@@ -11,37 +11,19 @@
 
 ## 部署
 
-两种部署方式，选一种即可：**A. 命令行手动部署**、**B. 连接 GitHub 后推送即部署**。
-两种方式部署的是同一个 Worker，可以随时切换。
+D1 数据库的**创建、绑定、建表都由 `scripts/setup-d1.mjs` 自动完成**——
+不需要手工 `d1 create`、不需要复制 `database_id`、不需要单独跑建表。
+脚本是幂等的：库已存在就复用，表已存在就跳过（`schema.sql` 全部 `IF NOT EXISTS`）。
 
-### 0. 一次性准备
+只需改一处：**你自己的域名**。
 
-```bash
-npx wrangler login     # 首次使用需授权 Cloudflare 账号
-```
-
-> 项目**运行时零依赖**（Worker 只跑源码，没有第三方库）。`package.json` 里唯一的
-> 依赖是 `wrangler` 本身（devDependency），只是为了让命令行和 CI 用同一个确定版本。
-> 不装也能跑——`npx wrangler ...` 会自动取用。
-
-### 1. 建 D1 数据库并初始化表
+### 1. 授权 + 改域名
 
 ```bash
-# 建库，输出里会给出 database_id
-npx wrangler d1 create site-monitor-db
-
-# 把上一步得到的 database_id 填进 wrangler.toml 的 [[d1_databases]]
-#   database_id = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
-
-# 建表（幂等：重复执行不会报错、也不会动已有数据，升级时可放心重跑）
-npx wrangler d1 execute site-monitor-db --remote --file=./schema.sql
+npx wrangler login          # 首次需授权 Cloudflare 账号
 ```
 
-> ⚠️ 这一步**只需做一次**。换用 GitHub 自动部署时，CI 不会替你建表。
-
-### 2. 改域名
-
-`wrangler.toml` 里的 `[[routes]]` 换成你自己的域名：
+打开 `wrangler.toml`，把 `[[routes]]` 换成你的域名：
 
 ```toml
 [[routes]]
@@ -49,38 +31,52 @@ pattern = "uptime.example.com"
 custom_domain = true
 ```
 
-> `custom_domain = true` 会自动建 DNS 记录并签发证书，域名的 DNS 需托管在 Cloudflare。
+> `custom_domain = true` 会自动建 DNS 记录并签发证书，域名 DNS 需托管在 Cloudflare。
 > ⚠️ 不要用 `workers.dev` 域名——实测在中国大陆不可达。
 
-### 3-A. 命令行部署
+### 2-A. 命令行部署（一条命令）
 
 ```bash
-npx wrangler deploy
+npm run deploy
 ```
 
-### 3-B. 连接 GitHub，推送即部署
+它会依次做三件事：
+
+1. 列出账号下的 D1，找 `site-monitor-db`
+2. **没有就创建**，并把 `database_name` 与 `database_id` **写回 `wrangler.toml`**（即自动绑定）；
+   已有则校验配置与实际是否一致，不一致就修正
+3. 执行 `schema.sql` 建表
+
+然后才执行 `wrangler deploy`。全过程幂等，反复跑不会重复建库、不会丢数据。
+
+> 只想做数据库准备、不部署：`npm run setup`
+>
+> 换库名：`D1_NAME=my-db npm run deploy`；换 D1 主区域：`D1_LOCATION=wnam npm run deploy`。
+
+### 2-B. 连接 GitHub，推送即部署
 
 在 Cloudflare Dashboard 操作（只需配一次）：
 
 1. **Workers & Pages** → **Create** → 切到 **Import from Git** 标签
 2. 授权 GitHub，选中本仓库（若没看到，点 *Configure GitHub app* 调整仓库可见范围）
-3. 构建配置填这几项：
+3. 构建配置：
 
    | 项 | 值 |
    |---|---|
    | Framework preset | **None** |
    | Build command | 留空（本项目无构建步骤） |
-   | Deploy command | `npx wrangler deploy` |
-   | Root directory | `/`（若仓库里本项目在子目录，填子目录名） |
+   | **Deploy command** | **`npm run deploy`** |
+   | Root directory | `/`（若本项目在仓库子目录里，填子目录名） |
 
-4. 保存后即触发首次部署；此后**每次 `git push` 到 `main` 都会自动部署**
+4. 保存即触发首次部署；此后**每次 `git push` 到 `main` 都会自动部署**
 
-> 生产分支默认是 `main`。若你的默认分支不同，在 Settings → Builds 里改 *Production branch*。
+> ⚠️ Deploy command 要填 `npm run deploy`，**不要**填 `npx wrangler deploy`——
+> 前者会先跑 D1 准备脚本，后者会跳过，新环境上会因为没有 `database_id` 而失败。
 >
-> CI 环境由 Cloudflare 自动注入 `CLOUDFLARE_API_TOKEN` / `CLOUDFLARE_ACCOUNT_ID`，
-> 不需要手动配置密钥。
+> 生产分支默认 `main`。不同则在 Settings → Builds 改 *Production branch*。
+> CI 环境由 Cloudflare 自动注入 `CLOUDFLARE_API_TOKEN` / `CLOUDFLARE_ACCOUNT_ID`，不需要配密钥。
 
-### 4. 打开后台设密码
+### 3. 打开后台设密码
 
 访问 `https://<你的域名>/admin`。**首次进入没有密码，任何人都能改配置**，
 所以第一件事是在「设置 → 安全」里设管理员密码。设完之后后台就要求登录了。
@@ -90,7 +86,7 @@ npx wrangler deploy
 > npx wrangler secret put ADMIN_PASSWORD
 > ```
 
-### 5. 加监控站点
+### 4. 加监控站点
 
 后台「站点 → ＋添加站点」，填名称和地址即可。分类可下拉选择，也可选「＋ 新建分类…」顺手建一个。
 
@@ -166,7 +162,10 @@ public/
   monitor.html / monitor.js  站点详情（图表为原生 SVG，无图表库）
   admin.html / admin.js      后台
   app.css / sw.js            样式 / Service Worker
-schema.sql   建表语句
+scripts/
+  setup-d1.mjs  部署前自动建库 + 绑定 + 建表（幂等）
+schema.sql      建表语句（全部 IF NOT EXISTS）
+wrangler.toml   只有绑定配置；运行参数一律在后台「设置」里改
 ```
 
 数据表：`sites` `checks` `state` `pending` `ssl` `categories` `meta`
