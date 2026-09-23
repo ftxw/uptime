@@ -172,7 +172,6 @@ a { color: inherit; text-decoration: none; }
   transition: background .12s, color .12s;
 }
 .nav a:hover { background: hsl(var(--accent) / 0.8); color: hsl(var(--foreground)); }
-.nav a.active { background: hsl(var(--accent) / 0.9); color: hsl(var(--foreground)); font-weight: 500; }
 
 /* ── 统计卡：grid-cols-2 lg:grid-cols-5 gap-3 ───────────── */
 

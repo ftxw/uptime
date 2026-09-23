@@ -91,7 +91,6 @@ function renderHead(d) {
     (d.consecutive_fail ? ` · 连续失败 ${d.consecutive_fail} 次` : "");
 
   qs("#visit").href = s.url;
-  qs("#edit").href = `/admin#${encodeURIComponent(s.id)}`;
   document.title = `${s.name} · 站点详情`;
 }
 

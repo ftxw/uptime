@@ -6,7 +6,7 @@
 //    缓存名带版本号，activate 时会把旧缓存整个删掉。
 //    不升的话静态资源是"缓存优先"，回访用户第一次导航仍会拿到旧文件，
 //    表现是"部署了新代码但界面没变"（要刷新第二次才生效）。
-const VERSION = "v6";
+const VERSION = "v7";
 const SHELL = `/shell-${VERSION}`;
 const PRECACHE = [
   "/",

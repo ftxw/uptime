@@ -47,8 +47,25 @@ npx wrangler secret put ADMIN_PASSWORD
 用 GitHub 自动部署（Workers Builds）的话在 Dashboard 配一次：
 
 > **Workers & Pages → 选中本项目 → Settings → Variables and Secrets → 添加**
-> 名称填 `ADMIN_PASSWORD`，类型选 **Secret**（不是 Text），保存。
+> 名称填 `ADMIN_PASSWORD`，**类型必须选 Secret**（不是 Text），保存。
 > 之后每次部署都会自动注入，无需重复配置。
+
+> ### ⚠️ 为什么必须选 Secret —— 实测踩过的坑
+> `wrangler deploy` 会把「版本的全部明文变量」按本地配置重写，所以
+> **只在控制台填的明文（Text）变量，会在下一次部署时被整个清掉**
+> （以 `wrangler.toml` 为准，`[vars]` 里没有的就视为"已删除"）。
+>
+> 症状很有迷惑性：变量明明填了，但 Worker 运行时读不到，后台一直提示
+> 「尚未设置管理员密码」——看起来像代码 bug，其实是变量被部署清空了。
+>
+> | 类型 | 设置方式 | 重部署后是否保留 |
+> |---|---|---|
+> | Secret | 控制台或 `wrangler secret put` | ✅ 永远保留 |
+> | 明文 Variables | 仅控制台填 | ❌ 会被清掉 |
+> | 明文 Variables | 写进 `wrangler.toml` 的 `[vars]` | ✅ 随部署生效 |
+>
+> 本项目已在 `wrangler.toml` 里设了 **`keep_vars = true`**，让 wrangler 不去动
+> 控制台上的变量；但**敏感值仍然推荐用 Secret**（值不会明文可见，也不进代码库）。
 
 > 不设也能用，但**任何人都能进 `/admin` 改配置**，页面顶部会显示醒目警告。
 >
@@ -120,7 +137,7 @@ npm run deploy
 ## 配置：都在这里改
 
 **运行参数全部在后台「设置」里改，改完即时生效，不需要重新部署。**
-`wrangler.toml` 里没有任何 `[vars]`，只有 D1 与 Durable Object 的绑定。
+`wrangler.toml` 里没有任何 `[vars]`（只有 `keep_vars = true` 与 D1 / Durable Object 等绑定）。
 
 优先级：**后台设置（存 D1）> 环境变量 / secret > 代码内置默认**
 

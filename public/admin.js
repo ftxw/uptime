@@ -113,7 +113,7 @@ function hideLogin() {
   AUTHED = true;
   qs("#login-mask").hidden = true;
   qs("#main").style.visibility = "visible";
-  qs("#logout").hidden = PWD_SOURCE === "none";
+  qs("#logout").hidden = false; // 已进入后台就常显「退出」
 }
 
 qs("#login-form").addEventListener("submit", async (e) => {
@@ -756,16 +756,23 @@ document.addEventListener("click", async (e) => {
     btn.textContent = "…";
     try {
       // 位置（区域组 / 筛选）统一由后端从全局设置取，前端不再传 ——
-      // 保证"测出来的"与"真实探测"走同一套参数
+      // 保证"测出来的"与"真实探测"走同一套参数。
+      // 带上 site=<id>：让后端把这次结果写进 checks，
+      // 这样手动测的点会出现在详情页折线与「最近检查」里。
       const kind = site?.resolved_kind || "cf";
-      const q = `kind=${kind}&target=${encodeURIComponent(site.url)}`;
+      const q = `kind=${kind}&site=${encodeURIComponent(site.id)}`;
       const d = await api(`/test?${q}`);
       const res = (d.results || [])[0] || {};
       const where = d.egress?.colo ? `机房 ${d.egress.colo}` : res.probe || "";
+      const mark = d.persisted ? `（已记入检查记录${d.persisted.ok ? "" : "：" + (d.persisted.reason || "失败")}）` : "";
+      // ⚠️ 顺序要紧：先重渲染表格（让「状态 / 最近检查」立刻反映这次结果），
+      //    再显示提示。若反过来，banner() 会被刷新流程里的横幅覆盖掉。
+      //    这里只调 renderRows 而不是 loadAll —— 后者会写「N 个站点 · N 个分类」横幅。
+      if (d.persisted) await renderRows();
       banner(
         `${site.name}：HTTP ${res.status ?? "—"} · ${res.ttfb ?? "—"} ms · ${where} · 往返 ${
           d.roundTripMs ?? "—"
-        } ms`,
+        } ms${mark}`,
         res.ok ? "info" : "error"
       );
     } catch (err) {
@@ -875,9 +882,8 @@ function fillSettingsForm(s) {
     ? `已配置：${s.globalping_token_masked}（留空则保留）`
     : "未配置（额度 250 次/小时；配置后 500 次/小时）";
 
-  // 密码不在后台改，只用于决定「显示未设密码警告 / 是否显示退出按钮」
+  // 密码只来自环境变量：这里只用于决定是否显示「尚未设置」警告
   PWD_SOURCE = s.password_source || "none";
-  qs("#logout").hidden = PWD_SOURCE === "none";
   qs("#pwd-warn").hidden = PWD_SOURCE !== "none";
 }
 
@@ -957,14 +963,6 @@ qs("#f-id").addEventListener("input", (e) => {
   e.target.dataset.touched = "1";
 });
 
-/** 支持 /admin#<站点id> 直接打开该站点的编辑弹窗（详情页的「编辑」按钮这么跳） */
-function openFromHash() {
-  const id = decodeURIComponent(location.hash.replace(/^#/, ""));
-  if (!id) return;
-  const site = siteById(id);
-  if (site) openForm(site);
-}
-
 async function bootstrap() {
   // 一次 /admin 同时拿到「登录态」与「全部数据」——不再先发 /session 再发数据。
   // 未登录时它返回 401：api() 已经弹出登录框，并把 needLogin 抛到这里。
@@ -973,7 +971,6 @@ async function bootstrap() {
   try {
     await loadAll();
     hideLogin();
-    openFromHash();
   } catch (e) {
     if (e.needLogin) return; // 登录框已由 api() 弹出，交给用户输入
     banner("加载失败：" + e.message, "error");

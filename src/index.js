@@ -765,6 +765,35 @@ async function persistCf(env, sites, cfResult) {
 }
 
 /**
+ * 手动测试（后台「测」按钮）的结果也要落库 ——
+ * 否则它不会出现在详情页的折线和「最近检查」里，与自动探测的数据割裂。
+ *
+ * ⚠️ 只写 checks，**刻意不调 bumpState**，原因是两个副作用都不该由一次调试点击引起：
+ *    ① bumpState 会更新 state.last_checked_ts，而 dueSites() 正是靠它判断"是否到期"，
+ *       于是手动测一次就会把该站点的下次计划检查往后推 interval_min；
+ *    ② 会累加 consecutive_fail 并可能在达到阈值时真的发出告警。
+ *    手动测试是排查手段，不应该改变调度与告警状态。
+ *    因此「连续失败次数」只由 cron 的自动探测累积；手动结果仅作为数据点展示。
+ */
+async function persistManualTest(env, site, { source, probe, result }) {
+  const v = judge(site, result);
+  await insertChecks(env, [
+    {
+      ts: new Date().toISOString(),
+      site: site.id,
+      source,
+      probe: probe || null,
+      ok: v.ok,
+      status: result?.status ?? 0,
+      ttfb_ms: result?.ttfb ?? 0,
+      total_ms: result?.total ?? 0,
+      error: v.reason,
+    },
+  ]);
+  return { ok: v.ok, reason: v.reason };
+}
+
+/**
  * 刷新过期/缺失的 SSL 信息。
  *
  * ⚠️ 额度与子请求都要小心：gpSslCheck 是「发起 + 轮询」的同步写法，
@@ -1585,25 +1614,46 @@ export default {
       }
 
       // 单个后端的即时测试：?api=test&kind=cf|globalping&target=...&hint=|magic=
+      // 单个后端的即时测试：?api=test&kind=cf|globalping&[site=<id>|target=...]
+      //   带 site=<id> 时，结果会**写入 checks**（这样「测」出来的点会出现在
+      //   详情页折线与「最近检查」里）；不带则纯调试、不落库。
       if (api === "test") {
         const kind = url.searchParams.get("kind") || "cf";
-        const target = url.searchParams.get("target") || "https://www.baidu.com";
+        const siteId = url.searchParams.get("site");
+        const d = await db(env);
+        const site = siteId
+          ? await d.prepare("SELECT * FROM sites WHERE id = ?").bind(siteId).first()
+          : null;
+        // 带 site 时一律用站点自身的 url —— 避免前端传错 target 导致
+        // "存进 A 站点名下的其实是 B 的探测结果"
+        const target = site?.url || url.searchParams.get("target") || "https://www.baidu.com";
         const timeoutMs = Number((env && env.TIMEOUT_MS) || 8000);
+
         if (kind === "cf") {
           const hint = url.searchParams.get("hint") || cfHintOf(env);
           const multi = url.searchParams.get("targets");
           const list = multi
             ? multi.split(",").map((u) => u.trim()).filter(Boolean).map((u) => ({ url: u, keyword: null }))
-            : [{ url: target, keyword: url.searchParams.get("keyword") || null }];
+            : [{ url: target, keyword: site?.keyword || url.searchParams.get("keyword") || null }];
           const t0 = Date.now();
           const out = await probeViaCf(env, hint, list, timeoutMs);
+          let persisted = null;
+          if (site) {
+            persisted = await persistManualTest(env, site, {
+              source: `cf:${hint}`,
+              probe: out.colo,
+              result: out.results?.[0],
+            });
+          }
           return json({
             ok: true, kind: "cf", hint,
             count: list.length,
             egress: out.egress, wall: out.wall, roundTripMs: Date.now() - t0,
             results: out.results,
+            persisted,
           });
         }
+
         // 位置筛选统一取全局设置，不再支持按请求覆盖 ——
         // 否则"测出来的结果"和"真实探测"可能用的不是同一个筛选，失去参考价值。
         const { id, source, quota } = await gpCreate(env, { url: target });
@@ -1613,7 +1663,19 @@ export default {
           const out = await gpCollect(env, { measurement_id: id });
           if (out.done) finished = out;
         }
-        return json({ ok: true, kind: "globalping", source, quota, results: finished?.results || [] });
+        const results = finished?.results || [];
+        let persisted = null;
+        if (site) {
+          // 与 collectGlobalping 同口径：取成功结果里最快的那条为代表
+          const good = results.filter((r) => r.ok);
+          const best = good.sort((a, b) => (a.ttfb || 1e9) - (b.ttfb || 1e9))[0] || results[0];
+          persisted = await persistManualTest(env, site, {
+            source,
+            probe: good.map((r) => r.probe).join(",") || null,
+            result: best,
+          });
+        }
+        return json({ ok: true, kind: "globalping", source, quota, results, persisted });
       }
 
       // 未知接口一律 404 —— 不再兜底返回 200 的服务信息，
