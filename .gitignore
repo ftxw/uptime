@@ -14,3 +14,6 @@ node_modules/
 # 日志
 *.log
 npm-debug.log*
+
+# wrangler --dry-run 产物（outdir 用 /tmp 时在 Windows 会落到项目内的 tmp/）
+tmp/
