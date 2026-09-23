@@ -15,7 +15,7 @@ D1 数据库的**创建、绑定、建表都由 `scripts/setup-d1.mjs` 自动完
 不需要手工 `d1 create`、不需要复制 `database_id`、不需要单独跑建表。
 脚本是幂等的：库已存在就复用，表已存在就跳过（`schema.sql` 全部 `IF NOT EXISTS`）。
 
-只需改一处：**你自己的域名**。
+需要你自己做的只有两件事：**改域名**、**设管理员密码**。
 
 ### 1. 授权 + 改域名
 
@@ -34,7 +34,27 @@ custom_domain = true
 > `custom_domain = true` 会自动建 DNS 记录并签发证书，域名 DNS 需托管在 Cloudflare。
 > ⚠️ 不要用 `workers.dev` 域名——实测在中国大陆不可达。
 
-### 2-A. 命令行部署（一条命令）
+### 2. 设置管理员密码（推荐）
+
+密码可以**在部署前用环境变量设好**，这样部署完成即有保护，不存在「后台暂时开放」的窗口期：
+
+```bash
+npx wrangler secret put ADMIN_PASSWORD
+```
+
+用 GitHub 自动部署（Workers Builds）的话在 Dashboard 配一次：
+
+> **Workers & Pages → 选中本项目 → Settings → Variables and Secrets → 添加**
+> 名称填 `ADMIN_PASSWORD`，类型选 **Secret**（不是 Text），保存。
+> 之后每次部署都会自动注入，无需重复配置。
+
+> 不设也能用，但**首次访问 `/admin` 时没有密码，任何人在你设置之前都能改配置** ——
+> 那种「先开放、再进后台设」的方式只适合自己马上就去配的场景。
+>
+> 环境变量的优先级**高于**后台设置的密码。设了它之后，后台「设置 → 安全」里的
+> 密码输入框会变灰并提示「此处设置暂不生效」。
+
+### 3-A. 命令行部署（一条命令）
 
 ```bash
 npm run deploy
@@ -53,7 +73,7 @@ npm run deploy
 >
 > 换库名：`D1_NAME=my-db npm run deploy`；换 D1 主区域：`D1_LOCATION=wnam npm run deploy`。
 
-### 2-B. 连接 GitHub，推送即部署
+### 3-B. 连接 GitHub，推送即部署
 
 在 Cloudflare Dashboard 操作（只需配一次）：
 
@@ -76,17 +96,16 @@ npm run deploy
 > 生产分支默认 `main`。不同则在 Settings → Builds 改 *Production branch*。
 > CI 环境由 Cloudflare 自动注入 `CLOUDFLARE_API_TOKEN` / `CLOUDFLARE_ACCOUNT_ID`，不需要配密钥。
 
-### 3. 打开后台设密码
+### 4. 首次访问
 
-访问 `https://<你的域名>/admin`。**首次进入没有密码，任何人都能改配置**，
-所以第一件事是在「设置 → 安全」里设管理员密码。设完之后后台就要求登录了。
+访问 `https://<你的域名>/admin` 登录后台（第 2 步设了 `ADMIN_PASSWORD` 就在这里输入；
+没设过则直接进入，页面会提示尽快设置）。
 
-> 如果忘了密码：用环境变量设一个救援密码，它会覆盖后台设的密码。
-> ```bash
-> npx wrangler secret put ADMIN_PASSWORD
-> ```
+> **忘了密码**：用环境变量覆盖一个最快 —— `npx wrangler secret put ADMIN_PASSWORD`
+> （环境变量优先级更高，设完立即生效）。后台里改不了已经忘记的旧密码，
+> 因为根本登不进去。
 
-### 4. 加监控站点
+### 5. 加监控站点
 
 后台「站点 → ＋添加站点」，填名称和地址即可。分类可下拉选择，也可选「＋ 新建分类…」顺手建一个。
 
@@ -117,17 +136,28 @@ npm run deploy
 | 告警 | Webhook 地址 | 空 | 可直接对接飞书 / 钉钉 / Server 酱 |
 | 安全 | 管理员密码 | 未设置 | 设置后后台要求登录，30 天免登录 |
 
-### 敏感值（可选，用 secret）
+### 敏感值
 
-后台里也能填 Globalping token 和告警地址；**只有想用环境变量覆盖时才需要 secret**：
+三项都可以在后台填，只有想用环境变量固定它们时才需要配 secret：
+
+| 名称 | 用环境变量配的理由 |
+|---|---|
+| `ADMIN_PASSWORD` | **推荐**。部署即生效，无「后台暂未设密码」的开放窗口；也是忘记密码时的唯一救法 |
+| `GLOBALPING_TOKEN` | Globalping 额度 250 → 500 次/小时 |
+| `ALERT_WEBHOOK` | 告警地址；想避免配置泄露到数据库时用它 |
 
 ```bash
-npx wrangler secret put GLOBALPING_TOKEN   # Globalping 额度 250 → 500 次/小时
-npx wrangler secret put ALERT_WEBHOOK      # 告警地址
-npx wrangler secret put ADMIN_PASSWORD     # 救援密码（优先级高于后台设的密码）
+npx wrangler secret put ADMIN_PASSWORD
+npx wrangler secret put GLOBALPING_TOKEN
+npx wrangler secret put ALERT_WEBHOOK
 ```
 
-`ADMIN_SECRET` 用于固定会话签名密钥，不设也没关系——默认会在 D1 里生成一个随机值。
+用 GitHub 自动部署时，改在 Dashboard：**项目 → Settings → Variables and Secrets**（类型选 Secret）。
+
+> 环境变量的优先级高于后台设置。所以设了 `ADMIN_PASSWORD` 后，
+> 后台的密码框会变灰并提示「此处设置暂不生效」。
+>
+> `ADMIN_SECRET` 用于固定会话签名密钥（不设也行，会在 D1 里自动生成随机值）。
 
 ---
 

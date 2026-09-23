@@ -3,7 +3,7 @@
    布局对齐 ftxw/uptime-monitor：分组一张卡 + 组内分隔行 + 「响应时间 / SSL / 可用率」三列。 */
 
 const API = "/api/overview";
-const CACHE_KEY = "uptime-v2:overview";
+const CACHE_KEY = "uptime:overview";
 
 /* 分类：GROUPS 为接口返回的全部分组，FILTER 为空表示"全部" */
 let GROUPS = [];

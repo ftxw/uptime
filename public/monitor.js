@@ -453,7 +453,7 @@ const SITE_ID = params.get("id") || "";
 let HOURS = Number(params.get("hours") || 24);
 if (![6, 24, 168, 720].includes(HOURS)) HOURS = 24;
 
-const cacheKey = () => `uptime-v2:site:${SITE_ID}:${HOURS}`;
+const cacheKey = () => `uptime:site:${SITE_ID}:${HOURS}`;
 
 function render(d) {
   if (!d || !d.ok) return;

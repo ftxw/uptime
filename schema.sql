@@ -1,7 +1,7 @@
--- uptime-v2 数据模型
+-- uptime 数据模型
 --
--- 表名不再带 v2_ 前缀 —— 那个前缀只是为了和早期 v1 的 sites/checks 共存，
--- 现在 v1 表已废弃，前缀只会让每条 SQL 都变长、变难读。
+-- 七张表：sites 站点配置 · checks 探测明细 · state 运行态 · pending 待收结果
+--        ssl 证书 · categories 分类 · meta 全局键值
 
 -- ── 监测目标 ──────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS sites (
