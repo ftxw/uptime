@@ -180,7 +180,7 @@ async function buildAdminPayload(env) {
   const sslMap = Object.fromEntries((sslRes.results || []).map((r) => [r.site, r]));
   const sites = (sitesRes.results || []).map((s) => ({
     ...s,
-    resolved_kind: resolveKind(s, env),
+    resolved_kind: resolveKind(s),
     last_ok: lastMap[s.id]?.ok ?? null,
     last_status: lastMap[s.id]?.status ?? null,
     last_ttfb: lastMap[s.id]?.ttfb_ms ?? null,
@@ -193,7 +193,6 @@ async function buildAdminPayload(env) {
     sites,
     categories: cats,
     ssl: sslMap,
-    default_kind: (env && env.PROBE_MODE) || "auto",
     has_globalping_token: Boolean(env && env.GLOBALPING_TOKEN),
   };
 }
@@ -203,15 +202,15 @@ function isCleanupWindow(now = new Date()) {
   return now.getUTCHours() === 3 && now.getUTCMinutes() < 5;
 }
 
-/** 每个站点解析出该用哪个后端（含 auto 降级） */
-function resolveKind(site, env) {
-  const mode = (site.probe_kind || (env && env.PROBE_MODE) || "auto").toLowerCase();
-  const hasGp = Boolean(env && env.GLOBALPING_TOKEN);
-  // 显式指定 globalping 就照做 —— 匿名也能跑（额度 250 次/小时）
-  if (mode === "globalping") return "globalping";
-  if (mode === "cf") return "cf";
-  // auto：配了 token 优先 globalping（额度更高），没配则回落 CF
-  return hasGp ? "globalping" : "cf";
+/**
+ * 每个站点用哪个探测后端。
+ *
+ * 后端是**站点级必选项**（后台表单只给 cf / globalping 两个选项，没有 auto），
+ * 所以这里不需要任何"全局默认"参与决策。空值只可能来自早期数据 ——
+ * 一律回落到 cf：免费、无外部依赖、不消耗 Globalping 额度。
+ */
+function resolveKind(site) {
+  return site.probe_kind === "globalping" ? "globalping" : "cf";
 }
 
 /**
@@ -302,7 +301,6 @@ function bucketFor(hours) {
 const SETTING_KEYS = [
   "default_theme",     // auto | light | dark —— 前台默认主题
   "site_title",        // 前台标题
-  "probe_mode",        // auto | cf | globalping
   "cf_hint",           // CF 默认区域组
   "gp_magic",          // Globalping 默认位置筛选
   "gp_ssl_magic",      // SSL 检测用的筛选（与站点筛选解耦）
@@ -334,7 +332,6 @@ async function effectiveEnv(env, S) {
   const pick = (k, fallback) => (s[k] !== undefined && s[k] !== "" ? s[k] : env[k] || fallback);
   return Object.assign({}, env, {
     GLOBALPING_TOKEN: pick("globalping_token", ""),
-    PROBE_MODE: pick("probe_mode", "auto"),
     CF_HINT: pick("cf_hint", "apac"),
     GP_MAGIC: pick("gp_magic", "CN+datacenter-network"),
     GP_SSL_MAGIC: pick("gp_ssl_magic", "CN+datacenter-network"),
@@ -413,7 +410,6 @@ const SESSION_TTL = 30 * 86400;
 
 /** 设置项 → 环境变量名（用于把「最终生效值」回显给后台表单） */
 const ENV_FOR = {
-  probe_mode: "PROBE_MODE",
   cf_hint: "CF_HINT",
   gp_magic: "GP_MAGIC",
   gp_ssl_magic: "GP_SSL_MAGIC",
@@ -621,7 +617,7 @@ async function dispatch(env, sites) {
   const gpSites = [];
   for (const s of sites) {
     if (pendingSet.has(s.id)) continue;
-    (resolveKind(s, env) === "globalping" ? gpSites : cfSites).push(s);
+    (resolveKind(s) === "globalping" ? gpSites : cfSites).push(s);
   }
 
   const cfResult = {};
@@ -1064,7 +1060,7 @@ export default {
               id: s.id,
               name: s.name,
               url: s.url,
-              probe_kind: resolveKind(s, env),
+              probe_kind: resolveKind(s),
               cf_hint: cfHintOf(env),
               state,
               degrade_reason: degradeReason,
@@ -1339,7 +1335,7 @@ export default {
                 name: meta.name,
                 url: meta.url,
                 group_name: meta.group_name || "未分组",
-                probe_kind: resolveKind(meta, env),
+                probe_kind: resolveKind(meta),
                 cf_hint: cfHintOf(env),
                 gp_magic: gpMagicOf(env),
                 expect_codes: meta.expect_codes || null,

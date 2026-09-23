@@ -214,17 +214,23 @@ function renderCats() {
     .join("");
 }
 
-/** 站点表单里的分类下拉：现有分类 + 「＋ 新建分类…」 */
+/**
+ * 站点表单里的分类下拉：**只列已有分类**。
+ * 不支持在这里新建分类 —— 新建/改名/删除统一在左侧「分类」栏做，
+ * 避免"同一个分类两个入口"带来的状态不一致（例如下拉里临时新建一个、
+ * 之后在左侧改名，两边指向的分裂）。
+ */
 function fillGroupSelect(current) {
   const sel = qs("#f-group");
   if (!sel) return;
   const keep = current ?? sel.value;
   const names = CATS.map((c) => c.name);
+  // 「未分组」永远作为兜底项 —— 还没建过任何分类时下拉不能是空的
+  if (!names.includes(UNGROUPED)) names.unshift(UNGROUPED);
   if (keep && !names.includes(keep)) names.push(keep);
-  sel.innerHTML =
-    names
-      .map((n) => `<option value="${escapeHtml(n)}">${escapeHtml(n)}</option>`)
-      .join("") + `<option value="__new__">＋ 新建分类…</option>`;
+  sel.innerHTML = names
+    .map((n) => `<option value="${escapeHtml(n)}">${escapeHtml(n)}</option>`)
+    .join("");
   if (keep && names.includes(keep)) sel.value = keep;
 }
 
@@ -241,10 +247,9 @@ function sslCell(ssl) {
   )} · 到期 ${escapeHtml(ssl.expires_at || "")}">${text}</span>`;
 }
 
+/** 后端标签。后端现在是站点级必选项，直接显示解析结果 */
 function backendLabel(s) {
-  if (s.probe_kind === "cf") return `cf · ${(s.cf_hint || "").toUpperCase()}`;
-  if (s.probe_kind === "globalping") return `globalping`;
-  return `auto`;
+  return s.resolved_kind || "cf";
 }
 
 async function renderRows() {
@@ -328,14 +333,16 @@ function applyBrandTitle(st) {
  * /sites → /categories 是**串行**的，加上首屏 HTML 共 4 个 RTT，叠起来就明显慢。
  * 合并成 1 个 /admin 后，首屏只剩「HTML + /admin」两个请求。
  */
+/**
+ * 拉取后台全量数据（一次 /admin 拿到站点 + 分类 + 证书 + 设置）。
+ *
+ * ⚠️ 401 时**必须让 `needLogin` 继续往上抛**，不要在这里吞掉：
+ *    `api()` 已经弹出了登录框，而 bootstrap 要靠这个异常来判断"没登录"。
+ *    一旦在此 return，bootstrap 会以为加载成功、继续执行 hideLogin()，
+ *    把刚弹出的登录框又藏回去 —— 表现为后台一片空白且无法登录。
+ */
 async function loadAll() {
-  let d;
-  try {
-    d = await api("/admin");
-  } catch (e) {
-    if (e.needLogin) return;
-    throw e;
-  }
+  const d = await api("/admin");
   if (!d.ok) {
     banner(d.error || "加载失败", "error");
     return;
@@ -369,7 +376,9 @@ async function saveOrder() {
     banner(`顺序已保存（${d.updated} 个站点），前台立即生效`, "info");
   } catch (e) {
     if (!e.needLogin) banner("排序保存失败：" + e.message, "error");
-    await loadAll();
+    // 失败后重新拉一次以还原界面；401 时 loadAll 会抛 needLogin，
+    // 这里已在 catch 内，再抛就成了未处理的 rejection，故吞掉（登录框已由 api() 弹出）
+    await loadAll().catch(() => {});
   }
 }
 
@@ -591,7 +600,7 @@ async function saveCatOrder(names) {
     await loadAll();
   } catch (err) {
     if (!err.needLogin) banner("分类排序失败：" + err.message, "error");
-    await loadAll();
+    await loadAll().catch(() => {}); // 同上：catch 里再抛会变成未处理的 rejection
   }
 }
 
@@ -652,26 +661,8 @@ catList.addEventListener("drop", (e) => {
 
 const dlg = qs("#dlg");
 
-/** 选中「＋ 新建分类…」时，显示旁边的名称输入框 */
-function toggleNewGroupInput() {
-  const isNew = qs("#f-group").value === "__new__";
-  const input = qs("#f-group-new");
-  input.hidden = !isNew;
-  if (!isNew) input.value = "";
-  qs("#f-group-hint").textContent = isNew
-    ? "保存站点时会一并创建这个分类"
-    : "选「＋ 新建分类…」可直接建一个新分类";
-  if (isNew) setTimeout(() => input.focus(), 30);
-}
-
 /** 表单里最终选定的分类名 */
-function currentGroupValue() {
-  const sel = qs("#f-group").value;
-  if (sel === "__new__") return qs("#f-group-new").value.trim() || UNGROUPED;
-  return sel || UNGROUPED;
-}
-
-qs("#f-group").addEventListener("change", toggleNewGroupInput);
+const currentGroupValue = () => qs("#f-group").value || UNGROUPED;
 
 function openForm(site) {
   qs("#dlg-title").textContent = site ? "编辑站点" : "添加站点";
@@ -683,10 +674,8 @@ function openForm(site) {
   fillGroupSelect(
     site?.group_name || (FILTER && FILTER !== UNGROUPED ? FILTER : UNGROUPED)
   );
-  qs("#f-group-new").hidden = true;
-  qs("#f-group-new").value = "";
-  qs("#f-group-hint").textContent = "选「＋ 新建分类…」可直接建一个新分类";
-  qs("#f-kind").value = site?.probe_kind || "";
+  // 后端是必选项（表单里没有空选项），新建时默认 cf；早期数据的空值也回落到 cf
+  qs("#f-kind").value = site?.probe_kind === "globalping" ? "globalping" : "cf";
   qs("#f-codes").value = site?.expect_codes || "";
   qs("#f-keyword").value = site?.keyword || "";
   qs("#f-threshold").value = site?.fail_threshold ?? 3;
@@ -703,13 +692,6 @@ function openForm(site) {
 qs("#form").addEventListener("submit", async (e) => {
   if (e.submitter?.value !== "save") return;
   e.preventDefault();
-
-  if (qs("#f-group").value === "__new__" && !qs("#f-group-new").value.trim()) {
-    const el = qs("#dlg-err");
-    el.textContent = "请填写新分类名称，或改选一个已有分类";
-    el.hidden = false;
-    return;
-  }
 
   const body = {
     id: qs("#f-id").value.trim(),
@@ -817,17 +799,31 @@ qs("#checkall").addEventListener("click", async () => {
 
 const setdlg = qs("#setdlg");
 
-const ENV_HINT = {
-  probe_mode: "PROBE_MODE",
-  cf_hint: "CF_HINT",
-  gp_magic: "GP_MAGIC",
-  gp_ssl_magic: "GP_SSL_MAGIC",
-  gp_limit: "GP_LIMIT",
-  timeout_ms: "TIMEOUT_MS",
-  ssl_per_tick: "SSL_PER_TICK",
-  ssl_warn_days: "SSL_WARN_DAYS",
-  alert_webhook: "ALERT_WEBHOOK",
-};
+/** 位置筛选下拉里的「自定义…」哨兵值 */
+const MAGIC_CUSTOM = "__custom__";
+/** 预设选项（与 admin.html 里的 <option> 一致） */
+const MAGIC_PRESETS = [
+  "CN+datacenter-network",
+  "CN+eyeball-network",
+  "east-asia",
+  "western-europe",
+  "north-america",
+];
+
+/** 读位置筛选：下拉选中预设就取预设值，选中「自定义」则取输入框 */
+function readMagic() {
+  const v = qs("#s-magic").value;
+  return v === MAGIC_CUSTOM ? qs("#s-magic-custom").value.trim() : v;
+}
+
+/** 写位置筛选：预设值→选中对应项；非预设值→切到「自定义」并填入输入框 */
+function writeMagic(v) {
+  const val = v || "";
+  const isPreset = MAGIC_PRESETS.includes(val);
+  qs("#s-magic").value = isPreset ? val : val ? MAGIC_CUSTOM : "";
+  qs("#s-magic-custom").value = isPreset ? "" : val;
+  qs("#s-magic-custom").hidden = qs("#s-magic").value !== MAGIC_CUSTOM;
+}
 
 async function openSettings() {
   qs("#set-err").hidden = true;
@@ -863,10 +859,9 @@ async function openSettings() {
 function fillSettingsForm(s) {
   qs("#s-title").value = s.site_title || "";
   qs("#s-theme").value = s.default_theme || "auto";
-  qs("#s-mode").value = s.probe_mode || "";
   qs("#s-hint").value = s.cf_hint || "";
   qs("#s-timeout").value = s.timeout_ms || "";
-  qs("#s-magic").value = s.gp_magic || "";
+  writeMagic(s.gp_magic || "");
   qs("#s-limit").value = s.gp_limit || "";
   qs("#s-sslmagic").value = s.gp_ssl_magic || "";
   qs("#s-per-tick").value = s.ssl_per_tick || "";
@@ -888,6 +883,13 @@ function fillSettingsForm(s) {
 
 qs("#settings-open").addEventListener("click", openSettings);
 
+// 位置筛选选到「自定义…」时展开输入框
+qs("#s-magic").addEventListener("change", () => {
+  const custom = qs("#s-magic").value === MAGIC_CUSTOM;
+  qs("#s-magic-custom").hidden = !custom;
+  if (custom) qs("#s-magic-custom").focus();
+});
+
 qs("#setform").addEventListener("submit", async (e) => {
   if (e.submitter?.value !== "save") return;
   e.preventDefault();
@@ -902,10 +904,9 @@ qs("#setform").addEventListener("submit", async (e) => {
   const body = {
     site_title: qs("#s-title").value.trim(),
     default_theme: qs("#s-theme").value,
-    probe_mode: qs("#s-mode").value,
     cf_hint: qs("#s-hint").value,
     timeout_ms: qs("#s-timeout").value.trim(),
-    gp_magic: qs("#s-magic").value.trim(),
+    gp_magic: readMagic(),
     gp_limit: qs("#s-limit").value.trim(),
     gp_ssl_magic: qs("#s-sslmagic").value.trim(),
     ssl_per_tick: qs("#s-per-tick").value.trim(),
@@ -966,20 +967,15 @@ function openFromHash() {
 
 async function bootstrap() {
   // 一次 /admin 同时拿到「登录态」与「全部数据」——不再先发 /session 再发数据。
-  // 未登录时它返回 401，由 api() 统一弹登录框；密码未设置时后端直接放行。
+  // 未登录时它返回 401：api() 已经弹出登录框，并把 needLogin 抛到这里。
+  // ⚠️ 这种情况必须**直接返回**，绝不能继续往下走 ——
+  //    下面的 hideLogin() 会把刚弹出的登录框又藏回去，变成空白页无法登录。
   try {
     await loadAll();
-    AUTHED = true;
-    qs("#logout").hidden = PWD_SOURCE === "none";
     hideLogin();
     openFromHash();
   } catch (e) {
-    if (e.needLogin) {
-      AUTHED = false;
-      qs("#logout").hidden = false;
-      showLogin();
-      return;
-    }
+    if (e.needLogin) return; // 登录框已由 api() 弹出，交给用户输入
     banner("加载失败：" + e.message, "error");
   }
 }

@@ -418,6 +418,12 @@ dialog::backdrop { background: hsl(220 30% 10% / 0.45); }
 
 /* ── 提示 ───────────────────────────────────────────────── */
 
+/* ⚠️ 必须在所有组件样式之前：组件里写 `display: flex` 之类会盖掉浏览器默认的
+   `[hidden] { display: none }`（UA 样式优先级低于任何作者样式），
+   导致 JS 里 `el.hidden = true` 完全无效、空提示框照样露出。
+   这条兜底一次解决全部同类问题，别再给单个元素打补丁。 */
+[hidden] { display: none !important; }
+
 .alert {
   display: flex; align-items: flex-start; gap: 8px;
   padding: 10px 12px; border-radius: calc(var(--radius) - 2px);
@@ -440,7 +446,6 @@ dialog::backdrop { background: hsl(220 30% 10% / 0.45); }
 
 .mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
 .muted { color: hsl(var(--muted-foreground)); }
-.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
 
 .icon-btn {
   display: inline-flex; align-items: center; justify-content: center;
@@ -721,8 +726,7 @@ tr.drag-over td { box-shadow: inset 0 2px 0 hsl(var(--primary)); }
   background: hsl(var(--background) / 0.65);
   backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px);
 }
-/* ⚠️ 必须显式写这条：元素上有 display:flex，`hidden` 属性就不再生效了 */
-.login-mask[hidden] { display: none; }
+/* 不需要 [hidden] 特例了 —— 顶部有全局 [hidden] 兜底 */
 
 .login-card {
   width: min(360px, 100%); padding: 24px;
