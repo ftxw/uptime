@@ -11,6 +11,15 @@
 const API = "/api";
 const qs = (s) => document.querySelector(s);
 
+/** 可选的监测间隔（分钟）。与后台表单的下拉项、以及 dueSites() 的调度逻辑对应 */
+const INTERVALS = [1, 5, 10, 30, 60];
+
+/** 间隔的友好显示：60 → "1 小时"，其余 → "N 分钟" */
+const fmtInterval = (min) => {
+  const n = Number(min) || 5;
+  return n >= 60 ? `${n / 60} 小时` : `${n} 分钟`;
+};
+
 let SITES = [];   // 顺序 = 前台渲染顺序（分类 → sort → id）
 let CATS = [];
 let FILTER = "";  // "" = 全部
@@ -283,7 +292,9 @@ async function renderRows() {
           <div class="muted" style="font-size:11px">${escapeHtml(g)} · ${escapeHtml(s.id)}</div>
         </td>
         <td><span class="mono" style="font-size:12px">${escapeHtml(s.url)}</span></td>
-        <td class="muted" style="font-size:12px">${backendLabel(s)}</td>
+        <td class="muted" style="font-size:12px">${backendLabel(s)}<div style="font-size:11px;opacity:.65">${fmtInterval(
+          s.interval_min
+        )}</div></td>
         <td>${sslCell(sslMap[s.id])}</td>
         <td><span class="badge ${cls}">${st}</span><div class="muted" style="font-size:11px">${relTime(
         s.last_ts
@@ -681,6 +692,10 @@ function openForm(site) {
   qs("#f-codes").value = site?.expect_codes || "";
   qs("#f-keyword").value = site?.keyword || "";
   qs("#f-threshold").value = site?.fail_threshold ?? 3;
+  // 间隔选项是 1/5/10/30/60；若站点存的是其它值（早期数据），回退到最接近的 5 分钟
+  qs("#f-interval").value = INTERVALS.includes(Number(site?.interval_min))
+    ? String(site.interval_min)
+    : "5";
   qs("#f-sort").value = site?.sort ?? 0;
   qs("#f-enabled").value = String(site?.enabled ?? 1);
   qs("#dlg-err").hidden = true;
@@ -709,6 +724,7 @@ qs("#form").addEventListener("submit", async (e) => {
     expect_codes: qs("#f-codes").value.trim(),
     keyword: qs("#f-keyword").value.trim() || null,
     fail_threshold: Number(qs("#f-threshold").value || 3),
+    interval_min: Number(qs("#f-interval").value || 5),
     sort: Number(qs("#f-sort").value || 0),
     enabled: qs("#f-enabled").value === "1",
   };

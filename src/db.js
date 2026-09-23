@@ -149,7 +149,8 @@ export async function bumpState(env, perSite) {
            last_checked_ts = excluded.last_checked_ts,
            last_alert_ts = COALESCE(excluded.last_alert_ts, state.last_alert_ts)`
       )
-      .bind(site, fail, info.ok ? nowIso : null, nowIso, null);
+      .bind(site, fail, info.ok ? nowIso : null, nowIso, null)
+      .run(); // ⚠️ 必须 .run()：.bind() 只构造语句、不执行，且不会报错（静默丢失）
 
     // 恢复通知
     if (info.ok && Number(cur?.consecutive_fail || 0) >= info.threshold) {

@@ -505,7 +505,10 @@ async function probeViaCf(env, hint, list, timeoutMs) {
 async function collectGlobalping(env) {
   const d = await db(env);
   const { results: pending } = await d.prepare("SELECT * FROM pending").all();
-  if (!pending || !pending.length) return { collected: 0, rows: [] };
+  // ⚠️ 返回值结构必须与下面的完整分支保持一致（尤其是 alerts）——
+  //    调用方会无条件读 collected.alerts.length，少了这个字段就会抛 TypeError，
+  //    导致整轮 cron 在打完日志前失败。
+  if (!pending || !pending.length) return { collected: 0, rows: [], alerts: [] };
 
   const sites = await loadSites(env);
   const byId = Object.fromEntries(sites.map((s) => [s.id, s]));
@@ -559,6 +562,31 @@ async function collectGlobalping(env) {
   const alerts = await bumpState(env, perSite);
   const alertResult = await sendAlerts(env, alerts);
   return { collected: rows.length, rows, alerts, alertResult };
+}
+
+/**
+ * 挑出「本轮该检查」的站点。
+ *
+ * 为什么需要这一步：cron 每分钟触发（见 wrangler.toml），但每个站点的监测间隔
+ * 是独立配置的（1 / 5 / 10 / 30 / 60 分钟）。必须按「距上次检查是否已达间隔」
+ * 筛选，否则 1 分钟和 1 小时的站点会被一视同仁地每分钟都查 ——
+ * 既浪费子请求与 DO 额度，也让间隔设置彻底失去意义。
+ *
+ * last_checked_ts 由 bumpState 在每次检查**完成后**写入，所以它表示
+ * 「上次真正完成检查的时刻」，对 CF 与 Globalping 两种后端语义一致。
+ * 从未检查过的站点（无记录）直接纳入，保证新增站点立刻被探测一次。
+ */
+async function dueSites(env, sites) {
+  const d = await db(env);
+  const { results } = await d.prepare("SELECT site, last_checked_ts FROM state").all();
+  const lastMap = Object.fromEntries((results || []).map((r) => [r.site, r.last_checked_ts]));
+  const now = Date.now();
+  return sites.filter((s) => {
+    const last = lastMap[s.id];
+    if (!last) return true;
+    const ivMs = Math.max(1, Number(s.interval_min || 5)) * 60_000;
+    return now - new Date(last).getTime() >= ivMs;
+  });
 }
 
 /** 阶段二：发起本轮测量（Globalping 两阶段 / CF 即时） */
@@ -1632,10 +1660,15 @@ export default {
 
   async scheduled(controller, env, ctx) {
     const sites = await loadSites(env);
-    // 先收取上一轮 Globalping 的结果，再发起本轮
+
+    // 先收取上一轮 Globalping 的结果 —— 必须全量收，不受间隔影响：
+    // 那些测量已经发出去了，不收就白花了额度。
     const collected = await collectGlobalping(env);
-    const disp = await dispatch(env, sites);
-    const persisted = await persistCf(env, sites, disp.cfResult);
+
+    // 再按各站点的监测间隔，只对「已到期」的发起新一轮
+    const due = await dueSites(env, sites);
+    const disp = await dispatch(env, due);
+    const persisted = await persistCf(env, due, disp.cfResult);
 
     // SSL 低频补充：每轮只处理少量站点，避免子请求超限（详见 refreshSslStale 注释）
     let ssl = [];
@@ -1662,6 +1695,7 @@ export default {
       JSON.stringify({
         cron: controller.cron,
         sites: sites.length,
+        due: due.length, // 本轮按间隔筛选后实际该查的站点数
         collected: collected.collected,
         dispatched: disp.started,
         gpStarted: disp.gpStarted,

@@ -204,7 +204,18 @@
         </div>
       </div>
 
-      <div class="grid-2">
+      <div class="grid-3">
+        <div class="field">
+          <label for="f-interval">监测间隔</label>
+          <select id="f-interval">
+            <option value="1">1 分钟</option>
+            <option value="5">5 分钟</option>
+            <option value="10">10 分钟</option>
+            <option value="30">30 分钟</option>
+            <option value="60">1 小时</option>
+          </select>
+          <span class="hint">每隔多久探测一次</span>
+        </div>
         <div class="field">
           <label for="f-sort">显示顺序（小的在前）</label>
           <input id="f-sort" type="number" value="0">
