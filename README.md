@@ -11,16 +11,20 @@
 
 ## 部署
 
-### 1. 准备
+两种部署方式，选一种即可：**A. 命令行手动部署**、**B. 连接 GitHub 后推送即部署**。
+两种方式部署的是同一个 Worker，可以随时切换。
 
-项目**零依赖、无构建步骤**，不需要 `npm install`——wrangler 直接用 `npx` 跑即可。
-（想固定版本可以自己 `npm i -D wrangler`，非必须。）
+### 0. 一次性准备
 
 ```bash
 npx wrangler login     # 首次使用需授权 Cloudflare 账号
 ```
 
-### 2. 建 D1 数据库并初始化表
+> 项目**运行时零依赖**（Worker 只跑源码，没有第三方库）。`package.json` 里唯一的
+> 依赖是 `wrangler` 本身（devDependency），只是为了让命令行和 CI 用同一个确定版本。
+> 不装也能跑——`npx wrangler ...` 会自动取用。
+
+### 1. 建 D1 数据库并初始化表
 
 ```bash
 # 建库，输出里会给出 database_id
@@ -33,7 +37,9 @@ npx wrangler d1 create site-monitor-db
 npx wrangler d1 execute site-monitor-db --remote --file=./schema.sql
 ```
 
-### 3. 改域名
+> ⚠️ 这一步**只需做一次**。换用 GitHub 自动部署时，CI 不会替你建表。
+
+### 2. 改域名
 
 `wrangler.toml` 里的 `[[routes]]` 换成你自己的域名：
 
@@ -46,13 +52,35 @@ custom_domain = true
 > `custom_domain = true` 会自动建 DNS 记录并签发证书，域名的 DNS 需托管在 Cloudflare。
 > ⚠️ 不要用 `workers.dev` 域名——实测在中国大陆不可达。
 
-### 4. 部署
+### 3-A. 命令行部署
 
 ```bash
 npx wrangler deploy
 ```
 
-### 5. 打开后台设密码
+### 3-B. 连接 GitHub，推送即部署
+
+在 Cloudflare Dashboard 操作（只需配一次）：
+
+1. **Workers & Pages** → **Create** → 切到 **Import from Git** 标签
+2. 授权 GitHub，选中本仓库（若没看到，点 *Configure GitHub app* 调整仓库可见范围）
+3. 构建配置填这几项：
+
+   | 项 | 值 |
+   |---|---|
+   | Framework preset | **None** |
+   | Build command | 留空（本项目无构建步骤） |
+   | Deploy command | `npx wrangler deploy` |
+   | Root directory | `/`（若仓库里本项目在子目录，填子目录名） |
+
+4. 保存后即触发首次部署；此后**每次 `git push` 到 `main` 都会自动部署**
+
+> 生产分支默认是 `main`。若你的默认分支不同，在 Settings → Builds 里改 *Production branch*。
+>
+> CI 环境由 Cloudflare 自动注入 `CLOUDFLARE_API_TOKEN` / `CLOUDFLARE_ACCOUNT_ID`，
+> 不需要手动配置密钥。
+
+### 4. 打开后台设密码
 
 访问 `https://<你的域名>/admin`。**首次进入没有密码，任何人都能改配置**，
 所以第一件事是在「设置 → 安全」里设管理员密码。设完之后后台就要求登录了。
@@ -62,7 +90,7 @@ npx wrangler deploy
 > npx wrangler secret put ADMIN_PASSWORD
 > ```
 
-### 6. 加监控站点
+### 5. 加监控站点
 
 后台「站点 → ＋添加站点」，填名称和地址即可。分类可下拉选择，也可选「＋ 新建分类…」顺手建一个。
 
@@ -161,8 +189,14 @@ schema.sql   建表语句
 ## 本地开发
 
 ```bash
-npx wrangler dev
+npm install     # 可选：只为装 wrangler。跳过则下面命令改用 npx wrangler ...
+npm run dev     # 等价于 wrangler dev
 ```
 
-默认 `http://localhost:8787`。本地用 D1 的本地副本，首次会提示建表：
-`npx wrangler d1 execute site-monitor-db --local --file=./schema.sql`
+默认 `http://localhost:8787`。本地用的是 D1 的本地副本，首次需建表：
+
+```bash
+npm run db:init:local
+```
+
+其他命令：`npm run deploy`（部署）、`npm run db:init`（对线上库建表）。
