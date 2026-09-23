@@ -864,6 +864,9 @@ function fillSettingsForm(s) {
   qs("#s-sslmagic").value = s.gp_ssl_magic || "";
   qs("#s-per-tick").value = s.ssl_per_tick || "";
   qs("#s-warn").value = s.ssl_warn_days || "";
+  qs("#s-ipver").value = s.gp_ip_version || "4";
+  qs("#s-budget").value = s.subreq_budget || "";
+  qs("#s-keep").value = s.check_keep_days || "";
   qs("#s-webhook").value = s.alert_webhook || "";
   qs("#s-gp-token").value = "";
   qs("#s-gp-token-hint").textContent = s.has_globalping_token
@@ -939,6 +942,9 @@ qs("#setform").addEventListener("submit", async (e) => {
     gp_ssl_magic: qs("#s-sslmagic").value.trim(),
     ssl_per_tick: qs("#s-per-tick").value.trim(),
     ssl_warn_days: qs("#s-warn").value.trim(),
+    gp_ip_version: qs("#s-ipver").value,
+    subreq_budget: qs("#s-budget").value.trim(),
+    check_keep_days: qs("#s-keep").value.trim(),
     alert_webhook: qs("#s-webhook").value.trim(),
     // 留空 = 不修改已有 token（后端识别 __KEEP__）
     globalping_token: qs("#s-gp-token").value.trim() || "__KEEP__",

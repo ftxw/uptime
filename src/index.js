@@ -298,9 +298,12 @@ const SETTING_KEYS = [
   "gp_magic",          // Globalping 默认位置筛选
   "gp_ssl_magic",      // SSL 检测用的筛选（与站点筛选解耦）
   "gp_limit",          // 每次测量的探测点数（每个算 1 次额度）
+  "gp_ip_version",     // Globalping 使用的 IP 版本：4 | 6
   "timeout_ms",        // 单次探测超时
   "ssl_per_tick",      // 每轮 cron 补充检测几个站点的 SSL
   "ssl_warn_days",     // 证书剩余 ≤ N 天判为降级
+  "subreq_budget",     // 单次调用的子请求预算（免费层上限 50，留余量）
+  "check_keep_days",   // 探测明细保留天数（过期由 cron 每天清理一次）
   "alert_webhook",     // 告警 Webhook
   "globalping_token",  // Globalping token（只在后台可写，读取时脱敏）
 ];
@@ -322,9 +325,12 @@ async function effectiveEnv(env, S) {
     GP_MAGIC: pick("gp_magic", "CN+datacenter-network"),
     GP_SSL_MAGIC: pick("gp_ssl_magic", "CN+datacenter-network"),
     GP_LIMIT: pick("gp_limit", "1"),
+    GP_IP_VERSION: pick("gp_ip_version", "4"),
     TIMEOUT_MS: pick("timeout_ms", "8000"),
     SSL_PER_TICK: pick("ssl_per_tick", "2"),
     SSL_WARN_DAYS: pick("ssl_warn_days", "14"),
+    SUBREQ_BUDGET: pick("subreq_budget", "30"),
+    CHECK_KEEP_DAYS: pick("check_keep_days", "30"),
     ALERT_WEBHOOK: pick("alert_webhook", ""),
   });
 }
@@ -398,9 +404,12 @@ const ENV_FOR = {
   gp_magic: "GP_MAGIC",
   gp_ssl_magic: "GP_SSL_MAGIC",
   gp_limit: "GP_LIMIT",
+  gp_ip_version: "GP_IP_VERSION",
   timeout_ms: "TIMEOUT_MS",
   ssl_per_tick: "SSL_PER_TICK",
   ssl_warn_days: "SSL_WARN_DAYS",
+  subreq_budget: "SUBREQ_BUDGET",
+  check_keep_days: "CHECK_KEEP_DAYS",
   alert_webhook: "ALERT_WEBHOOK",
   globalping_token: "GLOBALPING_TOKEN",
 };
