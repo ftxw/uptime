@@ -1,15 +1,14 @@
 /**
- * 认证：常量时间比较 + PBKDF2 密码哈希 + HMAC-SHA256 签名会话 + 内存限速。
+ * 认证：常量时间比较 + HMAC-SHA256 签名会话 + 内存限速。
  *
- * ⚠️ PBKDF2 轮数为什么是 5000 而不是十万级 —— 别照搬参考项目：
- *   参考项目 HaoNav 跑在 EdgeOne Edge Functions（CPU 预算 200 ms），用了 210k 轮（≈23 ms）；
- *   本 Worker 跑在 **Cloudflare Workers 免费版，CPU 限制 10 ms/次执行**，
- *   直接搬过来会超限。5000 轮在本机 V8 约 0.7 ms，留了足够余量。
- *   ⛔ 改轮数前先确认执行环境的 CPU 预算 —— 这是「抗离线爆破」与「CPU 上限」的直接交换。
+ * 密码**只来自环境变量** `ADMIN_PASSWORD`（wrangler secret 或 Dashboard Variables），
+ * 不在 D1 里存哈希 —— 密码属于部署期配置，放环境变量更简单、更容易审计，
+ * 也省掉了"改了密码如何作废旧会话"这类额外状态。因此本文件不含 PBKDF2。
  *
  * 会话是**自包含签名 token**，服务端不留状态（不写 D1/KV）：
  *   token = base64url(JSON payload) . base64url(HMAC-SHA256(secret, payload))
- *   改密码时会把 session_secret 一并重置 → 所有旧会话立即失效。
+ * 签名密钥取自 ADMIN_SECRET 环境变量；未设则在 D1 里生成一个随机值持久化
+ * （这样多机房、多 isolate 之间签名一致，重启也不会把所有会话踢掉）。
  */
 
 const encoder = new TextEncoder();
@@ -37,65 +36,10 @@ function toHex(bytes) {
   return s;
 }
 
-function fromHex(s) {
-  if (typeof s !== "string" || s.length % 2 !== 0 || !/^[0-9a-fA-F]*$/.test(s)) return null;
-  const out = new Uint8Array(s.length / 2);
-  for (let i = 0; i < out.length; i++) {
-    const b = Number.parseInt(s.slice(i * 2, i * 2 + 2), 16);
-    if (Number.isNaN(b)) return null;
-    out[i] = b;
-  }
-  return out;
-}
-
 export function randomHex(bytes = 32) {
   const buf = new Uint8Array(bytes);
   crypto.getRandomValues(buf);
   return toHex(buf);
-}
-
-/* ───────────────────────── 密码哈希（PBKDF2-SHA256）───────────────────────── */
-
-/** 存储格式：`pbkdf2$<iters>$<saltHex>$<hashHex>` —— 含轮数与盐，便于将来平滑升级 */
-export const PBKDF2_ITERATIONS = 5000;
-
-async function derivePbkdf2(password, salt, iterations) {
-  const key = await crypto.subtle.importKey(
-    "raw",
-    encoder.encode(password ?? ""),
-    "PBKDF2",
-    false,
-    ["deriveBits"]
-  );
-  const bits = await crypto.subtle.deriveBits(
-    { name: "PBKDF2", hash: "SHA-256", salt, iterations },
-    key,
-    256
-  );
-  return toHex(new Uint8Array(bits));
-}
-
-/** 生成密码哈希。盐随机 → 同一密码每次结果都不同 */
-export async function hashPassword(password, iterations = PBKDF2_ITERATIONS) {
-  const salt = new Uint8Array(16);
-  crypto.getRandomValues(salt);
-  const hex = await derivePbkdf2(password, salt, iterations);
-  return `pbkdf2$${iterations}$${toHex(salt)}$${hex}`;
-}
-
-/** 校验哈希；格式非法一律 false（fail-closed） */
-export async function verifyPasswordHash(input, stored) {
-  if (typeof stored !== "string" || stored.length === 0) return false;
-  const parts = stored.split("$");
-  if (parts.length !== 4 || parts[0] !== "pbkdf2") return false;
-  const iterations = Number(parts[1]);
-  // 上界防止有人把轮数写成天文数字导致 CPU 超限
-  if (!Number.isInteger(iterations) || iterations < 1000 || iterations > 100000) return false;
-  const salt = fromHex(parts[2]);
-  const expected = fromHex(parts[3]);
-  if (!salt || salt.length < 8 || !expected || expected.length !== 32) return false;
-  const actual = await derivePbkdf2(input ?? "", salt, iterations);
-  return constantTimeEqual(actual, parts[3].toLowerCase());
 }
 
 /* ───────────────────────── 会话（HMAC 签名 token）───────────────────────── */

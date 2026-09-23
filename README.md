@@ -34,9 +34,11 @@ custom_domain = true
 > `custom_domain = true` 会自动建 DNS 记录并签发证书，域名 DNS 需托管在 Cloudflare。
 > ⚠️ 不要用 `workers.dev` 域名——实测在中国大陆不可达。
 
-### 2. 设置管理员密码（推荐）
+### 2. 设置管理员密码
 
-密码可以**在部署前用环境变量设好**，这样部署完成即有保护，不存在「后台暂时开放」的窗口期：
+密码**只来自环境变量** `ADMIN_PASSWORD`，后台没有改密码的入口（改密码 = 改这里）。
+
+强烈建议在**部署前**就设好，这样部署完成即有保护，不存在「后台暂时开放」的窗口期：
 
 ```bash
 npx wrangler secret put ADMIN_PASSWORD
@@ -48,11 +50,11 @@ npx wrangler secret put ADMIN_PASSWORD
 > 名称填 `ADMIN_PASSWORD`，类型选 **Secret**（不是 Text），保存。
 > 之后每次部署都会自动注入，无需重复配置。
 
-> 不设也能用，但**首次访问 `/admin` 时没有密码，任何人在你设置之前都能改配置** ——
-> 那种「先开放、再进后台设」的方式只适合自己马上就去配的场景。
+> 不设也能用，但**任何人都能进 `/admin` 改配置**，页面顶部会显示醒目警告。
 >
-> 环境变量的优先级**高于**后台设置的密码。设了它之后，后台「设置 → 安全」里的
-> 密码输入框会变灰并提示「此处设置暂不生效」。
+> **为什么不做成后台可改**：那样就得在 D1 里存密码哈希，还要额外处理「改密码如何
+> 作废旧会话」。而密码本质是部署期配置，放环境变量更简单、也更容易审计。
+> 改密码的代价就是重新设置一次变量，不需要重新部署。
 
 ### 3-A. 命令行部署（一条命令）
 
@@ -99,15 +101,18 @@ npm run deploy
 ### 4. 首次访问
 
 访问 `https://<你的域名>/admin` 登录后台（第 2 步设了 `ADMIN_PASSWORD` 就在这里输入；
-没设过则直接进入，页面会提示尽快设置）。
+没设过则直接进入，页面顶部会提示尽快设置）。
 
-> **忘了密码**：用环境变量覆盖一个最快 —— `npx wrangler secret put ADMIN_PASSWORD`
-> （环境变量优先级更高，设完立即生效）。后台里改不了已经忘记的旧密码，
-> 因为根本登不进去。
+> **忘了密码**：直接重设环境变量即可 ——
+> ```bash
+> npx wrangler secret put ADMIN_PASSWORD
+> ```
+> 或去 Dashboard 的 Variables and Secrets 改。设完立即生效，不需要重新部署。
 
 ### 5. 加监控站点
 
 后台「站点 → ＋添加站点」，填名称和地址即可。分类可下拉选择，也可选「＋ 新建分类…」顺手建一个。
+探测后端按站点选（`auto` / `cf` / `globalping`），**位置则由「设置 → 探测」统一配置**。
 
 ---
 
@@ -123,8 +128,8 @@ npm run deploy
 | 外观 | 站点标题 | 站点状态 | 前台标题与页头品牌名 |
 | | 前台默认主题 | 跟随系统 | 跟随系统 / 浅色 / 深色（用户手动切换优先） |
 | 探测 | 默认后端 | auto | `auto`＝配了 token 走 Globalping，否则回落 CF |
-| | CF 区域组 | apac | `apac`香港、`apac-ne`首尔、`apac-se`新加坡等 |
-| | Globalping 筛选 | CN+datacenter-network | 国内云机房；也可填 `CN+eyeball-network`（家庭宽带） |
+| | CF 区域组 | apac | **全局**。`apac`香港、`apac-ne`首尔、`apac-se`新加坡等 |
+| | Globalping 筛选 | CN+datacenter-network | **全局**。国内云机房；也可填 `CN+eyeball-network`（家庭宽带） |
 | | 每次探测点数 | 1 | ⚠️ 每个探针算 1 次额度 |
 | | IP 版本 | 4 | 4 / 6 |
 | | 探测超时 | 8000 ms | |
@@ -134,17 +139,18 @@ npm run deploy
 | 高级 | 子请求预算 | 30 | 免费层上限 50，需给 D1 查询留余量 |
 | | 明细保留天数 | 30 | 过期记录由 cron 每天自动清理 |
 | 告警 | Webhook 地址 | 空 | 可直接对接飞书 / 钉钉 / Server 酱 |
-| 安全 | 管理员密码 | 未设置 | 设置后后台要求登录，30 天免登录 |
 
-### 敏感值
+> **为什么位置（CF 区域组 / Globalping 筛选）是全局而不是每站点一份**：
+> 一个站点只会解析出唯一后端，所以两份位置必然只有一份生效 ——
+> 另一份是死配置，放出来只会让人误以为能分别控制。
 
-三项都可以在后台填，只有想用环境变量固定它们时才需要配 secret：
+### 敏感值（都用环境变量）
 
-| 名称 | 用环境变量配的理由 |
+| 名称 | 说明 |
 |---|---|
-| `ADMIN_PASSWORD` | **推荐**。部署即生效，无「后台暂未设密码」的开放窗口；也是忘记密码时的唯一救法 |
-| `GLOBALPING_TOKEN` | Globalping 额度 250 → 500 次/小时 |
-| `ALERT_WEBHOOK` | 告警地址；想避免配置泄露到数据库时用它 |
+| `ADMIN_PASSWORD` | **必设**。后台唯一的登录凭据；不设则后台完全开放 |
+| `GLOBALPING_TOKEN` | 可选。Globalping 额度 250 → 500 次/小时 |
+| `ALERT_WEBHOOK` | 可选。告警地址（也能在后台「设置 → 告警」里填） |
 
 ```bash
 npx wrangler secret put ADMIN_PASSWORD
@@ -154,9 +160,6 @@ npx wrangler secret put ALERT_WEBHOOK
 
 用 GitHub 自动部署时，改在 Dashboard：**项目 → Settings → Variables and Secrets**（类型选 Secret）。
 
-> 环境变量的优先级高于后台设置。所以设了 `ADMIN_PASSWORD` 后，
-> 后台的密码框会变灰并提示「此处设置暂不生效」。
->
 > `ADMIN_SECRET` 用于固定会话签名密钥（不设也行，会在 D1 里自动生成随机值）。
 
 ---
@@ -186,7 +189,7 @@ src/
   db.js       数据层：所有 SQL 集中在此
   probe.js    探测：CF Durable Object / Globalping 两后端
   prober.js   Durable Object 实现
-  auth.js     PBKDF2 密码哈希 + HMAC 签名会话
+  auth.js     常量时间比较 + HMAC 签名会话（密码只比环境变量，不存哈希）
 public/
   index.html / app.js        前台总览
   monitor.html / monitor.js  站点详情（图表为原生 SVG，无图表库）
@@ -209,8 +212,10 @@ wrangler.toml   只有绑定配置；运行参数一律在后台「设置」里�
 - **后台为什么要聚合接口**：实测从国内访问 CF 边缘，单个请求 TTFB 中位约 780ms（静态文件、
   走缓存、不进 Worker 也是这个数）——瓶颈在链路，不在数据库。所以优化方向是**减少请求数**，
   后台从串行 3 个请求合并成 1 个 `/api/admin`。
-- **密码哈希只用了 5000 轮 PBKDF2**：Workers 免费版 CPU 上限 10ms/次。参考项目跑在
-  EdgeOne（200ms 预算）用 21 万轮，直接照搬会超限。
+- **密码为什么不做成后台可改**：那样就得在 D1 存哈希、还要处理「改密码如何作废旧会话」。
+  密码本质是部署期配置，放环境变量更简单、更容易审计，也省掉一类状态。
+  登录仍用常量时间比较，且 `ADMIN_PASSWORD` 为空时 fail-closed。
+- **位置为什么是全局而非每站点**：一个站点只解析出唯一后端，两份位置必然只有一份生效。
 - **登录限速在 D1 上计数**：低流量下 Workers 经常每次请求都新建 isolate，内存 Map 形同虚设。
 
 ---

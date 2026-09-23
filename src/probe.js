@@ -201,7 +201,10 @@ export function judge(site, r) {
 export async function gpCreate(env, site) {
   const token = env && env.GLOBALPING_TOKEN;
   const u = new URL(normalizeUrl(site.url));
-  const magic = site.gp_magic || (env && env.GP_MAGIC) || "CN+datacenter-network";
+  // 位置筛选是**全局设置**（后台「设置 → 探测」）。
+  // 不做成站点级的原因：一个站点只用一个后端，站点级的 CF 区域组/GP 筛选
+  // 必然只有一个是活的，另一个是死配置。
+  const magic = (env && env.GP_MAGIC) || "CN+datacenter-network";
   const limit = Number((env && env.GP_LIMIT) || 1);
   const protocol = u.protocol === "http:" ? "HTTP" : "HTTPS";
   const port = u.port ? Number(u.port) : protocol === "HTTP" ? 80 : 443;
@@ -300,7 +303,7 @@ export async function gpSslCheck(env, site) {
   if (u.protocol !== "https:") {
     return { error: "非 HTTPS 站点，跳过证书检测" };
   }
-  // ⚠️ 刻意**不使用** site.gp_magic。
+  // ⚠️ 刻意**不用可用性探测的筛选**（GP_MAGIC）：
   // 可用性探测的筛选可能很窄（例如 CN+xian+eyeball-network），窄到没有探针；
   // 而 SSL 检测只需要任意一个能建立 TLS 的探针即可，用窄条件会让证书检测连带失败。
   const magic =

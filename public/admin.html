@@ -59,7 +59,8 @@
 
   <div class="alert alert-info" id="banner" hidden></div>
   <div class="alert alert-warn" id="pwd-warn" hidden>
-    <b>尚未设置管理员密码</b> —— 当前任何人都能修改配置。请在右上角「设置 → 安全」中立即设置密码。
+    <b>尚未设置管理员密码</b> —— 当前任何人都能修改配置。
+    请给 Worker 添加环境变量 <code>ADMIN_PASSWORD</code>（类型选 Secret），保存后立即生效。
   </div>
 
   <!-- 左右两栏：左 = 分类，右 = 站点 -->
@@ -152,38 +153,7 @@
             <option value="cf">cf（Cloudflare Durable Object）</option>
             <option value="globalping">globalping（第三方探针）</option>
           </select>
-        </div>
-      </div>
-
-      <div class="grid-2">
-        <div class="field">
-          <label for="f-hint">CF 区域组（仅 cf 后端用）</label>
-          <select id="f-hint">
-            <option value="apac">apac — 亚太（实测 HKG 香港 / KIX 大阪）</option>
-            <option value="apac-se">apac-se — 东南亚（实测 HKG 香港 / SIN 新加坡）</option>
-            <option value="apac-ne">apac-ne — 东北亚（实测 ICN 首尔 / NRT 东京）</option>
-            <option value="oc">oc — 大洋洲</option>
-            <option value="wnam">wnam — 北美西部</option>
-            <option value="enam">enam — 北美东部</option>
-            <option value="weur">weur — 西欧</option>
-            <option value="eeur">eeur — 东欧</option>
-            <option value="me">me — 中东</option>
-            <option value="afr">afr — 非洲</option>
-            <option value="sam">sam — 南美</option>
-          </select>
-          <span class="hint">留空则用全局默认；区域组有保证，组内具体机房由 CF 自选</span>
-        </div>
-        <div class="field">
-          <label for="f-magic">Globalping 位置筛选（仅 globalping 后端用）</label>
-          <input id="f-magic" placeholder="CN+datacenter-network" list="magic-list">
-          <datalist id="magic-list">
-            <option value="CN+datacenter-network">中国大陆 · 云机房（稳，推荐用来定阈值）</option>
-            <option value="CN+eyeball-network">中国大陆 · 家庭宽带（真实，但不稳）</option>
-            <option value="east-asia">东亚</option>
-            <option value="western-europe">西欧</option>
-            <option value="north-america">北美</option>
-          </datalist>
-          <span class="hint">留空则用全局设置。也可写 CN+changsha+4837 精确锁运营商</span>
+          <span class="hint">区域组 / 位置筛选在「设置 → 探测」里统一配置</span>
         </div>
       </div>
 
@@ -235,7 +205,7 @@
 
     <div class="dialog-foot">
       <button class="btn" value="cancel" formnovalidate type="submit">取消</button>
-      <button class="btn btn-primary" id="save" value="save" type="submit">保存</button>
+      <button class="btn btn-primary" value="save" type="submit">保存</button>
     </div>
   </form>
 </dialog>
@@ -307,7 +277,7 @@
           </select>
         </div>
         <div class="field">
-          <label for="s-hint">CF 默认区域组</label>
+          <label for="s-hint">CF 区域组</label>
           <select id="s-hint">
             <option value="">（不指定）</option>
             <option value="apac">apac — 亚太</option>
@@ -322,6 +292,7 @@
             <option value="afr">afr — 非洲</option>
             <option value="sam">sam — 南美</option>
           </select>
+          <span class="hint">对所有用 cf 后端的站点生效</span>
         </div>
         <div class="field">
           <label for="s-timeout">探测超时（ms）</label>
@@ -336,8 +307,9 @@
           <span class="hint" id="s-gp-token-hint">未配置（额度 250 次/小时）</span>
         </div>
         <div class="field">
-          <label for="s-magic">Globalping 默认筛选</label>
+          <label for="s-magic">Globalping 位置筛选</label>
           <input id="s-magic" list="magic-list2" placeholder="CN+datacenter-network">
+          <span class="hint">对所有用 globalping 后端的站点生效</span>
           <datalist id="magic-list2">
             <option value="CN+datacenter-network">中国大陆 · 云机房</option>
             <option value="CN+eyeball-network">中国大陆 · 家庭宽带</option>
@@ -397,24 +369,6 @@
         <label for="s-webhook">Webhook 地址</label>
         <input id="s-webhook" placeholder="https://...（留空则不告警）">
         <span class="hint">可直接对接飞书 / 钉钉 / Server 酱的通用 Webhook</span>
-      </div>
-
-      <h3 class="set-group">安全</h3>
-      <div class="grid-2">
-        <div class="field">
-          <label for="s-pwd">管理员密码</label>
-          <input id="s-pwd" type="password" placeholder="留空 = 不修改" autocomplete="new-password">
-          <span class="hint" id="s-pwd-hint"></span>
-        </div>
-        <div class="field">
-          <label for="s-pwd2">确认新密码</label>
-          <input id="s-pwd2" type="password" autocomplete="new-password">
-        </div>
-      </div>
-      <div>
-        <button type="button" class="btn btn-danger btn-sm" id="s-pwd-remove" hidden>
-          移除密码（恢复为开放访问）
-        </button>
       </div>
     </div>
 

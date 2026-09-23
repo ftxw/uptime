@@ -25,8 +25,6 @@ import {
 } from "./probe.js";
 import {
   constantTimeEqual,
-  hashPassword,
-  verifyPasswordHash,
   issueSession,
   verifySession,
   getSessionToken,
@@ -183,7 +181,6 @@ async function buildAdminPayload(env) {
   const sites = (sitesRes.results || []).map((s) => ({
     ...s,
     resolved_kind: resolveKind(s, env),
-    cf_hint_resolved: cfHintOf(s, env),
     last_ok: lastMap[s.id]?.ok ?? null,
     last_status: lastMap[s.id]?.status ?? null,
     last_ttfb: lastMap[s.id]?.ttfb_ms ?? null,
@@ -217,9 +214,21 @@ function resolveKind(site, env) {
   return hasGp ? "globalping" : "cf";
 }
 
-function cfHintOf(site, env) {
-  const h = site.cf_hint || (env && env.CF_HINT) || "apac";
+/**
+ * CF 探测区域组：**全局设置**（后台「设置 → 探测」或 env.CF_HINT）。
+ *
+ * 为什么不做成站点级：一个站点只会解析出唯一后端（见 resolveKind），
+ * 所以站点级的「CF 区域组」与「Globalping 筛选」永远只有一个会生效，
+ * 另一个是死配置 —— 放着只会让人误以为可以分别控制。
+ */
+function cfHintOf(env) {
+  const h = (env && env.CF_HINT) || "apac";
   return REGION_GROUPS.includes(h) ? h : "apac";
+}
+
+/** Globalping 位置筛选：同样是全局设置。null 表示用 probe.js 的内置默认 */
+function gpMagicOf(env) {
+  return (env && env.GP_MAGIC) || null;
 }
 
 /**
@@ -308,8 +317,13 @@ const SETTING_KEYS = [
   "globalping_token",  // Globalping token（只在后台可写，读取时脱敏）
 ];
 
-/** 只读内部状态，不对外暴露 */
-const INTERNAL_KEYS = ["admin_password", "session_secret", "config_version"];
+/**
+ * 不对外暴露的内部状态键（不在 SETTING_KEYS 里，后台读写接口都碰不到）：
+ *   session_secret     会话签名密钥，首次需要时随机生成并落库
+ *   config_version     配置版本号，用于让边缘缓存立即失效
+ *   login_fail_window / login_fail_count   登录失败计数（全局限速）
+ *   admin_password     已废弃 —— 密码只走环境变量，此处仅列出以免误用
+ */
 
 /**
  * 把 D1 设置合并进 env —— 现有代码全部读 env.XXX，这样一处覆盖、全链路生效，
@@ -432,7 +446,7 @@ function publicSettings(env, raw) {
   s.globalping_token = "";
   s.globalping_token_masked = maskToken(env.GLOBALPING_TOKEN);
   s.has_globalping_token = Boolean(env.GLOBALPING_TOKEN);
-  s.password_source = env.ADMIN_PASSWORD ? "env" : raw.admin_password ? "db" : "none";
+  s.password_source = env.ADMIN_PASSWORD ? "env" : "none";
   return s;
 }
 
@@ -615,7 +629,7 @@ async function dispatch(env, sites) {
     // 按 hint 分组，一组一次 DO 调用
     const groups = {};
     for (const s of cfSites) {
-      const h = cfHintOf(s, env);
+      const h = cfHintOf(env);
       (groups[h] = groups[h] || []).push(s);
     }
     for (const [hint, list] of Object.entries(groups)) {
@@ -669,7 +683,7 @@ async function dispatch(env, sites) {
   if (gpFailed.length) {
     const groups = {};
     for (const { site } of gpFailed) {
-      const h = cfHintOf(site, env);
+      const h = cfHintOf(env);
       (groups[h] = groups[h] || []).push(site);
     }
     for (const [hint, list] of Object.entries(groups)) {
@@ -798,7 +812,10 @@ export default {
        设置存 D1 且优先级高于环境变量；合并回 env 后，下游所有 `env.XXX` 读取
        自动变成「D1 设置 → 环境变量 → 代码默认」，不必在每个调用点改成读设置。 */
     const rawSettings = await loadSettings(env);
-    const pwdConfigured = Boolean(rawSettings.admin_password || env.ADMIN_PASSWORD);
+    // 密码**只认环境变量** ADMIN_PASSWORD（wrangler secret / Dashboard Variables）。
+    // 不做后台可改密码：那样就得在 D1 里存哈希、还要处理"改了密码如何作废旧会话"，
+    // 而密码本就属于部署期配置，放环境变量更简单也更容易审计。
+    const pwdConfigured = Boolean(env.ADMIN_PASSWORD);
 
     let authed = false;
     if (!pwdConfigured) {
@@ -814,7 +831,6 @@ export default {
 
     env = await effectiveEnv(env, rawSettings);
 
-    // 公开接口：前台只读展示 + 登录/会话探测。其余（含所有写接口）都要求已登录。
     // 公开接口：前台只读展示 + 登录/登出。其余（含所有写接口）都要求已登录。
     const PUBLIC_APIS = new Set(["overview", "site", "login", "logout"]);
     if (pwdConfigured && !PUBLIC_APIS.has(api) && !authed) {
@@ -864,13 +880,9 @@ export default {
         const body = await request.json().catch(() => ({}));
         const input = String(body.password || "");
 
-        let pass = false;
-        if (env.ADMIN_PASSWORD) {
-          // 环境变量（secret）优先 —— 也算"救援密码"：D1 里密码忘了还能用它进来
-          pass = constantTimeEqual(input, env.ADMIN_PASSWORD);
-        } else if (rawSettings.admin_password) {
-          pass = await verifyPasswordHash(input, rawSettings.admin_password);
-        }
+        // fail-closed：ADMIN_PASSWORD 为空时一律不放行（此时闸门本来也不会走到这里）
+        const expected = env.ADMIN_PASSWORD || "";
+        const pass = expected.length > 0 && constantTimeEqual(input, expected);
 
         if (!pass) {
           await recordLoginFail(env, rawSettings);
@@ -928,30 +940,10 @@ export default {
             saved.push("globalping_token:cleared");
           }
 
-          let newCookie = null;
-          if (body.new_password) {
-            const pwd = String(body.new_password);
-            if (pwd.length < 6) {
-              return json({ ok: false, error: "密码至少 6 位" }, 400, "no-store", pretty);
-            }
-            await saveSetting(env, "admin_password", await hashPassword(pwd));
-            // 重置会话密钥 → 所有旧会话立即失效；紧接着给当前浏览器签发新会话，免得把自己踢出去
-            await saveSetting(env, "session_secret", randomHex(32));
-            const fresh = await loadSettings(env);
-            const token = await issueSession(await sessionSecret(env, fresh), SESSION_TTL);
-            newCookie = buildSessionCookie(token, SESSION_TTL, true);
-            saved.push("admin_password");
-          }
-
-          if (body.remove_password) {
-            await saveSetting(env, "admin_password", "");
-            saved.push("admin_password:removed");
-          }
-
+          // 密码不在这里改 —— 它只来自环境变量 ADMIN_PASSWORD，
+          // 改密码 = 改 Cloudflare 上的变量/secret 后重新部署，不需要（也不该）走后台。
           await bumpConfigVersion(env);
-          const headers = { ...JSON_HEADERS, "Cache-Control": "no-store" };
-          if (newCookie) headers["Set-Cookie"] = newCookie;
-          return new Response(JSON.stringify({ ok: true, saved }), { status: 200, headers });
+          return json({ ok: true, saved }, 200, "no-store", pretty);
         }
 
         // GET：回显设置。token 永不回传明文，只给掩码 + 是否存在
@@ -959,7 +951,6 @@ export default {
           {
             ok: true,
             authed,
-            password_configured: pwdConfigured,
             settings: publicSettings(env, rawSettings),
           },
           200,
@@ -990,8 +981,8 @@ export default {
                           ROW_NUMBER() OVER (PARTITION BY site ORDER BY ts DESC) rn
                    FROM checks
                  )
-                 SELECT s.id, s.name, s.url, s.group_name, s.probe_kind, s.cf_hint,
-                        s.gp_magic, s.fail_threshold, s.expect_codes, s.keyword,
+                 SELECT s.id, s.name, s.url, s.group_name, s.probe_kind,
+                        s.fail_threshold, s.expect_codes, s.keyword,
                         COALESCE(st.consecutive_fail, 0) AS consecutive_fail,
                         l.ok AS last_ok, l.status AS last_status,
                         l.ttfb_ms AS last_ttfb, l.source AS last_source,
@@ -1074,7 +1065,7 @@ export default {
               name: s.name,
               url: s.url,
               probe_kind: resolveKind(s, env),
-              cf_hint: cfHintOf(s, env),
+              cf_hint: cfHintOf(env),
               state,
               degrade_reason: degradeReason,
               last_ok: s.last_ok,
@@ -1166,7 +1157,7 @@ export default {
                      SELECT ok, status, ttfb_ms, total_ms, source, probe, ts, error
                      FROM checks WHERE site = ?1 ORDER BY ts DESC LIMIT 1
                    )
-                   SELECT s.id, s.name, s.url, s.group_name, s.probe_kind, s.cf_hint, s.gp_magic,
+                   SELECT s.id, s.name, s.url, s.group_name, s.probe_kind,
                           s.fail_threshold, s.interval_min, s.expect_codes, s.keyword,
                           s.enabled, s.sort,
                           COALESCE(st.consecutive_fail, 0) AS consecutive_fail,
@@ -1349,8 +1340,8 @@ export default {
                 url: meta.url,
                 group_name: meta.group_name || "未分组",
                 probe_kind: resolveKind(meta, env),
-                cf_hint: cfHintOf(meta, env),
-                gp_magic: meta.gp_magic || null,
+                cf_hint: cfHintOf(env),
+                gp_magic: gpMagicOf(env),
                 expect_codes: meta.expect_codes || null,
                 keyword: meta.keyword || null,
                 fail_threshold: failThreshold,
@@ -1532,14 +1523,13 @@ export default {
             if (!s.id || !s.url) continue;
             await d
               .prepare(
-                `INSERT INTO sites (id,name,url,group_name,expect_codes,keyword,probe_kind,cf_hint,gp_magic,fail_threshold,interval_min,enabled,sort)
-                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                `INSERT INTO sites (id,name,url,group_name,expect_codes,keyword,probe_kind,fail_threshold,interval_min,enabled,sort)
+                 VALUES (?,?,?,?,?,?,?,?,?,?,?)
                  ON CONFLICT(id) DO UPDATE SET
                    name=excluded.name, url=excluded.url,
                    group_name=excluded.group_name,
                    expect_codes=excluded.expect_codes, keyword=excluded.keyword,
-                   probe_kind=excluded.probe_kind, cf_hint=excluded.cf_hint,
-                   gp_magic=excluded.gp_magic, fail_threshold=excluded.fail_threshold,
+                   probe_kind=excluded.probe_kind, fail_threshold=excluded.fail_threshold,
                    interval_min=excluded.interval_min, enabled=excluded.enabled,
                    sort=excluded.sort`
               )
@@ -1551,8 +1541,6 @@ export default {
                 s.expect_codes ?? "",
                 s.keyword ?? null,
                 s.probe_kind ?? null,
-                s.cf_hint ?? null,
-                s.gp_magic ?? null,
                 Number(s.fail_threshold ?? 3),
                 Number(s.interval_min ?? 5),
                 s.enabled === false ? 0 : 1,
@@ -1572,17 +1560,16 @@ export default {
          首屏只需「HTML + /admin」两个请求，后台打开速度接近减半。 */
       if (api === "admin") {
         const payload = await buildAdminPayload(env);
+        // 复用请求开头已读到的 rawSettings，不再多查一次 D1
+        const settings = publicSettings(env, rawSettings);
         return json(
           {
             ok: true,
             ...payload,
-            // 复用请求开头已读到的 rawSettings，不再多查一次 D1
-            settings: publicSettings(env, rawSettings),
-            password_source: rawSettings.admin_password
-              ? "db"
-              : env.ADMIN_PASSWORD
-              ? "env"
-              : "none",
+            settings,
+            // 只反映「密码是否已配置」，用于前端决定是否显示警告/退出按钮。
+            // 与 settings.password_source 同源，避免两处逻辑漂移。
+            password_source: settings.password_source,
           },
           200,
           "no-store",
@@ -1607,7 +1594,7 @@ export default {
         const target = url.searchParams.get("target") || "https://www.baidu.com";
         const timeoutMs = Number((env && env.TIMEOUT_MS) || 8000);
         if (kind === "cf") {
-          const hint = url.searchParams.get("hint") || cfHintOf({}, env);
+          const hint = url.searchParams.get("hint") || cfHintOf(env);
           const multi = url.searchParams.get("targets");
           const list = multi
             ? multi.split(",").map((u) => u.trim()).filter(Boolean).map((u) => ({ url: u, keyword: null }))
@@ -1621,8 +1608,9 @@ export default {
             results: out.results,
           });
         }
-        const site = { url: target, gp_magic: url.searchParams.get("magic") || null };
-        const { id, source, quota } = await gpCreate(env, site);
+        // 位置筛选统一取全局设置，不再支持按请求覆盖 ——
+        // 否则"测出来的结果"和"真实探测"可能用的不是同一个筛选，失去参考价值。
+        const { id, source, quota } = await gpCreate(env, { url: target });
         let finished = null;
         for (let i = 0; i < 12 && !finished; i++) {
           await new Promise((r) => setTimeout(r, 2500));
@@ -1659,6 +1647,15 @@ export default {
   },
 
   async scheduled(controller, env, ctx) {
+    // ⚠️ 必须先合并后台设置再往下走。
+    //    fetch 路径有 `env = await effectiveEnv(...)`，但 cron 是独立入口 ——
+    //    漏掉这一步的话，后台里改的区域组 / 筛选 / 超时 / 告警 / 保留天数
+    //    对定时探测**全部无效**（只会用到环境变量或代码默认值），
+    //    而页面上却显示"已保存、立即生效"，属于静默失效。
+    //    合并一次即可：下面所有函数都读 env。
+    const settings = await loadSettings(env);
+    env = await effectiveEnv(env, settings);
+
     const sites = await loadSites(env);
 
     // 先收取上一轮 Globalping 的结果 —— 必须全量收，不受间隔影响：

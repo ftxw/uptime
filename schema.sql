@@ -10,8 +10,8 @@ CREATE TABLE IF NOT EXISTS sites (
   url            TEXT NOT NULL,
   group_name     TEXT,                -- 所属分类；NULL/空 = 未分组
   probe_kind     TEXT,                -- 'cf' | 'globalping'；NULL = 继承全局默认
-  cf_hint        TEXT,                -- CF 探测区域组，如 apac / apac-ne / apac-se
-  gp_magic       TEXT,                -- Globalping 位置筛选，如 CN+datacenter-network
+  -- 位置（CF 区域组 / Globalping 筛选）是**全局设置**，不在这里。
+  -- 一个站点只解析出唯一后端，站点级放两份位置必然只有一份生效，是死配置。
   expect_codes   TEXT,                -- 逗号分隔，如 "200,301"；空 = 接受 2xx/3xx
   keyword        TEXT,                -- 正文关键字校验（防"200 但内容是错误页"）
   fail_threshold INTEGER NOT NULL DEFAULT 3,  -- 连续失败多少次才判故障/告警

@@ -26,7 +26,7 @@ let FILTER = "";  // "" = 全部
 let DRAG_ID = null;
 let DRAG_CAT = null;     // 正在拖拽的分类名
 let AUTHED = false;
-let PWD_SOURCE = "none"; // none | db | env
+let PWD_SOURCE = "none"; // none | env —— 密码只来自环境变量 ADMIN_PASSWORD
 let SETTINGS = null;     // /admin 一次性带回的设置，用于设置面板预填
 let SSL_MAP = {};        // /admin 一次性带回的证书结果（site → 记录）
 
@@ -687,8 +687,6 @@ function openForm(site) {
   qs("#f-group-new").value = "";
   qs("#f-group-hint").textContent = "选「＋ 新建分类…」可直接建一个新分类";
   qs("#f-kind").value = site?.probe_kind || "";
-  qs("#f-hint").value = site?.cf_hint || "";
-  qs("#f-magic").value = site?.gp_magic || "";
   qs("#f-codes").value = site?.expect_codes || "";
   qs("#f-keyword").value = site?.keyword || "";
   qs("#f-threshold").value = site?.fail_threshold ?? 3;
@@ -719,8 +717,6 @@ qs("#form").addEventListener("submit", async (e) => {
     url: qs("#f-url").value.trim(),
     group_name: currentGroupValue(),
     probe_kind: qs("#f-kind").value || null,
-    cf_hint: qs("#f-hint").value || null,
-    gp_magic: qs("#f-magic").value.trim() || null,
     expect_codes: qs("#f-codes").value.trim(),
     keyword: qs("#f-keyword").value.trim() || null,
     fail_threshold: Number(qs("#f-threshold").value || 3),
@@ -777,15 +773,10 @@ document.addEventListener("click", async (e) => {
     btn.disabled = true;
     btn.textContent = "…";
     try {
-      const kind = site?.probe_kind || "";
-      const q =
-        kind === "globalping"
-          ? `kind=globalping&target=${encodeURIComponent(site.url)}&magic=${encodeURIComponent(
-              site.gp_magic || ""
-            )}`
-          : `kind=cf&target=${encodeURIComponent(site.url)}&hint=${encodeURIComponent(
-              site?.cf_hint || ""
-            )}`;
+      // 位置（区域组 / 筛选）统一由后端从全局设置取，前端不再传 ——
+      // 保证"测出来的"与"真实探测"走同一套参数
+      const kind = site?.resolved_kind || "cf";
+      const q = `kind=${kind}&target=${encodeURIComponent(site.url)}`;
       const d = await api(`/test?${q}`);
       const res = (d.results || [])[0] || {};
       const where = d.egress?.colo ? `机房 ${d.egress.colo}` : res.probe || "";
@@ -888,38 +879,14 @@ function fillSettingsForm(s) {
   qs("#s-gp-token-hint").textContent = s.has_globalping_token
     ? `已配置：${s.globalping_token_masked}（留空则保留）`
     : "未配置（额度 250 次/小时；配置后 500 次/小时）";
-  qs("#s-pwd").value = "";
-  qs("#s-pwd2").value = "";
 
+  // 密码不在后台改，只用于决定「显示未设密码警告 / 是否显示退出按钮」
   PWD_SOURCE = s.password_source || "none";
-  const pwdHint = qs("#s-pwd-hint");
-  const pwdInput = qs("#s-pwd");
-  const removeBtn = qs("#s-pwd-remove");
-  if (PWD_SOURCE === "env") {
-    pwdHint.textContent = "当前使用环境变量 ADMIN_PASSWORD（优先级更高），此处设置暂不生效";
-    pwdInput.disabled = true;
-    removeBtn.hidden = true;
-  } else if (PWD_SOURCE === "db") {
-    pwdHint.textContent = "已在后台设置。留空表示不修改；设置新密码会作废其他设备的登录";
-    pwdInput.disabled = false;
-    removeBtn.hidden = false;
-  } else {
-    pwdHint.textContent = "尚未设置 —— 设置后后台将要求登录";
-    pwdInput.disabled = false;
-    removeBtn.hidden = true;
-  }
+  qs("#logout").hidden = PWD_SOURCE === "none";
+  qs("#pwd-warn").hidden = PWD_SOURCE !== "none";
 }
 
 qs("#settings-open").addEventListener("click", openSettings);
-
-let REMOVE_PWD = false;
-qs("#s-pwd-remove").addEventListener("click", () => {
-  if (!confirm("移除管理员密码后，任何人都能修改配置。确定继续？")) return;
-  REMOVE_PWD = true;
-  qs("#s-pwd").value = "";
-  qs("#s-pwd2").value = "";
-  qs("#s-pwd-hint").textContent = "保存后将移除密码（恢复开放访问）";
-});
 
 qs("#setform").addEventListener("submit", async (e) => {
   if (e.submitter?.value !== "save") return;
@@ -927,21 +894,6 @@ qs("#setform").addEventListener("submit", async (e) => {
 
   const errEl = qs("#set-err");
   errEl.hidden = true;
-
-  const pwd = qs("#s-pwd").value;
-  const pwd2 = qs("#s-pwd2").value;
-  if (pwd || pwd2) {
-    if (pwd.length < 6) {
-      errEl.textContent = "密码至少 6 位";
-      errEl.hidden = false;
-      return;
-    }
-    if (pwd !== pwd2) {
-      errEl.textContent = "两次输入的密码不一致";
-      errEl.hidden = false;
-      return;
-    }
-  }
 
   const btn = qs("#set-save");
   btn.disabled = true;
@@ -965,22 +917,12 @@ qs("#setform").addEventListener("submit", async (e) => {
     // 留空 = 不修改已有 token（后端识别 __KEEP__）
     globalping_token: qs("#s-gp-token").value.trim() || "__KEEP__",
   };
-  if (pwd) body.new_password = pwd;
-  if (REMOVE_PWD && !pwd) body.remove_password = true;
 
   try {
     const d = await post("/settings", body);
     if (!d.ok) throw new Error(d.error || "保存失败");
-    REMOVE_PWD = false;
     setdlg.close();
     banner("设置已保存，立即生效", "info");
-    PWD_SOURCE = body.new_password
-      ? "db"
-      : body.remove_password
-      ? "none"
-      : PWD_SOURCE;
-    qs("#logout").hidden = PWD_SOURCE === "none";
-    qs("#pwd-warn").hidden = PWD_SOURCE !== "none";
     await loadAll();
   } catch (err) {
     errEl.textContent = err.needLogin ? "会话已过期，请重新登录" : "保存失败：" + err.message;

@@ -427,6 +427,13 @@ dialog::backdrop { background: hsl(220 30% 10% / 0.45); }
 .alert-warn { background: hsl(var(--warning) / 0.12); color: hsl(var(--warning)); border-color: hsl(var(--warning) / 0.3); }
 .alert-error { background: hsl(var(--destructive) / 0.1); color: hsl(var(--destructive)); border-color: hsl(var(--destructive) / 0.25); }
 
+/* 行内代码：用来在提示里引用环境变量名 / 命令 */
+.alert code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: .92em; padding: 1px 5px; border-radius: 4px;
+  background: hsl(var(--muted) / .8);
+}
+
 .empty { padding: 44px 16px; text-align: center; color: hsl(var(--muted-foreground)); font-size: 13px; }
 
 /* ── 骨架屏 ─────────────────────────────────────────────── */
