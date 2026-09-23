@@ -1,0 +1,16 @@
+# Wrangler 本地状态与构建产物
+.wrangler/
+dist/
+
+# 依赖
+node_modules/
+
+# 本地环境变量（敏感值一律用 wrangler secret，不要落盘）
+.dev.vars
+.env
+.env.*
+!.env.example
+
+# 日志
+*.log
+npm-debug.log*

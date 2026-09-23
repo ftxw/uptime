@@ -1,0 +1,94 @@
+name = "uptime-v2"
+main = "src/index.js"
+compatibility_date = "2026-09-22"
+
+# ── 定时 ──────────────────────────────────────────────────────────────
+# 免费计划：每账号最多 5 个 cron trigger，最小粒度 1 分钟，时区固定 UTC。
+# 探测位置与 cron 执行位置无关：CF 后端把活交给 Durable Object（locationHint 锁区域），
+# Globalping 后端把活交给第三方探针 —— 两条路都不受 cron 落在哪个机房影响。
+[triggers]
+crons = ["*/5 * * * *"]
+
+# ── 自定义域名 ────────────────────────────────────────────────────────
+# ⚠️ workers.dev 域名在中国大陆不可达（实测本机与国内节点都 fetch 失败），
+#    所以必须绑自定义域名。custom_domain = true 会自动建 DNS 记录并签发证书。
+[[routes]]
+pattern = "uptime.333399.xyz"
+custom_domain = true
+
+# ── 存储（复用已有 D1，表名前缀 v2_ 避免与旧表冲突）────────────────────
+[[d1_databases]]
+binding = "DB"
+database_name = "site-monitor-db"
+database_id = "f095cb2f-a10a-4c6f-91bd-bd4b16eb70c9"
+
+# ── CF 探测后端：Durable Object（位置可控）─────────────────────────────
+# 免费计划只能用 SQLite 后端 → 必须 new_sqlite_classes
+# 免费额度：10 万请求/天、13000 GB-s/天
+[[durable_objects.bindings]]
+name = "PROBER"
+class_name = "Prober"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Prober"]
+
+# ── 静态资源（前台 + 后台）─────────────────────────────────────────────
+# Workers Static Assets：命中静态文件时**不执行 Worker**，官方说明此类请求
+# 也不消耗 Worker 请求额度（免费层 10 万/天）。
+# 默认 run_worker_first = false → 先匹配静态文件，未命中才进 Worker，
+# 所以 /api/* 会自动落到 Worker，而 / 与 /admin 走静态文件。
+[assets]
+directory = "./public"
+binding = "ASSETS"
+
+# ── 探测后端选择 ──────────────────────────────────────────────────────
+[vars]
+# auto        → 配了 GLOBALPING_TOKEN 就走 globalping，否则回落 cf（推荐）
+# cf          → 全部走 CF DO
+# globalping  → 全部走 Globalping（没有 token 时自动降级到 cf）
+PROBE_MODE = "auto"
+
+# 探测后端为 cf 时使用的区域组（只接受粗粒度区域组）
+#   apac → HKG 香港 ｜ apac-se → HKG ｜ apac-ne → ICN 首尔
+#   想要东京/新加坡得用 Placement Hints，但它对 cron 无效 —— 所以这里拿不到
+CF_HINT = "apac"
+
+# Globalping 默认位置筛选（站点级 gp_magic 会覆盖它）
+#   CN+datacenter-network        国内云机房（稳，推荐用来定阈值）
+#   CN+eyeball-network           国内家庭宽带（真实，但不稳）
+#   CN+xian / CN+shanghai        指定城市
+#   east-asia / western-europe   大区
+GP_MAGIC = "CN+datacenter-network"
+
+# Globalping 每次测量的探测点个数 —— ⚠️ 每个探测点算 1 次额度，越小越省
+GP_LIMIT = "1"
+
+# 单次调用内允许的最大子请求数。
+# Workers 免费计划上限是 50/次；这里留出余量，因为 D1 查询也占子请求。
+# 每站点的开销：CF 后端≈1（按 hint 分组后更省）／Globalping 后端=2（发起+下一轮收取）
+SUBREQ_BUDGET = "30"
+
+TIMEOUT_MS = "8000"
+
+# 每轮 cron 最多补充检测几个站点的 SSL
+# ⚠️ 别调大：SSL 检测走 Globalping 的「发起+轮询」，单站点最多消耗约 13 个子请求，
+#    而 Workers 免费层每次调用上限是 50 个子请求。
+#    2 个/轮 × 每 5 分钟 → 10 个站点半小时内轮完一遍，对"证书一天查一次"完全够。
+SSL_PER_TICK = "2"
+
+# 证书剩余天数 ≤ 该值时，站点状态判为「降级」（对齐参考项目 lib/checker.ts 的 14 天规则）
+SSL_WARN_DAYS = "14"
+
+# 证书检测用的 Globalping 位置筛选（与站点自己的 gp_magic 解耦）
+# 原因：可用性探测可能用很窄的筛选（如 CN+xian+eyeball-network），窄到没有探针，
+#       若证书检测复用它会连带失败。证书只需任意一个能建立 TLS 的探针。
+GP_SSL_MAGIC = "CN+datacenter-network"
+
+# 告警 Webhook（留空则不发告警）。可直接对接飞书/钉钉/Server 酱的通用 Webhook。
+# 敏感值建议改用：npx wrangler secret put ALERT_WEBHOOK
+# ALERT_WEBHOOK = ""
+
+# Globalping token（提升额度 250 → 500 次/小时）
+# 用 secret 存，别写在这里：npx wrangler secret put GLOBALPING_TOKEN
+# GLOBALPING_TOKEN = ""

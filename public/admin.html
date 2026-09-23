@@ -1,0 +1,420 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>管理 · 站点状态</title>
+<meta name="robots" content="noindex, nofollow">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/app.css">
+<script>
+(function () {
+  try {
+    var t = localStorage.getItem("theme");
+    if (!t) t = matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+    if (t === "dark") document.documentElement.classList.add("dark");
+  } catch (e) {}
+})();
+</script>
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <div class="brand">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
+      <span id="brand-name">站点状态</span>
+    </div>
+    <nav class="nav">
+      <a href="/">总览</a>
+      <a href="/admin" class="active">管理</a>
+      <button class="icon-btn" id="theme" title="切换主题" aria-label="切换主题">
+        <svg class="sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M6.3 17.7l-1.4 1.4M19.1 4.9l-1.4 1.4"/></svg>
+        <svg class="moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>
+      </button>
+    </nav>
+  </div>
+</header>
+
+<main class="wrap stack" id="main" style="padding-top:24px;visibility:hidden">
+
+  <div class="between page-head">
+    <div>
+      <h1>站点管理</h1>
+      <p>左边管分类、右边管站点。拖动站点行可调整顺序，保存后前台立即生效。</p>
+    </div>
+    <div class="row">
+      <button class="btn" id="checkall">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polygon points="6 3 20 12 6 21 6 3"/></svg>
+        立即全部检查
+      </button>
+      <button class="btn" id="settings-open">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-2.9 1.2V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-2.9-1.2l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1A1.7 1.7 0 0 0 3 15H3a2 2 0 1 1 0-4h.1A1.7 1.7 0 0 0 4.2 8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1A1.7 1.7 0 0 0 9.9 4V3a2 2 0 1 1 4 0v.1A1.7 1.7 0 0 0 16.8 5l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0 1.2 2.9H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>
+        设置
+      </button>
+      <button class="btn" id="logout" hidden>退出</button>
+    </div>
+  </div>
+
+  <div class="alert alert-info" id="banner" hidden></div>
+  <div class="alert alert-warn" id="pwd-warn" hidden>
+    <b>尚未设置管理员密码</b> —— 当前任何人都能修改配置。请在右上角「设置 → 安全」中立即设置密码。
+  </div>
+
+  <!-- 左右两栏：左 = 分类，右 = 站点 -->
+  <div class="adm-grid">
+    <section class="card glass adm-col">
+      <div class="sec-head">
+        <h2>分类</h2>
+        <button class="btn btn-sm" id="cat-add-toggle">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
+          添加分类
+        </button>
+      </div>
+      <div class="cat-list" id="cats"></div>
+    </section>
+
+    <section class="card glass adm-col">
+      <div class="sec-head">
+        <h2 id="sites-title">站点</h2>
+        <button class="btn btn-sm btn-primary" id="add">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
+          添加站点
+        </button>
+      </div>
+      <div class="tbl-wrap">
+        <table class="table">
+          <thead>
+            <tr>
+              <th style="width:48px">顺序</th>
+              <th>名称</th>
+              <th>地址</th>
+              <th>探测后端</th>
+              <th>证书</th>
+              <th>状态</th>
+              <th style="text-align:right">操作</th>
+            </tr>
+          </thead>
+          <tbody id="rows">
+            <tr><td colspan="7" class="empty">加载中…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </div>
+
+  <p class="muted" style="font-size:12px;margin:0">
+    站点顺序用拖拽调整（仅限同一分类内），也可用 ↑↓ 按钮。分类顺序在左侧「分类」卡里调整。
+    回收站：删除站点后其历史数据仍保留在 D1 中。
+  </p>
+</main>
+
+<!-- ══════════ 站点表单 ══════════ -->
+<dialog id="dlg">
+  <form method="dialog" id="form">
+    <div class="dialog-head">
+      <span id="dlg-title">添加站点</span>
+      <button class="icon-btn" value="cancel" formnovalidate aria-label="关闭" type="submit">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>
+      </button>
+    </div>
+
+    <div class="dialog-body">
+      <div class="grid-2">
+        <div class="field">
+          <label for="f-id">标识（唯一，英文/数字/短横线）</label>
+          <input id="f-id" required pattern="[a-zA-Z0-9_-]+" placeholder="my-site">
+        </div>
+        <div class="field">
+          <label for="f-name">显示名称</label>
+          <input id="f-name" required placeholder="我的主站">
+        </div>
+      </div>
+
+      <div class="field">
+        <label for="f-url">监控地址（完整 URL）</label>
+        <input id="f-url" required type="url" placeholder="https://example.com/health">
+        <span class="hint">路径会被保留 —— 填 /health 就检测 /health，不会退化成首页</span>
+      </div>
+
+      <div class="grid-2">
+        <div class="field">
+          <label for="f-group">分类</label>
+          <select id="f-group"></select>
+          <input id="f-group-new" placeholder="新分类名称" hidden aria-label="新分类名称">
+          <span class="hint" id="f-group-hint">选择「＋ 新建分类」可直接创建</span>
+        </div>
+        <div class="field">
+          <label for="f-kind">探测后端</label>
+          <select id="f-kind">
+            <option value="">auto（继承全局默认）</option>
+            <option value="cf">cf（Cloudflare Durable Object）</option>
+            <option value="globalping">globalping（第三方探针）</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="grid-2">
+        <div class="field">
+          <label for="f-hint">CF 区域组（仅 cf 后端用）</label>
+          <select id="f-hint">
+            <option value="apac">apac — 亚太（实测 HKG 香港 / KIX 大阪）</option>
+            <option value="apac-se">apac-se — 东南亚（实测 HKG 香港 / SIN 新加坡）</option>
+            <option value="apac-ne">apac-ne — 东北亚（实测 ICN 首尔 / NRT 东京）</option>
+            <option value="oc">oc — 大洋洲</option>
+            <option value="wnam">wnam — 北美西部</option>
+            <option value="enam">enam — 北美东部</option>
+            <option value="weur">weur — 西欧</option>
+            <option value="eeur">eeur — 东欧</option>
+            <option value="me">me — 中东</option>
+            <option value="afr">afr — 非洲</option>
+            <option value="sam">sam — 南美</option>
+          </select>
+          <span class="hint">留空则用全局默认；区域组有保证，组内具体机房由 CF 自选</span>
+        </div>
+        <div class="field">
+          <label for="f-magic">Globalping 位置筛选（仅 globalping 后端用）</label>
+          <input id="f-magic" placeholder="CN+datacenter-network" list="magic-list">
+          <datalist id="magic-list">
+            <option value="CN+datacenter-network">中国大陆 · 云机房（稳，推荐用来定阈值）</option>
+            <option value="CN+eyeball-network">中国大陆 · 家庭宽带（真实，但不稳）</option>
+            <option value="east-asia">东亚</option>
+            <option value="western-europe">西欧</option>
+            <option value="north-america">北美</option>
+          </datalist>
+          <span class="hint">留空则用全局设置。也可写 CN+changsha+4837 精确锁运营商</span>
+        </div>
+      </div>
+
+      <div class="grid-3">
+        <div class="field">
+          <label for="f-codes">期望状态码</label>
+          <input id="f-codes" placeholder="200,301,302">
+          <span class="hint">留空 = 接受 200-399</span>
+        </div>
+        <div class="field">
+          <label for="f-keyword">正文关键字</label>
+          <input id="f-keyword" placeholder="（可空）">
+          <span class="hint">必须包含，防 200 假页面</span>
+        </div>
+        <div class="field">
+          <label for="f-threshold">连续失败几次告警</label>
+          <input id="f-threshold" type="number" min="1" max="20" value="3">
+        </div>
+      </div>
+
+      <div class="grid-2">
+        <div class="field">
+          <label for="f-sort">显示顺序（小的在前）</label>
+          <input id="f-sort" type="number" value="0">
+          <span class="hint">列表里拖拽排序会自动覆盖这里</span>
+        </div>
+        <div class="field">
+          <label for="f-enabled">启用</label>
+          <select id="f-enabled">
+            <option value="1">启用</option>
+            <option value="0">暂停</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="alert alert-error" id="dlg-err" hidden></div>
+    </div>
+
+    <div class="dialog-foot">
+      <button class="btn" value="cancel" formnovalidate type="submit">取消</button>
+      <button class="btn btn-primary" id="save" value="save" type="submit">保存</button>
+    </div>
+  </form>
+</dialog>
+
+<!-- ══════════ 分类表单（新建 / 重命名共用）══════════ -->
+<dialog id="catdlg">
+  <form method="dialog" id="catform">
+    <div class="dialog-head">
+      <span id="catdlg-title">添加分类</span>
+      <button class="icon-btn" value="cancel" formnovalidate aria-label="关闭" type="submit">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>
+      </button>
+    </div>
+
+    <div class="dialog-body">
+      <div class="field">
+        <label for="c-name">分类名称</label>
+        <input id="c-name" required placeholder="例如：生产环境" autocomplete="off">
+        <span class="hint" id="c-name-hint">分类只用于分组展示，不影响探测行为</span>
+      </div>
+      <div class="alert alert-error" id="catdlg-err" hidden></div>
+    </div>
+
+    <div class="dialog-foot">
+      <button class="btn" value="cancel" formnovalidate type="submit">取消</button>
+      <button class="btn btn-primary" id="cat-save" value="save" type="submit">保存</button>
+    </div>
+  </form>
+</dialog>
+
+<!-- ══════════ 设置 ══════════ -->
+<dialog id="setdlg">
+  <form method="dialog" id="setform">
+    <div class="dialog-head">
+      <span>站点设置</span>
+      <button class="icon-btn" value="cancel" formnovalidate aria-label="关闭" type="submit">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>
+      </button>
+    </div>
+
+    <div class="dialog-body">
+      <div class="alert alert-error" id="set-err" hidden></div>
+
+      <h3 class="set-group">外观</h3>
+      <div class="grid-2">
+        <div class="field">
+          <label for="s-title">站点标题</label>
+          <input id="s-title" placeholder="站点状态">
+        </div>
+        <div class="field">
+          <label for="s-theme">前台默认主题</label>
+          <select id="s-theme">
+            <option value="auto">跟随系统</option>
+            <option value="light">浅色</option>
+            <option value="dark">深色</option>
+          </select>
+          <span class="hint">用户手动切过主题后，以其选择为准</span>
+        </div>
+      </div>
+
+      <h3 class="set-group">探测</h3>
+      <div class="grid-3">
+        <div class="field">
+          <label for="s-mode">默认后端</label>
+          <select id="s-mode">
+            <option value="">auto（有 token 用 Globalping，否则 CF）</option>
+            <option value="cf">cf</option>
+            <option value="globalping">globalping</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="s-hint">CF 默认区域组</label>
+          <select id="s-hint">
+            <option value="">（不指定）</option>
+            <option value="apac">apac — 亚太</option>
+            <option value="apac-se">apac-se — 东南亚</option>
+            <option value="apac-ne">apac-ne — 东北亚</option>
+            <option value="oc">oc — 大洋洲</option>
+            <option value="wnam">wnam — 北美西部</option>
+            <option value="enam">enam — 北美东部</option>
+            <option value="weur">weur — 西欧</option>
+            <option value="eeur">eeur — 东欧</option>
+            <option value="me">me — 中东</option>
+            <option value="afr">afr — 非洲</option>
+            <option value="sam">sam — 南美</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="s-timeout">探测超时（ms）</label>
+          <input id="s-timeout" type="number" min="1000" max="30000" step="500" placeholder="8000">
+        </div>
+      </div>
+
+      <div class="grid-3">
+        <div class="field">
+          <label for="s-gp-token">Globalping Token</label>
+          <input id="s-gp-token" type="password" placeholder="留空 = 不修改" autocomplete="off">
+          <span class="hint" id="s-gp-token-hint">未配置（额度 250 次/小时）</span>
+        </div>
+        <div class="field">
+          <label for="s-magic">Globalping 默认筛选</label>
+          <input id="s-magic" list="magic-list2" placeholder="CN+datacenter-network">
+          <datalist id="magic-list2">
+            <option value="CN+datacenter-network">中国大陆 · 云机房</option>
+            <option value="CN+eyeball-network">中国大陆 · 家庭宽带</option>
+            <option value="east-asia">东亚</option>
+            <option value="western-europe">西欧</option>
+            <option value="north-america">北美</option>
+          </datalist>
+        </div>
+        <div class="field">
+          <label for="s-limit">每次探测点数</label>
+          <input id="s-limit" type="number" min="1" max="3" placeholder="1">
+          <span class="hint">每个探针算 1 次额度</span>
+        </div>
+      </div>
+
+      <div class="grid-3">
+        <div class="field">
+          <label for="s-sslmagic">SSL 检测筛选</label>
+          <input id="s-sslmagic" placeholder="CN+datacenter-network">
+          <span class="hint">与站点自己的筛选解耦，避免窄筛选导致失败</span>
+        </div>
+        <div class="field">
+          <label for="s-per-tick">每轮补检 SSL 数</label>
+          <input id="s-per-tick" type="number" min="1" max="10" placeholder="2">
+          <span class="hint">别调大：单站点可能吃掉约 13 个子请求</span>
+        </div>
+        <div class="field">
+          <label for="s-warn">证书降级阈值（天）</label>
+          <input id="s-warn" type="number" min="1" max="90" placeholder="14">
+        </div>
+      </div>
+
+      <h3 class="set-group">告警</h3>
+      <div class="field">
+        <label for="s-webhook">Webhook 地址</label>
+        <input id="s-webhook" placeholder="https://...（留空则不告警）">
+        <span class="hint">可直接对接飞书 / 钉钉 / Server 酱的通用 Webhook</span>
+      </div>
+
+      <h3 class="set-group">安全</h3>
+      <div class="grid-2">
+        <div class="field">
+          <label for="s-pwd">管理员密码</label>
+          <input id="s-pwd" type="password" placeholder="留空 = 不修改" autocomplete="new-password">
+          <span class="hint" id="s-pwd-hint"></span>
+        </div>
+        <div class="field">
+          <label for="s-pwd2">确认新密码</label>
+          <input id="s-pwd2" type="password" autocomplete="new-password">
+        </div>
+      </div>
+      <div>
+        <button type="button" class="btn btn-danger btn-sm" id="s-pwd-remove" hidden>
+          移除密码（恢复为开放访问）
+        </button>
+      </div>
+    </div>
+
+    <div class="dialog-foot">
+      <button class="btn" value="cancel" formnovalidate type="submit">取消</button>
+      <button class="btn btn-primary" id="set-save" value="save" type="submit">保存</button>
+    </div>
+  </form>
+</dialog>
+
+<!-- ══════════ 登录 ══════════ -->
+<div class="login-mask" id="login-mask" hidden>
+  <form class="card glass login-card" id="login-form">
+    <h2>管理员登录</h2>
+    <p class="muted">请输入管理员密码。登录状态保持 30 天。</p>
+    <div class="field">
+      <input type="password" id="login-pwd" placeholder="管理员密码"
+             autocomplete="current-password" aria-label="管理员密码">
+    </div>
+    <div class="alert alert-error" id="login-err" hidden></div>
+    <button class="btn btn-primary" type="submit" id="login-btn">登录</button>
+  </form>
+</div>
+
+<script src="/admin.js" defer></script>
+<script>
+// 后台也要注册 SW：否则每次进后台 HTML 与静态资源都要走一次跨国往返。
+// 前台 index.html / monitor.html 已注册，这里补上（同一个 SW 作用域覆盖全站）。
+if ("serviceWorker" in navigator) {
+  addEventListener("load", function () {
+    navigator.serviceWorker.register("/sw.js").catch(function () {});
+  });
+}
+</script>
+</body>
+</html>
