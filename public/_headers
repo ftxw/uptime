@@ -1,12 +1,9 @@
-/*
- * Workers Static Assets 的自定义响应头。
- * 文档：放在静态资源目录根部，随部署一起生效。
- *
- * ⚠️ 刻意**不在这里加 CSP**：三个 HTML 里都有内联 <script>（主题预设 / 首屏首包），
- *    严格的 script-src 会让它们全部失效，页面直接白屏。要上 CSP 必须先给内联脚本
- *    加 nonce 或哈希 —— 那是一笔独立的改造，别在没验证的情况下顺手加。
- *    下列这几项**不会影响现有功能**，属于"免费的安全加固"。
- */
+# Workers Static Assets 自定义响应头，随部署一起生效
+# 文档: https://developers.cloudflare.com/workers/static-assets/headers/
+#
+# 刻意不加 CSP：三个 HTML 都含内联 <script>（主题预设 / 首屏首包），
+# 严格 script-src 会让它们全部失效、页面白屏。要上 CSP 须先给内联脚本加 nonce/哈希。
+# 下列几项都不影响现有功能，属免费安全加固。
 
 /*
   X-Content-Type-Options: nosniff
@@ -15,9 +12,7 @@
   Permissions-Policy: geolocation=(), microphone=(), camera=(), payment=()
   Cross-Origin-Opener-Policy: same-origin
   Cross-Origin-Resource-Policy: same-origin
-*/
 
-/* 静态资源本身内容不可变、且已由 Service Worker 按版本缓存，这里给短一点的 CDN 缓存即可 */
 /*.css
   Cache-Control: public, max-age=300
 
