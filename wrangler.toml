@@ -50,7 +50,7 @@ crons = ["* * * * *"]
 [[d1_databases]]
 binding = "DB"
 database_name = "uptime-db"
-database_id = "e8f2f022-1e3d-4d6d-8637-9645c128726d"
+database_id = "64b6f8d9-04d4-43c5-a050-82970dfd7a31"
 
 # ── CF 探测后端：Durable Object（位置可控）─────────────────────────────
 # 免费计划只能用 SQLite 后端 → 必须 new_sqlite_classes

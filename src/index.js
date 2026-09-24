@@ -693,6 +693,24 @@ async function collectGlobalping(env) {
 }
 
 /**
+ * cron 周期，必须与 wrangler.toml 的 `* * * * *` 一致。
+ * 下面两处修正都建立在「调度器最多每分钟醒一次」这个前提上。
+ */
+const CRON_PERIOD_MS = 60_000;
+
+/**
+ * 判定「到期」时允许的提前量。
+ *
+ * 为什么必须有：last_checked_ts 是在探测**写库之后**（bumpState）才更新的，
+ * 比 check 自身的时间戳晚几百毫秒到几秒。而 cron 是按分钟触发的 ——
+ * 于是「间隔 = 1 分钟」的站点在下一分钟醒来时，now - last_checked 只有 59.x 秒，
+ * 差一点点不到 60 秒，被判成「未到期」，白等一整分钟（1 分钟间隔实际变 2 分钟）。
+ * 给一个远小于 cron 周期的宽容量即可消除；因为 cron 与监测间隔都是整分钟对齐的，
+ * 这么小的提前量不会把探测挪到别的 tick 上。
+ */
+const DUE_GRACE_MS = 15_000;
+
+/**
  * 挑出「本轮该检查」的站点。
  *
  * 为什么需要这一步：cron 每分钟触发（见 wrangler.toml），但每个站点的监测间隔
@@ -713,7 +731,16 @@ async function dueSites(env, sites) {
     const last = lastMap[s.id];
     if (!last) return true;
     const ivMs = Math.max(1, Number(s.interval_min || 5)) * 60_000;
-    return now - new Date(last).getTime() >= ivMs;
+
+    // Globalping 是两阶段：本轮发起、下一轮才收得到结果，探测本身就跨一个 cron 周期。
+    // 若仍按「距上次**收到结果**满 interval 才发起」，结果落地会整整晚一轮
+    // （1 分钟间隔 → 2 分钟）。所以提前一个周期把测量发出去，让**结果**落在 interval 上；
+    // 由于 collectGlobalping 先于 dueSites 执行，刚收完结果的站点在同一轮就会被重新发起，
+    // 形成「下一轮收上一轮的结果」的流水线。CF 后端同步返回，不存在这段延迟。
+    const lead = resolveKind(s) === "globalping" ? CRON_PERIOD_MS : 0;
+
+    const dueAt = Math.max(0, ivMs - lead) - DUE_GRACE_MS;
+    return now - new Date(last).getTime() >= dueAt;
   });
 }
 
