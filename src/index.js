@@ -9,7 +9,19 @@
  *         轮询等待几下就吃光了；两阶段把每站点压到 2 个子请求
  */
 
-import { db, loadSettings, saveSetting, loadSites, insertChecks, bumpState, buildCategories, cleanupOldChecks, saveSsl } from "./db.js";
+import {
+  db,
+  loadSettings,
+  saveSetting,
+  loadSites,
+  insertChecks,
+  bumpState,
+  buildCategories,
+  cleanupOldChecks,
+  saveSsl,
+  upsertLastResult,
+  UNGROUPED,
+} from "./db.js";
 import { Prober } from "./prober.js";
 import {
   REGION_GROUPS,
@@ -17,8 +29,6 @@ import {
   judge,
   normalizeUrl,
   zhError,
-  SSL_WARN_DAYS,
-  runAllDirect,
   gpCreate,
   gpCollect,
   gpSslCheck,
@@ -34,6 +44,7 @@ import {
   randomHex,
   sleep,
 } from "./auth.js";
+import { SETTING_META, SETTING_KEYS, defOf } from "./settings.js";
 
 export { Prober };
 
@@ -56,6 +67,36 @@ const json = (o, status = 200, cache = "no-store", pretty = false) =>
     status,
     headers: { ...JSON_HEADERS, "Cache-Control": cache },
   });
+
+/**
+ * 同源校验（防 CSRF）。
+ *
+ * Cookie 已是 SameSite=Lax，这本身就挡掉了绝大多数跨站写；但 Lax **允许顶层 GET 导航带 cookie**，
+ * 所以只要存在"会改状态的 GET"，就仍然有空子可钻。为了不依赖"记得每个端点都写成 POST"，
+ * 这里对所有**非安全方法**统一加一道显式校验。
+ *   优先看 Origin（最可靠）；缺失时退回 Sec-Fetch-Site。两者都没有时**拒绝** ——
+ *   全部现代浏览器都会带上这两个头，放行只会白白留一个可绕过的口子。
+ */
+function sameOriginOk(request, url) {
+  const origin = request.headers.get("origin");
+  if (origin) {
+    try {
+      return new URL(origin).host === url.host;
+    } catch {
+      return false;
+    }
+  }
+  const sfs = request.headers.get("sec-fetch-site");
+  if (sfs) return sfs === "same-origin" || sfs === "none";
+  // 两者都没有 ⇒ 无法判定来源，一律拒绝（fail closed）
+  return false;
+}
+
+/** 有副作用的接口一律要求 POST，避免 GET 被导航/预取/爬虫意外触发 */
+function requirePost(request, pretty) {
+  if (request.method === "POST") return null;
+  return json({ ok: false, error: "仅支持 POST" }, 405, "no-store", pretty);
+}
 
 /**
  * 用 Cache API 做边缘缓存。
@@ -158,14 +199,14 @@ async function buildAdminPayload(env) {
   // 站点 + 最近一次检查 + 已有证书结果：三条 SQL 并行（各一次 D1 往返）
   const [sitesRes, lastsRes, cats, sslRes] = await Promise.all([
     d.prepare("SELECT * FROM sites ORDER BY sort, id").all(),
+    // 「每个站点的最新一条」直接读 state —— 落库时就同步维护了结果快照，
+    // 所以这里是主键小表扫描，代价与 checks 的历史数据量无关。
+    // （若改成对 checks 做 ROW_NUMBER() 分区排序，耗时随站点数与保留天数线性增长。）
     d
       .prepare(
-        `WITH last AS (
-           SELECT site, ok, status, ttfb_ms, source, probe, ts,
-                  ROW_NUMBER() OVER (PARTITION BY site ORDER BY ts DESC) rn
-           FROM checks
-         )
-         SELECT site, ok, status, ttfb_ms, source, probe, ts FROM last WHERE rn = 1`
+        `SELECT site, last_ok AS ok, last_status AS status, last_ttfb_ms AS ttfb_ms,
+                last_source AS source, last_probe AS probe, last_ts AS ts
+         FROM state`
       )
       .all(),
     buildCategories(d),
@@ -197,9 +238,17 @@ async function buildAdminPayload(env) {
   };
 }
 
-/** 每天是否到了该清理的时点（UTC 03:00–03:05 这一轮） */
-function isCleanupWindow(now = new Date()) {
-  return now.getUTCHours() === 3 && now.getUTCMinutes() < 5;
+/**
+ * 是否该清理过期明细。
+ *
+ * 只用「上次成功清理的时间」判断，不用固定的 UTC 时刻窗口 ——
+ * 后者只要那一轮 cron 没跑成就漏一整天，且没有补救机制。
+ * 周期设 20 小时（略短于 24）：正常一天一次，漏了也能在下个窗口自动补。
+ */
+const CLEANUP_INTERVAL_MS = 20 * 3600 * 1000;
+function shouldCleanup(rawSettings) {
+  const last = Number(rawSettings.last_cleanup_ts || 0);
+  return !last || Date.now() - last >= CLEANUP_INTERVAL_MS;
 }
 
 /**
@@ -221,8 +270,8 @@ function resolveKind(site) {
  * 另一个是死配置 —— 放着只会让人误以为可以分别控制。
  */
 function cfHintOf(env) {
-  const h = (env && env.CF_HINT) || "apac";
-  return REGION_GROUPS.includes(h) ? h : "apac";
+  const h = env.CF_HINT || defOf("cf_hint");
+  return REGION_GROUPS.includes(h) ? h : defOf("cf_hint");
 }
 
 /** Globalping 位置筛选：同样是全局设置。null 表示用 probe.js 的内置默认 */
@@ -260,7 +309,7 @@ function stateOf(s, env) {
 
   if (state !== "down") {
     const timeoutMs = Number((env && env.TIMEOUT_MS) || 8000);
-    const warnDays = Number((env && env.SSL_WARN_DAYS) || SSL_WARN_DAYS);
+    const warnDays = Number(env.SSL_WARN_DAYS);
     if (ssl && !ssl.error && ssl.valid === false) {
       state = "degraded";
       degrade_reason = "证书无效";
@@ -292,35 +341,13 @@ function bucketFor(hours) {
 /* ────────────────────────────── 存储层 ────────────────────────────── */
 
 /* ────────────────────────── 站点设置（存 D1，后台可改）────────────────────────── */
-
-/**
- * 所有可配置项都存 meta 表，读写走这里。
- * 优先级：**D1 设置 > 环境变量（wrangler.toml / secret） > 代码默认值**。
- * 这样后台改完立即生效，不必重新部署；而 wrangler.toml 里的值仍可作为初始默认。
- */
-const SETTING_KEYS = [
-  "default_theme",     // auto | light | dark —— 前台默认主题
-  "site_title",        // 前台标题
-  "cf_hint",           // CF 默认区域组
-  "gp_magic",          // Globalping 默认位置筛选
-  "gp_ssl_magic",      // SSL 检测用的筛选（与站点筛选解耦）
-  "gp_limit",          // 每次测量的探测点数（每个算 1 次额度）
-  "gp_ip_version",     // Globalping 使用的 IP 版本：4 | 6
-  "timeout_ms",        // 单次探测超时
-  "ssl_per_tick",      // 每轮 cron 补充检测几个站点的 SSL
-  "ssl_warn_days",     // 证书剩余 ≤ N 天判为降级
-  "subreq_budget",     // 单次调用的子请求预算（免费层上限 50，留余量）
-  "check_keep_days",   // 探测明细保留天数（过期由 cron 每天清理一次）
-  "alert_webhook",     // 告警 Webhook
-  "globalping_token",  // Globalping token（只在后台可写，读取时脱敏）
-];
+/* 设置项清单、环境变量映射与默认值都在 src/settings.js —— 那里是唯一来源 */
 
 /**
  * 不对外暴露的内部状态键（不在 SETTING_KEYS 里，后台读写接口都碰不到）：
  *   session_secret     会话签名密钥，首次需要时随机生成并落库
  *   config_version     配置版本号，用于让边缘缓存立即失效
  *   login_fail_window / login_fail_count   登录失败计数（全局限速）
- *   admin_password     已废弃 —— 密码只走环境变量，此处仅列出以免误用
  */
 
 /**
@@ -329,25 +356,81 @@ const SETTING_KEYS = [
  */
 async function effectiveEnv(env, S) {
   const s = S || (await loadSettings(env));
-  const pick = (k, fallback) => (s[k] !== undefined && s[k] !== "" ? s[k] : env[k] || fallback);
-  return Object.assign({}, env, {
-    GLOBALPING_TOKEN: pick("globalping_token", ""),
-    CF_HINT: pick("cf_hint", "apac"),
-    GP_MAGIC: pick("gp_magic", "CN+datacenter-network"),
-    GP_SSL_MAGIC: pick("gp_ssl_magic", "CN+datacenter-network"),
-    GP_LIMIT: pick("gp_limit", "1"),
-    GP_IP_VERSION: pick("gp_ip_version", "4"),
-    TIMEOUT_MS: pick("timeout_ms", "8000"),
-    SSL_PER_TICK: pick("ssl_per_tick", "2"),
-    SSL_WARN_DAYS: pick("ssl_warn_days", "14"),
-    SUBREQ_BUDGET: pick("subreq_budget", "30"),
-    CHECK_KEEP_DAYS: pick("check_keep_days", "30"),
-    ALERT_WEBHOOK: pick("alert_webhook", ""),
-  });
+  const merged = Object.assign({}, env);
+  for (const [k, m] of Object.entries(SETTING_META)) {
+    if (!m.env) continue; // 纯展示项（主题/标题）不写进 env，读侧直接从 meta 取
+    merged[m.env] = s[k] !== undefined && s[k] !== "" ? s[k] : env[m.env] || m.def;
+  }
+  return merged;
+}
+
+/**
+ * 「一天」从哪一刻起算 —— 30 天色条与按天聚合的唯一时区来源。
+ *
+ * 必须可配的原因：色条是"某天的成功/失败占比"，而"某天"完全取决于时区。
+ * 写死在一个值上，换时区的部署就必须改代码；而 SQL 与 JS 两侧又必须算出**同一个**
+ * 边界，否则首帧会在两个日期间漂移。所以统一从这里取。
+ *
+ * @returns {number} 毫秒偏移。供 JS 侧生成日期轴用；SQL 侧走 dayMod()
+ */
+function dayOffsetMs(env) {
+  const min = clampInt(
+    env?.UTC_OFFSET_MIN ?? SETTING_META.utc_offset_min.def,
+    -720,
+    840,
+    SETTING_META.utc_offset_min.def
+  );
+  return min * 60000;
+}
+/** SQLite date() 的修饰符，如 '+480 minutes' */
+function dayMod(env) {
+  const min = Math.round(dayOffsetMs(env) / 60000);
+  return `${min < 0 ? "-" : "+"}${Math.abs(min)} minutes`;
 }
 
 /** 会话签名密钥：优先生效环境变量，否则用 D1 里的随机值（首次访问时生成） */
+/**
+ * 按 key 做取值的类型/范围规范化。
+ *
+ * 为什么必须在写入侧拦：这些值会直接参与探测参数（超时、IP 版本、位置筛选）和降级判定。
+ * 一个 timeout_ms = "abc" 会让 Number(...) 得到 NaN，进而使"响应时间 > 超时一半"恒假、
+ * 或让所有请求立即超时 —— 表现为"整站全线故障"，极难联想到是某个设置项写坏了。
+ */
+function normalizeSetting(k, v) {
+  const def = SETTING_META[k]?.def ?? "";
+  const num = (min, max) =>
+    String(clampInt(v === undefined || v === null || v === "" ? def : v, min, max, def));
+  switch (k) {
+    case "timeout_ms":
+      return num(1000, 30000);
+    case "ssl_per_tick":
+      return num(0, 10);
+    case "ssl_warn_days":
+      return num(0, 90);
+    case "subreq_budget":
+      return num(1, 45);
+    case "check_keep_days":
+      return num(1, 365);
+    case "utc_offset_min":
+      return num(-720, 840);
+    case "gp_limit":
+      return num(1, 10);
+    case "gp_ip_version":
+      return v === "6" ? "6" : SETTING_META.gp_ip_version.def;
+    case "default_theme":
+      return ["auto", "light", "dark"].includes(v) ? v : SETTING_META.default_theme.def;
+    case "alert_webhook":
+      // 只放行 http(s)：避免 Worker 的 fetch 被引导到 file:// 或非 HTTP 协议
+      return !v || validHttpUrl(v) ? v : "";
+    case "site_title":
+      return v.slice(0, 60);
+    default:
+      return v;
+  }
+}
+
 async function sessionSecret(env, S) {
+  // 环境变量优先：让"轮换密钥 = 作废所有会话"这件事在部署侧可控
   if (env.ADMIN_SECRET) return env.ADMIN_SECRET;
   const s = S || (await loadSettings(env));
   if (s.session_secret) return s.session_secret;
@@ -365,6 +448,49 @@ function maskToken(v) {
 }
 
 const loginLimiter = createRateLimiter(5, 60_000);
+
+/* ─────────────────────── 入参校验 ─────────────────────── */
+
+/**
+ * 服务端必须自己校验，不能只信任前端。
+ * 前端那些 Number()/trim() 只是为了让表单好用 —— 绕过页面直接调接口时它们完全不存在，
+ * 届时 fail_threshold = -1、interval_min = 0、url = javascript:... 都会原样落库。
+ */
+
+/** 钳到整数区间；非数字返回默认值（而不是 NaN 落库） */
+function clampInt(v, min, max, dflt) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return dflt;
+  return Math.min(max, Math.max(min, Math.trunc(n)));
+}
+
+/**
+ * 站点 id 会拼进 URL（/monitor?id=）也用作主键。
+ * SQL 是参数化的，不存在注入风险；真正要拦的是**会拆掉 URL 结构**的字符
+ * （/ ? # % 与控制字符、空白），其余（含中文）放行，避免把已有的中文 id 站点变成无法编辑。
+ */
+function validSiteId(id) {
+  if (typeof id !== "string") return false;
+  const s = id.trim();
+  return s.length > 0 && s.length <= 64 && !/[\s/?#%<>\\"]|[\x00-\x1f]/.test(s);
+}
+
+/** 只接受 http/https —— 阻断 javascript: / data: 等 scheme 落到 href 上被执行 */
+function validHttpUrl(u) {
+  try {
+    const p = new URL(String(u));
+    return p.protocol === "http:" || p.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
+/** expect_codes 形如 "200,301"：只允许数字与逗号 */
+function validExpectCodes(v) {
+  const s = String(v ?? "").trim();
+  if (!s) return true; // 空 = 接受 2xx/3xx，合法
+  return /^\d{3}(,\d{3})*$/.test(s);
+}
 
 /**
  * 登录失败的第二道闸门（存 D1）。
@@ -408,28 +534,16 @@ async function clearLoginFail(env) {
 /** 会话有效期：30 天（内部工具，频繁登录反而促使人用弱密码） */
 const SESSION_TTL = 30 * 86400;
 
-/** 设置项 → 环境变量名（用于把「最终生效值」回显给后台表单） */
-const ENV_FOR = {
-  cf_hint: "CF_HINT",
-  gp_magic: "GP_MAGIC",
-  gp_ssl_magic: "GP_SSL_MAGIC",
-  gp_limit: "GP_LIMIT",
-  gp_ip_version: "GP_IP_VERSION",
-  timeout_ms: "TIMEOUT_MS",
-  ssl_per_tick: "SSL_PER_TICK",
-  ssl_warn_days: "SSL_WARN_DAYS",
-  subreq_budget: "SUBREQ_BUDGET",
-  check_keep_days: "CHECK_KEEP_DAYS",
-  alert_webhook: "ALERT_WEBHOOK",
-  globalping_token: "GLOBALPING_TOKEN",
-};
-
-/** 取某个设置项的「最终生效值」（此时 env 已经是被合并过的） */
+/**
+ * 取某个设置项的「最终生效值」，用于回显到后台表单。
+ *
+ * env 此时已被 effectiveEnv 合并过：有环境变量的项从 env 读，
+ * 纯展示项（没有 env 变量）直接从 meta 读；两者都没有就回落到 SETTING_META 的默认值。
+ */
 function effectiveSettingValue(env, raw, k) {
-  if (k === "default_theme") return raw.default_theme || "auto";
-  if (k === "site_title") return raw.site_title || "站点状态";
-  const ek = ENV_FOR[k];
-  return ek ? env[ek] || "" : "";
+  const m = SETTING_META[k];
+  if (!m) return raw[k] ?? "";
+  return m.env ? env[m.env] || m.def : raw[k] || m.def;
 }
 
 /**
@@ -558,6 +672,8 @@ async function collectGlobalping(env) {
     perSite[p.site] = {
       ok: v.ok,
       status: best?.status ?? 0,
+      ttfb: best?.ttfb ?? 0,
+      total: best?.total ?? 0,
       reason: v.reason,
       threshold: Number(site.fail_threshold || 3),
       source: p.source,
@@ -566,8 +682,10 @@ async function collectGlobalping(env) {
   }
 
   if (rows.length) await insertChecks(env, rows);
-  for (const s of doneIds) {
-    await d.prepare("DELETE FROM pending WHERE site = ?").bind(s).run();
+  // 一条 IN 清完所有已收取的 pending：单条 DELETE × N 会多出 N 次 D1 往返
+  if (doneIds.length) {
+    const ph = doneIds.map(() => "?").join(",");
+    await d.prepare(`DELETE FROM pending WHERE site IN (${ph})`).bind(...doneIds).run();
   }
   const alerts = await bumpState(env, perSite);
   const alertResult = await sendAlerts(env, alerts);
@@ -717,10 +835,11 @@ async function persistCf(env, sites, cfResult) {
     const hit = cfResult[s.id];
     if (!hit) continue;
     if (hit.error) {
+      const src0 = hit.fallback ? `cf:fallback-${hit.hint}` : `cf:${hit.hint}`;
       rows.push({
         ts: new Date().toISOString(),
         site: s.id,
-        source: hit.fallback ? `cf:fallback-${hit.hint}` : `cf:${hit.hint}`,
+        source: src0,
         probe: null,
         ok: false,
         status: 0,
@@ -730,8 +849,13 @@ async function persistCf(env, sites, cfResult) {
       });
       perSite[s.id] = {
         ok: false,
+        status: 0,
+        ttfb: 0,
+        total: 0,
         reason: hit.error,
         threshold: Number(s.fail_threshold || 3),
+        source: src0,
+        probe: null,
       };
       continue;
     }
@@ -752,6 +876,8 @@ async function persistCf(env, sites, cfResult) {
     perSite[s.id] = {
       ok: v.ok,
       status: r.status ?? 0,
+      ttfb: r.ttfb ?? 0,
+      total: r.total ?? 0,
       reason: v.reason,
       threshold: Number(s.fail_threshold || 3),
       source: src,
@@ -777,18 +903,23 @@ async function persistCf(env, sites, cfResult) {
  */
 async function persistManualTest(env, site, { source, probe, result }) {
   const v = judge(site, result);
-  await insertChecks(env, [
-    {
-      ts: new Date().toISOString(),
-      site: site.id,
-      source,
-      probe: probe || null,
-      ok: v.ok,
-      status: result?.status ?? 0,
-      ttfb_ms: result?.ttfb ?? 0,
-      total_ms: result?.total ?? 0,
-      error: v.reason,
-    },
+  const ts = new Date().toISOString();
+  const row = {
+    ts,
+    site: site.id,
+    source,
+    probe: probe || null,
+    ok: v.ok,
+    status: result?.status ?? 0,
+    ttfb_ms: result?.ttfb ?? 0,
+    total_ms: result?.total ?? 0,
+    error: v.reason,
+  };
+  await Promise.all([
+    insertChecks(env, [row]),
+    // 同步刷新 state 的「最后一次结果快照」，让首页/后台立刻反映这次手动测试。
+    // upsertLastResult 刻意不碰 consecutive_fail 与 last_checked_ts。
+    upsertLastResult(env, row).catch(() => {}),
   ]);
   return { ok: v.ok, reason: v.reason };
 }
@@ -802,15 +933,27 @@ async function persistManualTest(env, site, { source, probe, result }) {
  *    10 个站点大约半小时内轮完一遍 —— 对"证书每天查一次"完全够。
  */
 async function refreshSslStale(env, sites, { force = false, maxAgeH = 24, limit = 2 } = {}) {
+  if (!sites.length || limit <= 0) return [];
   const d = await db(env);
-  const done = [];
+
+  // ⚠️ 必须**一次**把新鲜度取回来再筛选：cron 每分钟跑一轮，
+  //    而真正过期的通常只有少数几个 —— 逐站点 SELECT 会用 N 次往返换 2 个结果。
+  const { results } = await d.prepare("SELECT site, checked_ts FROM ssl").all();
+  const checkedTs = new Map((results || []).map((r) => [r.site, r.checked_ts]));
+  const cutoffMs = maxAgeH * 3600 * 1000;
+
+  const stale = [];
   for (const s of sites) {
-    if (done.length >= limit) break;
-    const cur = await d.prepare("SELECT * FROM ssl WHERE site = ?").bind(s.id).first();
-    const fresh =
-      cur && cur.checked_ts &&
-      Date.now() - new Date(cur.checked_ts).getTime() < maxAgeH * 3600 * 1000;
+    const ts = checkedTs.get(s.id);
+    const fresh = ts && Date.now() - new Date(ts).getTime() < cutoffMs;
     if (fresh && !force) continue;
+    stale.push(s);
+    if (stale.length >= limit) break;
+  }
+  if (!stale.length) return []; // 全都新鲜 → 本次只有上面那 1 次查询，零额度消耗
+
+  const done = [];
+  for (const s of stale) {
     let r;
     try {
       r = await gpSslCheck(env, s);
@@ -862,6 +1005,17 @@ export default {
       return json(
         { ok: false, error: "未登录或会话已过期", need_login: true },
         401,
+        "no-store",
+        pretty
+      );
+    }
+
+    // 跨站写请求一律拒 —— 放在 **认证之后**（未登录仍给 401，不泄漏是否配置了后台）
+    // 且放在下面的 bumpConfigVersion/purgeOverview **之前**（避免无谓的 D1 写）
+    if (request.method !== "GET" && request.method !== "HEAD" && !sameOriginOk(request, url)) {
+      return json(
+        { ok: false, error: "跨站请求被拒绝（同源校验失败）" },
+        403,
         "no-store",
         pretty
       );
@@ -932,7 +1086,20 @@ export default {
       }
 
       if (api === "logout") {
-        return new Response(JSON.stringify({ ok: true }), {
+        const bodyP = request.json().catch(() => ({}));
+        const body = await bodyP;
+        // 「登出并作废所有会话」：轮换 session_secret 使全部已签发 token 立即验签失败。
+        // 会话是无状态签名 token，服务端不留其他状态 —— 所以这是唯一能真正吊销的手段。
+        // 场景：怀疑 token 泄露、或改了 ADMIN_PASSWORD 想踢掉旧会话
+        //      （只改密码**不会**让旧 token 失效，这是无状态会话的固有代价）。
+        let revoked = false;
+        if (body.all === true) {
+          try {
+            await saveSetting(env, "session_secret", randomHex(32));
+            revoked = true;
+          } catch {}
+        }
+        return new Response(JSON.stringify({ ok: true, revoked }), {
           status: 200,
           headers: {
             ...JSON_HEADERS,
@@ -956,7 +1123,7 @@ export default {
             if (k === "globalping_token" && (v === "__KEEP__" || v === null || v === undefined)) {
               continue;
             }
-            await saveSetting(env, k, v === null ? "" : String(v).trim());
+            await saveSetting(env, k, normalizeSetting(k, String(v ?? "").trim()));
             saved.push(k);
           }
 
@@ -999,38 +1166,35 @@ export default {
           const since24 = new Date(Date.now() - 86400000).toISOString();
 
           const [siteRows, dayRows, h24, u24] = await Promise.all([
+            // ⚠️ 刻意**不用**窗口函数取"每个站点的最新一条"（那是对 checks 全表分区排序）。
+            //    最后一行的结果快照由落库路径同步写进 state（见 STATE_UPSERT），
+            //    这里只是主键 LEFT JOIN —— 代价与历史数据量无关。
             d
               .prepare(
-                `WITH last AS (
-                   SELECT site, ok, status, ttfb_ms, source, probe, ts, error,
-                          ROW_NUMBER() OVER (PARTITION BY site ORDER BY ts DESC) rn
-                   FROM checks
-                 )
-                 SELECT s.id, s.name, s.url, s.group_name, s.probe_kind,
-                        s.fail_threshold, s.expect_codes, s.keyword,
+                `SELECT s.id, s.name, s.url, s.group_name, s.probe_kind,
+                        s.fail_threshold, s.expect_codes, s.keyword, s.interval_min,
                         COALESCE(st.consecutive_fail, 0) AS consecutive_fail,
-                        l.ok AS last_ok, l.status AS last_status,
-                        l.ttfb_ms AS last_ttfb, l.source AS last_source,
-                        l.probe AS last_probe, l.ts AS last_ts, l.error AS last_error,
+                        st.last_ok, st.last_status, st.last_ttfb_ms AS last_ttfb,
+                        st.last_source, st.last_probe, st.last_ts, st.last_error,
                         ss.authorized AS ssl_authorized, ss.protocol AS ssl_protocol,
                         ss.issuer AS ssl_issuer, ss.expires_at AS ssl_expires_at,
                         ss.days_left AS ssl_days_left, ss.checked_ts AS ssl_checked_ts,
                         ss.error AS ssl_error
                  FROM sites s
                  LEFT JOIN state st ON st.site = s.id
-                 LEFT JOIN last l ON l.site = s.id AND l.rn = 1
                  LEFT JOIN ssl ss ON ss.site = s.id
                  -- 分类顺序由 categories.sort 决定，而不是 group_name 的字面排序。
                  -- 否则"生产环境"会被排到"测试环境"后面（中文码点顺序），与直觉相反。
-                 LEFT JOIN categories cat
-                        ON cat.name = COALESCE(NULLIF(TRIM(s.group_name), ''), '未分组')
+                LEFT JOIN categories cat
+                       ON cat.name = COALESCE(NULLIF(TRIM(s.group_name), ''), ?)
                  WHERE s.enabled = 1
                  ORDER BY COALESCE(cat.sort, 100000), s.group_name, s.sort, s.id`
               )
+              .bind(UNGROUPED)
               .all(),
             d
               .prepare(
-                `SELECT site, date(ts, '+8 hours') AS d,
+                `SELECT site, date(ts, '${dayMod(env)}') AS d,
                         COUNT(*) AS n, SUM(ok) AS ok
                  FROM checks WHERE ts > ?
                  GROUP BY site, d`
@@ -1053,10 +1217,11 @@ export default {
               .all(),
           ]);
 
-          // 30 天日期轴（北京时间）。与原项目一致：最左是今天，最右是最早。
+          // 30 天日期轴。最左是今天，最右是最早；"今天"按 utc_offset_min 起算，
+          // 必须与上面 SQL 的 date(ts, dayMod) 用同一个偏移，否则会因跨 UTC 日而错位。
           const axis = [];
           for (let i = 0; i < days; i++) {
-            const t = new Date(Date.now() - i * 86400000 + 8 * 3600 * 1000);
+            const t = new Date(Date.now() - i * 86400000 + dayOffsetMs(env));
             axis.push(t.toISOString().slice(0, 10));
           }
           const bySite = {};
@@ -1084,7 +1249,7 @@ export default {
             // 三态判定：up / down / degraded（规则见 stateOf）
             const { state, degrade_reason: degradeReason, ssl } = stateOf(s, env);
 
-            const g = s.group_name || "未分组";
+            const g = s.group_name || UNGROUPED;
             (groups[g] = groups[g] || []).push({
               id: s.id,
               name: s.name,
@@ -1131,8 +1296,11 @@ export default {
               now: new Date().toISOString(),
               // 前台需要的展示类设置（改完靠 config_version 换缓存 key 立即生效）
               settings: {
-                default_theme: rawSettings.default_theme || "auto",
-                site_title: rawSettings.site_title || "站点状态",
+                default_theme: rawSettings.default_theme || defOf("default_theme"),
+                site_title: rawSettings.site_title || defOf("site_title"),
+                // 降级阈值必须回显给前台页脚：页脚文案要按实际配置写，
+                // 否则后台把 ssl_warn_days 改成别的值后，页面还在说 "≤14 天"。
+                ssl_warn_days: Number(env.SSL_WARN_DAYS),
               },
               stats: {
                 total,
@@ -1263,10 +1431,10 @@ export default {
                 )
                 .bind(id, since)
                 .all(),
-              // ⑦ 按天聚合（+8 小时对齐北京时间，与首页一致）
+              // ⑦ 按天聚合。偏移必须取 utc_offset_min，与首页色条口径一致
               d
                 .prepare(
-                  `SELECT date(ts, '+8 hours') AS d, COUNT(*) AS n, SUM(ok) AS ok
+                  `SELECT date(ts, '${dayMod(env)}') AS d, COUNT(*) AS n, SUM(ok) AS ok
                    FROM checks WHERE site = ?1 AND ts > ?2
                    GROUP BY d`
                 )
@@ -1331,7 +1499,7 @@ export default {
           for (const r of dayRows.results || []) dayMap[r.d] = r;
           const bars = [];
           for (let i = 0; i < days; i++) {
-            const dkey = new Date(Date.now() - i * 86400000 + 8 * 3600 * 1000)
+            const dkey = new Date(Date.now() - i * 86400000 + dayOffsetMs(env))
               .toISOString()
               .slice(0, 10);
             const c = dayMap[dkey];
@@ -1356,14 +1524,14 @@ export default {
               now: new Date().toISOString(),
               // 详情页也要页头品牌名一致，所以一并带上展示类设置
               settings: {
-                site_title: rawSettings.site_title || "站点状态",
-                default_theme: rawSettings.default_theme || "auto",
+                site_title: rawSettings.site_title || defOf("site_title"),
+                default_theme: rawSettings.default_theme || defOf("default_theme"),
               },
               site: {
                 id: meta.id,
                 name: meta.name,
                 url: meta.url,
-                group_name: meta.group_name || "未分组",
+                group_name: meta.group_name || UNGROUPED,
                 probe_kind: resolveKind(meta),
                 cf_hint: cfHintOf(env),
                 gp_magic: gpMagicOf(env),
@@ -1482,7 +1650,9 @@ export default {
           if (action === "delete") {
             // 站点不跟着删，统一落到「未分组」—— 删分类不该顺带删监控
             await d.batch([
-              d.prepare("UPDATE sites SET group_name = ? WHERE group_name = ?").bind("未分组", name),
+              d
+                .prepare("UPDATE sites SET group_name = ? WHERE group_name = ?")
+                .bind(UNGROUPED, name),
               d.prepare("DELETE FROM categories WHERE name = ?").bind(name),
             ]);
             return json({ ok: true, action, name }, 200, "no-store", pretty);
@@ -1511,25 +1681,6 @@ export default {
         return json({ ok: true, categories: await buildCategories(d) }, 200, "no-store", pretty);
       }
 
-      // ── 排序：一次性提交完整顺序，按下标重写 sort ──
-      // 为什么整批提交而不是逐条移动：拖拽一次可能跨多行，
-      // 整批提交只有 1 个请求、且天然原子（D1 batch 在同一事务里执行）。
-      if (api === "sort") {
-        if (request.method !== "POST") {
-          return json({ ok: false, error: "仅支持 POST" }, 405, "no-store", pretty);
-        }
-        const d = await db(env);
-        const body = await request.json().catch(() => ({}));
-        const ids = Array.isArray(body.ids) ? body.ids.map(String).filter(Boolean) : [];
-        if (!ids.length) {
-          return json({ ok: false, error: "ids 不能为空" }, 400, "no-store", pretty);
-        }
-        await d.batch(
-          ids.map((id, i) => d.prepare("UPDATE sites SET sort = ? WHERE id = ?").bind(i + 1, id))
-        );
-        return json({ ok: true, updated: ids.length }, 200, "no-store", pretty);
-      }
-
       if (api === "sites") {
         const d = await db(env);
         if (request.method === "DELETE") {
@@ -1544,12 +1695,9 @@ export default {
         if (request.method === "POST") {
           const body = await request.json();
           const list = Array.isArray(body) ? body : [body];
-          for (const s of list) {
-            if (!s.id || !s.url) continue;
-            await d
-              .prepare(
-                `INSERT INTO sites (id,name,url,group_name,expect_codes,keyword,probe_kind,fail_threshold,interval_min,enabled,sort)
-                 VALUES (?,?,?,?,?,?,?,?,?,?,?)
+          const stmt = d.prepare(
+            `INSERT INTO sites (id,name,url,group_name,expect_codes,keyword,probe_kind,fail_threshold,interval_min,enabled,sort,created_ts)
+                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
                  ON CONFLICT(id) DO UPDATE SET
                    name=excluded.name, url=excluded.url,
                    group_name=excluded.group_name,
@@ -1557,19 +1705,51 @@ export default {
                    probe_kind=excluded.probe_kind, fail_threshold=excluded.fail_threshold,
                    interval_min=excluded.interval_min, enabled=excluded.enabled,
                    sort=excluded.sort`
-              )
+          );
+          for (const s of list) {
+            if (!s.id || !s.url) continue;
+            const id = String(s.id).trim();
+            const url = normalizeUrl(String(s.url).trim());
+            // ── 服务端校验：非法直接拒绝，不要静默写坏数据
+            if (!validSiteId(id)) {
+              return json(
+                { ok: false, error: `站点 ID 非法（需 1–64 字符，且不含 / ? # % 与空白）：${String(s.id).slice(0, 40)}` },
+                400,
+                "no-store",
+                pretty
+              );
+            }
+            if (!validHttpUrl(url)) {
+              return json(
+                { ok: false, error: `站点地址必须是 http/https：${String(s.url).slice(0, 80)}` },
+                400,
+                "no-store",
+                pretty
+              );
+            }
+            if (!validExpectCodes(s.expect_codes)) {
+              return json(
+                { ok: false, error: `期望状态码格式应为 3 位数字、逗号分隔（如 200,301）` },
+                400,
+                "no-store",
+                pretty
+              );
+            }
+            await stmt
               .bind(
-                s.id,
-                s.name ?? s.id,
-                normalizeUrl(s.url),
-                s.group_name ?? "默认分组",
-                s.expect_codes ?? "",
-                s.keyword ?? null,
-                s.probe_kind ?? null,
-                Number(s.fail_threshold ?? 3),
-                Number(s.interval_min ?? 5),
+                id,
+                String(s.name ?? id).trim().slice(0, 120) || id,
+                url,
+                String(s.group_name ?? UNGROUPED).trim().slice(0, 64) || UNGROUPED,
+                String(s.expect_codes ?? "").trim(),
+                s.keyword ? String(s.keyword).slice(0, 200) : null,
+                s.probe_kind === "globalping" ? "globalping" : s.probe_kind === "cf" ? "cf" : null,
+                // 阈值 1–20、间隔 1–1440 分钟（≤1 天）：防负数/超大值污染调度
+                clampInt(s.fail_threshold, 1, 20, 3),
+                clampInt(s.interval_min, 1, 1440, 5),
                 s.enabled === false ? 0 : 1,
-                Number(s.sort ?? 0)
+                clampInt(s.sort, 0, 100000, 0),
+                new Date().toISOString()
               )
               .run();
           }
@@ -1604,8 +1784,12 @@ export default {
 
       // 手动跑一轮（调试用）：?api=run&limit=3
       if (api === "run") {
+        const m2 = requirePost(request, pretty);
+        if (m2) return m2;
+        const body = await request.json().catch(() => ({}));
         const sites = await loadSites(env);
-        const limit = Number(url.searchParams.get("limit") || sites.length);
+        const raw = Number(body.limit ?? sites.length);
+        const limit = Number.isFinite(raw) && raw > 0 ? Math.min(raw, sites.length) : sites.length;
         const picked = sites.slice(0, limit);
         const collect = await collectGlobalping(env);
         const disp = await dispatch(env, picked);
@@ -1618,23 +1802,26 @@ export default {
       //   带 site=<id> 时，结果会**写入 checks**（这样「测」出来的点会出现在
       //   详情页折线与「最近检查」里）；不带则纯调试、不落库。
       if (api === "test") {
-        const kind = url.searchParams.get("kind") || "cf";
-        const siteId = url.searchParams.get("site");
+        const m2 = requirePost(request, pretty);
+        if (m2) return m2;
+        const body = await request.json().catch(() => ({}));
+        const kind = String(body.kind || "cf");
+        const siteId = String(body.site || "");
         const d = await db(env);
         const site = siteId
           ? await d.prepare("SELECT * FROM sites WHERE id = ?").bind(siteId).first()
           : null;
         // 带 site 时一律用站点自身的 url —— 避免前端传错 target 导致
         // "存进 A 站点名下的其实是 B 的探测结果"
-        const target = site?.url || url.searchParams.get("target") || "https://www.baidu.com";
-        const timeoutMs = Number((env && env.TIMEOUT_MS) || 8000);
+        const target = site?.url || String(body.target || "") || "https://www.baidu.com";
+        const timeoutMs = Number(env.TIMEOUT_MS || 8000);
 
         if (kind === "cf") {
-          const hint = url.searchParams.get("hint") || cfHintOf(env);
-          const multi = url.searchParams.get("targets");
+          const hint = String(body.hint || "") || cfHintOf(env);
+          const multi = String(body.targets || "");
           const list = multi
             ? multi.split(",").map((u) => u.trim()).filter(Boolean).map((u) => ({ url: u, keyword: null }))
-            : [{ url: target, keyword: site?.keyword || url.searchParams.get("keyword") || null }];
+            : [{ url: target, keyword: site?.keyword || String(body.keyword || "") || null }];
           const t0 = Date.now();
           const out = await probeViaCf(env, hint, list, timeoutMs);
           let persisted = null;
@@ -1678,8 +1865,8 @@ export default {
         return json({ ok: true, kind: "globalping", source, quota, results, persisted });
       }
 
-      // 未知接口一律 404 —— 不再兜底返回 200 的服务信息，
-      // 否则删掉的接口会一直"看起来还在"，掩盖调用方的错误。
+      // 未知接口一律 404 —— 返回 200 + 服务信息会让删掉的接口"看起来还在"，
+      // 掩盖调用方的错误。
       return json(
         {
           ok: false,
@@ -1691,8 +1878,8 @@ export default {
             "POST /api/login  /api/logout",
             "GET/POST /api/settings",
             "GET/POST/DELETE /api/categories",
-            "POST /api/sites（写）；POST /api/sort（排序）",
-            "POST /api/run  手动跑一轮（调试）；GET /api/test  测单个后端（调试）",
+            "POST /api/sites（写）",
+            "POST /api/run  手动跑一轮（调试）；POST /api/test  测单个后端（调试）",
           ],
         },
         404,
@@ -1736,11 +1923,14 @@ export default {
       ssl = [{ error: String((e && e.message) || e) }];
     }
 
-    // 每天一次的过期明细清理（保留 30 天）
+    // 每天一次的过期明细清理（保留 N 天）。
+    // 按「距上次成功清理的时间」判断而不是卡某个钟点 —— 后者只要那一轮 cron
+    // 失败或漂移，当天就再也不清理了，checks 会一路膨胀。按时间间隔判断自带自愈。
     let cleaned = 0;
-    if (isCleanupWindow()) {
+    if (shouldCleanup(settings)) {
       try {
         cleaned = await cleanupOldChecks(env, Number(env?.CHECK_KEEP_DAYS || 30));
+        await saveSetting(env, "last_cleanup_ts", String(Date.now()));
       } catch (e) {
         cleaned = -1; // -1 表示失败，便于在日志里区分"删了 0 条"和"没跑成"
       }

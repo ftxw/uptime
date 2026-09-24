@@ -6,6 +6,15 @@
  */
 
 /**
+ * 「未分组」的唯一真源。
+ *
+ * 这个字符串同时出现在 SQL 的分组兜底、分组名归并、以及新建站点的默认值里，
+ * 必须统一从这里引用 —— 分散成字面量时，只要有一处写得不一样就会凭空多出一个
+ * 「既不是显式分类、也不是未分组」的幽灵分类，而且很难在界面上发现。
+ */
+export const UNGROUPED = "未分组";
+
+/**
  * 分类列表 = 显式分类 ∪ 站点上出现的 group_name（并集，各带站点计数）。
  * 抽出来是因为 /api/categories 与 /api/admin 都要用，避免两处逻辑漂移。
  */
@@ -14,7 +23,7 @@ export async function buildCategories(d) {
     d.prepare("SELECT name, sort FROM categories ORDER BY sort, name").all(),
     d
       .prepare(
-        "SELECT COALESCE(NULLIF(TRIM(group_name), ''), '未分组') AS g, COUNT(*) AS n " +
+        `SELECT COALESCE(NULLIF(TRIM(group_name), ''), '${UNGROUPED}') AS g, COUNT(*) AS n ` +
           "FROM sites GROUP BY g"
       )
       .all(),
@@ -51,13 +60,10 @@ export async function buildCategories(d) {
 /**
  * 清理过期的探测明细。
  *
- * 为什么必须有：checks 每 5 分钟写入一次、且原本**从不清理**，会无限膨胀。
- * 而展示侧只需要 30 天（30 天色条的最长窗口），更老的数据完全没有用处。
- * 不清理的后果是：表越来越大 → 那条「按 site 分组取最新一行」的窗口函数查询
- * 虽然走索引，但仍要全索引扫描，耗时会随数据量线性增长。
+ * checks 每轮都在写入，不清理会无限膨胀；而展示侧只需要最近 30 天（色条的最长窗口），
+ * 更老的记录没有任何用处。表越大，按范围扫描越慢，所以必须定期删。
  *
- * 只在每天的一个固定时点跑一次（cron 是每 5 分钟一轮，288 轮/天），
- * 避免每轮都多一次 DELETE 开销。
+ * 每天只在一个时点跑一次 —— cron 是每分钟一轮（1440 轮/天），没必要每轮都多一次 DELETE。
  */
 export async function cleanupOldChecks(env, keepDays = 30) {
   const d = await db(env);
@@ -67,16 +73,14 @@ export async function cleanupOldChecks(env, keepDays = 30) {
 }
 
 export async function db(env) {
-  return env && env.DB;
+  return env.DB;
 }
 
 export async function loadSettings(env) {
+  const d = await db(env);
   const out = {};
-  try {
-    const d = await db(env);
-    const { results } = await d.prepare("SELECT key, value FROM meta").all();
-    for (const r of results || []) out[r.key] = r.value;
-  } catch {}
+  const { results } = await d.prepare("SELECT key, value FROM meta").all();
+  for (const r of results || []) out[r.key] = r.value;
   return out;
 }
 
@@ -128,38 +132,128 @@ export async function insertChecks(env, rows) {
   return { stored: batch.length };
 }
 
-/** 更新连续失败计数，必要时返回需要告警的站点 */
+/**
+ * state 的 upsert 语句 —— 一次写完「计数」与「最后一次结果快照」。
+ *
+ * last_ok_ts / last_alert_ts 用 COALESCE(excluded.X, state.X) 是刻意的：
+ * 传入 NULL 表示"本次没有新的成功/告警"，应当**保留原值**而不是清空。
+ */
+const STATE_UPSERT =
+  `INSERT INTO state (site, consecutive_fail, last_ok_ts, last_checked_ts, last_alert_ts,
+     last_ok, last_status, last_ttfb_ms, last_total_ms, last_source, last_probe, last_ts, last_error)
+   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+   ON CONFLICT(site) DO UPDATE SET
+     consecutive_fail = excluded.consecutive_fail,
+     last_ok_ts       = COALESCE(excluded.last_ok_ts, state.last_ok_ts),
+     last_checked_ts  = excluded.last_checked_ts,
+     last_alert_ts    = COALESCE(excluded.last_alert_ts, state.last_alert_ts),
+     last_ok          = excluded.last_ok,
+     last_status      = excluded.last_status,
+     last_ttfb_ms     = excluded.last_ttfb_ms,
+     last_total_ms    = excluded.last_total_ms,
+     last_source      = excluded.last_source,
+     last_probe       = excluded.last_probe,
+     last_ts          = excluded.last_ts,
+     last_error       = excluded.last_error`;
+
+/** perSite 里的 info 字段 → 落库需要的数值（缺字段一律给安全默认值） */
+function lastResultFields(info, nowIso) {
+  return [
+    info.ok ? 1 : 0,
+    Number.isFinite(Number(info.status)) ? Number(info.status) : 0,
+    Number.isFinite(Number(info.ttfb)) ? Number(info.ttfb) : null,
+    Number.isFinite(Number(info.total)) ? Number(info.total) : null,
+    info.source ?? null,
+    info.probe ?? null,
+    nowIso,
+    info.reason ?? null,
+  ];
+}
+
+/**
+ * 更新连续失败计数 + 最后一次结果快照，返回需要告警的站点。
+ *
+ * ⚠️ 必须**批量**：若每站点各发一次 SELECT + UPSERT，一轮 N 个站点就是 2N 次 D1 往返，
+ *    而 Workers 上每次往返都是真实的网络开销 —— 这是定时任务整体耗时的主要来源。
+ *    现在压到「1 次 SELECT + 1 次 batch」。
+ *
+ * ⚠️ 每条语句都必须 .bind() 后进 batch：.bind() 只构造语句、不发起请求，
+ *    漏了会静默丢失整个写入（不会报错，也不写任何数据）。
+ */
 export async function bumpState(env, perSite) {
   const d = await db(env);
-  const toAlert = [];
-  for (const [site, info] of Object.entries(perSite)) {
-    const cur = await d
-      .prepare("SELECT * FROM state WHERE site = ?")
-      .bind(site)
-      .first();
-    const fail = info.ok ? 0 : Number(cur?.consecutive_fail || 0) + 1;
-    const nowIso = new Date().toISOString();
-    await d
-      .prepare(
-        `INSERT INTO state (site, consecutive_fail, last_ok_ts, last_checked_ts, last_alert_ts)
-         VALUES (?,?,?,?,?)
-         ON CONFLICT(site) DO UPDATE SET
-           consecutive_fail = excluded.consecutive_fail,
-           last_ok_ts = COALESCE(excluded.last_ok_ts, state.last_ok_ts),
-           last_checked_ts = excluded.last_checked_ts,
-           last_alert_ts = COALESCE(excluded.last_alert_ts, state.last_alert_ts)`
-      )
-      .bind(site, fail, info.ok ? nowIso : null, nowIso, null)
-      .run(); // ⚠️ 必须 .run()：.bind() 只构造语句、不执行，且不会报错（静默丢失）
+  const ids = Object.keys(perSite);
+  if (!ids.length) return [];
 
-    // 恢复通知
-    if (info.ok && Number(cur?.consecutive_fail || 0) >= info.threshold) {
-      toAlert.push({ site, kind: "recovered", failCount: cur.consecutive_fail, info });
+  const ph = ids.map(() => "?").join(",");
+  const cur = await d
+    .prepare(`SELECT site, consecutive_fail FROM state WHERE site IN (${ph})`)
+    .bind(...ids)
+    .all();
+  const prevFail = {};
+  for (const r of cur.results || []) prevFail[r.site] = Number(r.consecutive_fail || 0);
+
+  const nowIso = new Date().toISOString();
+  const toAlert = [];
+  const batch = [];
+
+  for (const site of ids) {
+    const info = perSite[site];
+    const before = prevFail[site] || 0;
+    const fail = info.ok ? 0 : before + 1;
+
+    batch.push(
+      d
+        .prepare(STATE_UPSERT)
+        .bind(site, fail, info.ok ? nowIso : null, nowIso, null, ...lastResultFields(info, nowIso))
+    );
+
+    if (info.ok && before >= info.threshold) {
+      toAlert.push({ site, kind: "recovered", failCount: before, info });
     } else if (!info.ok && fail === info.threshold) {
       toAlert.push({ site, kind: "down", failCount: fail, info });
     }
   }
+
+  await d.batch(batch);
   return toAlert;
+}
+
+/**
+ * 只更新「最后一次结果快照」，**不动** consecutive_fail / last_checked_ts。
+ *
+ * 用于后台手动「测」：手动测试要能在图表中看到（所以要更新 last_*），
+ * 但不应该①把自动调度的下次检查时间往后推 ②累加失败计数触发误告警。
+ */
+export async function upsertLastResult(env, row) {
+  const d = await db(env);
+  await d
+    .prepare(
+      `INSERT INTO state (site, consecutive_fail, last_ok, last_status, last_ttfb_ms,
+                          last_total_ms, last_source, last_probe, last_ts, last_error)
+       VALUES (?, 0, ?,?,?,?,?,?,?,?)
+       ON CONFLICT(site) DO UPDATE SET
+         last_ok      = excluded.last_ok,
+         last_status  = excluded.last_status,
+         last_ttfb_ms = excluded.last_ttfb_ms,
+         last_total_ms= excluded.last_total_ms,
+         last_source  = excluded.last_source,
+         last_probe   = excluded.last_probe,
+         last_ts      = excluded.last_ts,
+         last_error   = excluded.last_error`
+    )
+    .bind(
+      row.site,
+      row.ok ? 1 : 0,
+      row.status ?? 0,
+      row.ttfb_ms ?? null,
+      row.total_ms ?? null,
+      row.source ?? null,
+      row.probe ?? null,
+      row.ts,
+      row.error ?? null
+    )
+    .run();
 }
 
 /** 写入 SSL 结果 */

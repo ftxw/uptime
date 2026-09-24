@@ -16,6 +16,8 @@
  *   但官方明确 Placement 只对 fetch handler 生效，对 scheduled(cron) 无效。
  */
 
+import { defOf } from "./settings.js";
+
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
@@ -39,7 +41,7 @@ export function normalizeUrl(u) {
 }
 
 /** Globalping 的 target 不能带 scheme，要单独剥出来 */
-export function hostOf(u) {
+function hostOf(u) {
   try {
     return new URL(normalizeUrl(u)).hostname;
   } catch {
@@ -174,9 +176,9 @@ export async function runAllDirect(items, timeoutMs) {
  *
  * 注意：这里只判断 up / down 两态。第三态 **degraded（降级）** 在 /api/overview 里
  * 结合 SSL 与响应时间实时算出 —— 因为 SSL 是每天一查的数据，不该塞进 5 分钟一次的检查行里。
- * 降级规则对齐参考项目：证书无效 或 剩余 ≤14 天 或 响应时间 > 超时上限的一半。
+ * 降级规则：证书无效 或 剩余 ≤ ssl_warn_days 天 或 响应时间 > 超时上限的一半。
+ * （阈值本身可在后台「设置 → 证书」改，这里是默认 14 天的口径说明。）
  */
-export const SSL_WARN_DAYS = 14;
 export function judge(site, r) {
   if (!r || r.ok === false) return { ok: false, reason: r?.error || "请求失败" };
   const codes = String(site.expect_codes || "")
@@ -204,8 +206,8 @@ export async function gpCreate(env, site) {
   // 位置筛选是**全局设置**（后台「设置 → 探测」）。
   // 不做成站点级的原因：一个站点只用一个后端，站点级的 CF 区域组/GP 筛选
   // 必然只有一个是活的，另一个是死配置。
-  const magic = (env && env.GP_MAGIC) || "CN+datacenter-network";
-  const limit = Number((env && env.GP_LIMIT) || 1);
+  const magic = env.GP_MAGIC || defOf("gp_magic");
+  const limit = Number(env.GP_LIMIT || defOf("gp_limit"));
   const protocol = u.protocol === "http:" ? "HTTP" : "HTTPS";
   const port = u.port ? Number(u.port) : protocol === "HTTP" ? 80 : 443;
 
@@ -306,8 +308,7 @@ export async function gpSslCheck(env, site) {
   // ⚠️ 刻意**不用可用性探测的筛选**（GP_MAGIC）：
   // 可用性探测的筛选可能很窄（例如 CN+xian+eyeball-network），窄到没有探针；
   // 而 SSL 检测只需要任意一个能建立 TLS 的探针即可，用窄条件会让证书检测连带失败。
-  const magic =
-    (env && env.GP_SSL_MAGIC) || (env && env.GP_MAGIC) || "CN+datacenter-network";
+  const magic = env.GP_SSL_MAGIC || env.GP_MAGIC || defOf("gp_ssl_magic");
   const H = {
     "Content-Type": "application/json",
     ...(token ? { Authorization: `Bearer ${token}` } : {}),

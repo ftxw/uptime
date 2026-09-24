@@ -4,12 +4,12 @@
   "private": true,
   "description": "站点可用性监控：Cloudflare Workers + D1 + Durable Object",
   "scripts": {
-    "setup": "node scripts/setup-d1.mjs",
-    "dev": "wrangler dev",
-    "deploy": "node scripts/setup-d1.mjs && wrangler deploy",
-    "deploy:preview": "node scripts/setup-d1.mjs && wrangler deploy --env preview",
-    "db:init": "wrangler d1 execute site-monitor-db --remote --file=./schema.sql",
-    "db:init:local": "wrangler d1 execute site-monitor-db --local --file=./schema.sql"
+    "setup": "node scripts/setup-d1.mjs production",
+    "setup:preview": "node scripts/setup-d1.mjs preview",
+    "sw:bump": "node scripts/bump-sw.mjs",
+    "dev": "node scripts/setup-d1.mjs local && node scripts/bump-sw.mjs && wrangler dev",
+    "deploy": "node scripts/setup-d1.mjs production && node scripts/bump-sw.mjs && wrangler deploy",
+    "deploy:preview": "node scripts/setup-d1.mjs preview && node scripts/bump-sw.mjs && wrangler deploy --env preview"
   },
   "devDependencies": {
     "wrangler": "^4.136.3"

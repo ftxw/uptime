@@ -241,9 +241,11 @@ function render(data) {
     `共 ${data.stats.total} 个监控` +
     (d ? ` · ${d} 个降级` : "") +
     ` · 更新于 ${t.toLocaleTimeString("zh-CN")}`;
+  // 阈值从服务端设置取 —— 后台改了 ssl_warn_days 后这里的文案必须跟着变
+  const warnDays = Number(data.settings?.ssl_warn_days ?? 14);
   qs("#foot").textContent =
     "点击站点名称进入详情页（趋势 / 证书 / 故障记录）。探测由 Cloudflare Durable Object 与 Globalping 探针执行；" +
-    "SSL 证书信息由 Globalping 提供（每站点每日检测一次），剩余 ≤ 14 天判定为降级。";
+    `SSL 证书信息由 Globalping 提供（每站点每日检测一次），剩余 ≤ ${warnDays} 天判定为降级。`;
 }
 
 /* ── 数据 ──────────────────────────────────────────────── */

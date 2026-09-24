@@ -44,7 +44,7 @@
   <div class="between page-head">
     <div>
       <h1>站点管理</h1>
-      <p>左边管分类、右边管站点。拖动站点行可调整顺序，保存后前台立即生效。</p>
+      <p>左边管分类、右边管站点。分类直接拖动排序，站点顺序用「编辑站点」里的「显示顺序」。</p>
     </div>
     <div class="row">
       <button class="btn" id="checkall">
@@ -263,6 +263,14 @@
             <option value="dark">深色</option>
           </select>
           <span class="hint">用户手动切过主题后，以其选择为准</span>
+        </div>
+      </div>
+
+      <div class="grid-2">
+        <div class="field">
+          <label for="s-utc">展示时区 · UTC 偏移（分钟）</label>
+          <input id="s-utc" type="number" min="-720" max="840" step="15" placeholder="480">
+          <span class="hint">480 = UTC+8。决定 30 天色条「一天」从哪一刻起算，与服务端口径一致</span>
         </div>
       </div>
 

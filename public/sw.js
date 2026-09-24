@@ -2,11 +2,10 @@
    第二次访问起，外壳从本地缓存直接返回，完全不走网络。
    这是唯一能绕开 CF 首访 ~1s 网络成本的办法。 */
 
-// ⚠️ 改动 /public 下的 HTML / JS / CSS 后**必须把这个版本号 +1**：
-//    缓存名带版本号，activate 时会把旧缓存整个删掉。
-//    不升的话静态资源是"缓存优先"，回访用户第一次导航仍会拿到旧文件，
-//    表现是"部署了新代码但界面没变"（要刷新第二次才生效）。
-const VERSION = "v7";
+// ⚠️ 版本号由 scripts/bump-sw.mjs 在部署前按 public/ 内容哈希自动重写，**不要手改**。
+//    原先是人工 +1，漏一次就会出现「部署了新代码但界面没变」（缓存优先）。
+//    现在只要 public/ 下任一文件内容变了，哈希就变 → 缓存名变 → activate 清掉旧缓存。
+const VERSION = "v-60c37b4638eb";
 const SHELL = `/shell-${VERSION}`;
 const PRECACHE = [
   "/",
@@ -40,30 +39,18 @@ self.addEventListener("activate", (e) => {
   );
 });
 
-/** 静态资源（JS/CSS/图标）：缓存优先 + 后台更新 —— 这是"二次访问秒开"的来源 */
-function shellFrom(path) {
-  return caches.match(path).then((hit) => {
-    const fetching = fetch(path)
-      .then((r) => {
-        if (r && r.ok) {
-          const copy = r.clone();
-          caches.open(SHELL).then((c) => c.put(path, copy));
-        }
-        return r;
-      })
-      .catch(() => hit);
-    return hit || fetching;
-  });
-}
-
 /**
- * HTML 外壳：**缓存优先 + 后台更新**（stale-while-revalidate）。
+ * 「缓存优先 + 后台更新」（stale-while-revalidate）—— HTML 外壳与静态资源共用。
  *
- * 早先这里是「网络优先」，理由是"部署后刷新要看到新页面"。但实测这一条让
- * **每次进后台都白等一次跨国往返**（HTML 外壳 ~0.7s），而 HTML 内容其实很少变。
- * 改成缓存优先后：有缓存就立即出页面（0 网络等待），同时后台拉新版写入缓存，
- * 下次访问就是新的 —— 部署的更新最多滞后一次访问，代价可接受。
- * 离线且无缓存时才真的等网络。
+ * 必须是缓存优先：网络优先会让**每次进后台都白等一次跨国往返**（HTML 外壳 ~0.7s），
+ * 而 HTML 内容其实很少变。缓存优先下有缓存就立即出内容（0 网络等待），
+ * 同时后台拉新版写入缓存，下次访问就是新的 —— 配合上面的内容哈希，
+ * 代码一变版本号就变，不存在滞后。
+ *
+ * ⚠️ path 必须传 **pathname**（`/app.css`），不能传绝对 URL：
+ *    PRECACHE 是按路径写入的，用绝对 URL 去 match 永远命中不了，
+ *    结果就是每次都走网络、"秒开"失效（这是一个真实的踩坑）。
+ *    离线且无缓存时才真的等网络。
  */
 async function shellFrom(path) {
   const c = await caches.open(SHELL);
@@ -132,6 +119,6 @@ self.addEventListener("fetch", (e) => {
     return;
   }
 
-  // 其余静态资源：缓存优先 + 后台更新（stale-while-revalidate）
-  e.respondWith(shellFrom(req.url));
+  // 其余静态资源：同样「缓存优先 + 后台更新」，且必须按 pathname 命中 precache
+  e.respondWith(shellFrom(url.pathname));
 });

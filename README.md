@@ -13,26 +13,28 @@
 
 D1 数据库的**创建、绑定、建表都由 `scripts/setup-d1.mjs` 自动完成**——
 不需要手工 `d1 create`、不需要复制 `database_id`、不需要单独跑建表。
-脚本是幂等的：库已存在就复用，表已存在就跳过（`schema.sql` 全部 `IF NOT EXISTS`）。
+脚本是幂等的：库已存在就复用，多次执行不会产生副作用。
 
-需要你自己做的只有两件事：**改域名**、**设管理员密码**。
+**域名不由脚本绑定**，你在 Cloudflare 控制台自己绑（见第 1 步）。这样换域名不必改仓库、
+也不必重新部署。
 
-### 1. 授权 + 改域名
+需要你自己做的只有两件事：**绑域名**、**设管理员密码**。
+
+### 1. 授权 + 绑定域名
 
 ```bash
 npx wrangler login          # 首次需授权 Cloudflare 账号
 ```
 
-打开 `wrangler.toml`，把 `[[routes]]` 换成你的域名：
+`wrangler.toml` 里**刻意不写 `[[routes]]`**：域名不跟着配置走，避免每次部署都用配置去
+覆写 DNS 与证书。绑定一次性敲定后长期有效：
 
-```toml
-[[routes]]
-pattern = "uptime.example.com"
-custom_domain = true
-```
+> **Workers & Pages → 选中本项目 Worker → Settings → Domains & Routes → Add → Custom domain**
 
-> `custom_domain = true` 会自动建 DNS 记录并签发证书，域名 DNS 需托管在 Cloudflare。
-> ⚠️ 不要用 `workers.dev` 域名——实测在中国大陆不可达。
+> 同理，预览环境的域名也在这个界面的 `uptime-preview` Worker 上绑。
+>
+> ⚠️ 不要只依赖 `workers.dev` 域名 —— 实测在中国大陆不可达。
+> 之所以保留了 `workers_dev = true`：绑域名之前总得有个能自检的地址。
 
 ### 2. 设置管理员密码
 
@@ -79,16 +81,24 @@ npx wrangler secret put ADMIN_PASSWORD
 npm run deploy
 ```
 
-它会依次做三件事：
+它会依次做四件事：
 
-1. 列出账号下的 D1，找 `site-monitor-db`
+1. 列出账号下的 D1，找 `uptime-db`
 2. **没有就创建**，并把 `database_name` 与 `database_id` **写回 `wrangler.toml`**（即自动绑定）；
    已有则校验配置与实际是否一致，不一致就修正
 3. 执行 `schema.sql` 建表
+4. **校验表结构与 `schema.sql` 一致**，不一致就中止部署
 
-然后才执行 `wrangler deploy`。全过程幂等，反复跑不会重复建库、不会丢数据。
+然后才执行 `wrangler deploy`。全过程幂等，反复跑不会重复建库。
 
-> 只想做数据库准备、不部署：`npm run setup`
+> 第 4 步是必要的：`schema.sql` 全部是 `IF NOT EXISTS`，对「已存在但结构较旧」的表
+> **不会补列**。没有这道校验的话，改过表结构后部署照样通过，直到运行时才报
+> `no such column`。本项目不做增量迁移 —— 结构变了就换库名重建（见下方）。
+
+预览环境同理，用 `npm run deploy:preview`（会为 `uptime-preview` Worker 准备独立的
+`uptime-db-preview`，两个库互不影响）。
+
+> 只想做数据库准备、不部署：`npm run setup` / `npm run setup:preview`
 >
 > 换库名：`D1_NAME=my-db npm run deploy`；换 D1 主区域：`D1_LOCATION=wnam npm run deploy`。
 
@@ -145,6 +155,7 @@ npm run deploy
 |---|---|---|---|
 | 外观 | 站点标题 | 站点状态 | 前台标题与页头品牌名 |
 | | 前台默认主题 | 跟随系统 | 跟随系统 / 浅色 / 深色（用户手动切换优先） |
+| | 展示时区 · UTC 偏移 | 480 分钟 | 即 UTC+8。决定 30 天色条「一天」从哪一刻起算，服务端口径一致 |
 | 探测 | CF 区域组 | apac | **全局**。`apac`香港、`apac-ne`首尔、`apac-se`新加坡等 |
 | | Globalping 筛选 | CN+datacenter-network | **全局**。国内云机房；也可填 `CN+eyeball-network`（家庭宽带），或选「自定义…」 |
 | | 每次探测点数 | 1 | ⚠️ 每个探针算 1 次额度 |
@@ -191,8 +202,8 @@ npx wrangler secret put ALERT_WEBHOOK
 | POST | `/api/login` `/api/logout` | 公开 | |
 | GET/POST | `/api/settings` | 登录 | |
 | GET/POST/DELETE | `/api/categories` | 登录 | |
-| POST | `/api/sites`（写） `/api/sort`（排序） | 登录 | |
-| POST | `/api/run`、GET `/api/test` | 登录 | 调试：手动跑一轮 / 测单个后端 |
+| POST | `/api/sites`（写） | 登录 | |
+| POST | `/api/run`、`/api/test` | 登录 | 调试：手动跑一轮 / 测单个后端 |
 
 Token 类设置**只写不读**——读取接口只返回掩码（`glp_****ghij`）和是否存在。
 
@@ -213,9 +224,11 @@ public/
   admin.html / admin.js      后台
   app.css / sw.js            样式 / Service Worker
 scripts/
-  setup-d1.mjs  部署前自动建库 + 绑定 + 建表（幂等）
-schema.sql      建表语句（全部 IF NOT EXISTS）
-wrangler.toml   只有绑定配置；运行参数一律在后台「设置」里改
+  setup-d1.mjs  自动准备 D1：建库 + 写绑定 + 建表（幂等）
+                  production / preview / local 三个目标
+  bump-sw.mjs   按 public/ 内容哈希自动重写 sw.js 版本号（部署前跑）
+schema.sql      建表语句（全部 IF NOT EXISTS，可重复执行）
+wrangler.toml   只有绑定配置（D1 / DO / 静态资源），**不含域名**；运行参数一律在后台「设置」里改
 ```
 
 数据表：`sites` `checks` `state` `pending` `ssl` `categories` `meta`
@@ -234,6 +247,11 @@ wrangler.toml   只有绑定配置；运行参数一律在后台「设置」里�
   登录仍用常量时间比较，且 `ADMIN_PASSWORD` 为空时 fail-closed。
 - **位置为什么是全局而非每站点**：一个站点只解析出唯一后端，两份位置必然只有一份生效。
 - **登录限速在 D1 上计数**：低流量下 Workers 经常每次请求都新建 isolate，内存 Map 形同虚设。
+- **域名为什么不写进 `wrangler.toml`**：`routes` 是声明式的，一旦写进来，每次部署都会按配置
+  重建 DNS 与证书；而控制台手动加的域名是独立持有的路由资源，不在配置里就不会被 wrangler 动。
+  交给人工绑定后，换域名不必改仓库、也不必重新部署。
+- **所有非 GET 请求为什么要校验同源**：Cookie 是 `SameSite=Lax`，它挡不住"会改状态的 GET 导航"。
+  与其依赖"每个写接口都记得写成 POST"，不如统一加一道校验（`Origin` → `Sec-Fetch-Site` → 拒绝）。
 
 ---
 
@@ -241,13 +259,10 @@ wrangler.toml   只有绑定配置；运行参数一律在后台「设置」里�
 
 ```bash
 npm install     # 可选：只为装 wrangler。跳过则下面命令改用 npx wrangler ...
-npm run dev     # 等价于 wrangler dev
+npm run dev
 ```
 
-默认 `http://localhost:8787`。本地用的是 D1 的本地副本，首次需建表：
+默认 `http://localhost:8787`。`npm run dev` 会先在本机的 D1 副本上建表再启动，直接可用。
 
-```bash
-npm run db:init:local
-```
-
-其他命令：`npm run deploy`（部署）、`npm run db:init`（对线上库建表）。
+其他命令：`npm run deploy`（部署生产）、`npm run deploy:preview`（部署预览）、
+`npm run setup` / `npm run setup:preview`（只准备数据库，不部署）。

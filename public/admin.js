@@ -11,9 +11,6 @@
 const API = "/api";
 const qs = (s) => document.querySelector(s);
 
-/** 可选的监测间隔（分钟）。与后台表单的下拉项、以及 dueSites() 的调度逻辑对应 */
-const INTERVALS = [1, 5, 10, 30, 60];
-
 /** 间隔的友好显示：60 → "1 小时"，其余 → "N 分钟" */
 const fmtInterval = (min) => {
   const n = Number(min) || 5;
@@ -23,7 +20,6 @@ const fmtInterval = (min) => {
 let SITES = [];   // 顺序 = 前台渲染顺序（分类 → sort → id）
 let CATS = [];
 let FILTER = "";  // "" = 全部
-let DRAG_ID = null;
 let DRAG_CAT = null;     // 正在拖拽的分类名
 let AUTHED = false;
 let PWD_SOURCE = "none"; // none | env —— 密码只来自环境变量 ADMIN_PASSWORD
@@ -36,12 +32,8 @@ const groupOf = (s) => (s && s.group_name && String(s.group_name).trim()) || UNG
 const siteById = (id) => SITES.find((s) => s.id === id);
 
 const ICON = {
-  grip: '<svg viewBox="0 0 24 24" fill="currentColor"><circle cx="9" cy="6.5" r="1.6"/><circle cx="15" cy="6.5" r="1.6"/><circle cx="9" cy="12" r="1.6"/><circle cx="15" cy="12" r="1.6"/><circle cx="9" cy="17.5" r="1.6"/><circle cx="15" cy="17.5" r="1.6"/></svg>',
-  up: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M6 15l6-6 6 6"/></svg>',
-  down: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>',
   pen: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/></svg>',
   x: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>',
-  check: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>',
 };
 
 function escapeHtml(s) {
@@ -146,7 +138,9 @@ qs("#login-form").addEventListener("submit", async (e) => {
 });
 
 qs("#logout").addEventListener("click", async () => {
-  await post("/logout", {}).catch(() => {});
+  // all:true —— 让服务端轮换签名密钥，作废这台设备以外可能已经泄露的所有会话。
+  // 会话本身是无状态签名 token，这是唯一能真正"下线"它们的办法。
+  await post("/logout", { all: true }).catch(() => {});
   SITES = [];
   CATS = [];
   qs("#rows").innerHTML = "";
@@ -354,92 +348,6 @@ async function loadAll() {
   // 未设置密码的警告仍由独立的 #pwd-warn 元素显示，不受影响。
   qs("#pwd-warn").hidden = PWD_SOURCE !== "none";
 }
-
-/* ── 排序（拖拽 + 上移下移）─────────────────────────────── */
-
-const tbody = qs("#rows");
-
-async function saveOrder() {
-  SITES.forEach((s, i) => (s.sort = i + 1));
-  try {
-    const d = await post("/sort", { ids: SITES.map((s) => s.id) });
-    if (!d.ok) throw new Error(d.error || "保存失败");
-    banner(`顺序已保存（${d.updated} 个站点），前台立即生效`, "info");
-  } catch (e) {
-    if (!e.needLogin) banner("排序保存失败：" + e.message, "error");
-    // 失败后重新拉一次以还原界面；401 时 loadAll 会抛 needLogin，
-    // 这里已在 catch 内，再抛就成了未处理的 rejection，故吞掉（登录框已由 api() 弹出）
-    await loadAll().catch(() => {});
-  }
-}
-
-function move(id, dir) {
-  const i = SITES.findIndex((s) => s.id === id);
-  if (i < 0) return;
-  const g = groupOf(SITES[i]);
-  let j = -1;
-  if (dir < 0) {
-    for (let k = i - 1; k >= 0; k--) if (groupOf(SITES[k]) === g) { j = k; break; }
-  } else {
-    for (let k = i + 1; k < SITES.length; k++) if (groupOf(SITES[k]) === g) { j = k; break; }
-  }
-  if (j < 0) return;
-  const [item] = SITES.splice(i, 1);
-  SITES.splice(j, 0, item);
-  renderRows();
-  saveOrder();
-}
-
-function moveBefore(srcId, dstId) {
-  if (srcId === dstId) return;
-  const src = siteById(srcId);
-  const dst = siteById(dstId);
-  if (!src || !dst || groupOf(src) !== groupOf(dst)) return; // 只允许同分类内拖
-  const si = SITES.findIndex((s) => s.id === srcId);
-  const [item] = SITES.splice(si, 1);
-  const di = SITES.findIndex((s) => s.id === dstId);
-  SITES.splice(di, 0, item);
-  renderRows();
-  saveOrder();
-}
-
-document.addEventListener("dragstart", (e) => {
-  const tr = e.target.closest("tr[data-id]");
-  if (!tr) return;
-  DRAG_ID = tr.dataset.id;
-  try {
-    e.dataTransfer.effectAllowed = "move";
-    e.dataTransfer.setData("text/plain", DRAG_ID);
-  } catch (err) {}
-  tr.classList.add("dragging");
-});
-
-document.addEventListener("dragend", () => {
-  DRAG_ID = null;
-  tbody.querySelectorAll("tr").forEach((t) => t.classList.remove("dragging", "drag-over"));
-});
-
-tbody.addEventListener("dragover", (e) => {
-  const tr = e.target.closest("tr[data-id]");
-  if (!tr || !DRAG_ID) return;
-  const src = siteById(DRAG_ID);
-  const dst = siteById(tr.dataset.id);
-  if (!src || !dst || groupOf(src) !== groupOf(dst)) return;
-  e.preventDefault();
-  e.dataTransfer.dropEffect = "move";
-  tbody.querySelectorAll("tr.drag-over").forEach((t) => t.classList.remove("drag-over"));
-  tr.classList.add("drag-over");
-});
-
-tbody.addEventListener("drop", (e) => {
-  const tr = e.target.closest("tr[data-id]");
-  if (!tr || !DRAG_ID) return;
-  e.preventDefault();
-  const src = DRAG_ID;
-  DRAG_ID = null;
-  tbody.querySelectorAll("tr").forEach((t) => t.classList.remove("drag-over", "dragging"));
-  moveBefore(src, tr.dataset.id);
-});
 
 /* ── 分类：切换 / 新建 / 改名 / 删除 / 排序 ─────────────── */
 
@@ -665,15 +573,12 @@ function openForm(site) {
   fillGroupSelect(
     site?.group_name || (FILTER && FILTER !== UNGROUPED ? FILTER : UNGROUPED)
   );
-  // 后端是必选项（表单里没有空选项），新建时默认 cf；早期数据的空值也回落到 cf
+  // probe_kind 是必选项（表单里没有空选项）；服务端也会归一化，这里只做预设
   qs("#f-kind").value = site?.probe_kind === "globalping" ? "globalping" : "cf";
   qs("#f-codes").value = site?.expect_codes || "";
   qs("#f-keyword").value = site?.keyword || "";
   qs("#f-threshold").value = site?.fail_threshold ?? 3;
-  // 间隔选项是 1/5/10/30/60；若站点存的是其它值（早期数据），回退到最接近的 5 分钟
-  qs("#f-interval").value = INTERVALS.includes(Number(site?.interval_min))
-    ? String(site.interval_min)
-    : "5";
+  qs("#f-interval").value = String(site?.interval_min ?? 5);
   qs("#f-sort").value = site?.sort ?? 0;
   qs("#f-enabled").value = String(site?.enabled ?? 1);
   qs("#dlg-err").hidden = true;
@@ -723,11 +628,6 @@ document.addEventListener("click", async (e) => {
   const id = btn.dataset.id;
   const site = id ? siteById(id) : null;
 
-  if (act === "up" || act === "down") {
-    btn.disabled = true;
-    return move(id, act === "up" ? -1 : 1);
-  }
-
   if (act === "edit") return openForm(site);
 
   if (act === "del") {
@@ -750,9 +650,10 @@ document.addEventListener("click", async (e) => {
       // 保证"测出来的"与"真实探测"走同一套参数。
       // 带上 site=<id>：让后端把这次结果写进 checks，
       // 这样手动测的点会出现在详情页折线与「最近检查」里。
+      // ⚠️ 必须是 POST：这个接口会落库并可能消耗 Globalping 额度，
+      //    GET 语义的幂等前提不成立（也避免被导航/预取意外触发）。
       const kind = site?.resolved_kind || "cf";
-      const q = `kind=${kind}&site=${encodeURIComponent(site.id)}`;
-      const d = await api(`/test?${q}`);
+      const d = await post("/test", { kind, site: site.id });
       const res = (d.results || [])[0] || {};
       const where = d.egress?.colo ? `机房 ${d.egress.colo}` : res.probe || "";
       const mark = d.persisted ? `（已记入检查记录${d.persisted.ok ? "" : "：" + (d.persisted.reason || "失败")}）` : "";
@@ -781,7 +682,8 @@ qs("#checkall").addEventListener("click", async () => {
   const old = b.innerHTML;
   b.textContent = "检查中…";
   try {
-    const d = await api("/run");
+    // 同理必须是 POST —— 手动跑一轮会真实发起探测并写库
+    const d = await post("/run", {});
     const n = (d.persisted?.persisted || 0) + (d.collect?.collected || 0);
     banner(`已执行一轮检查（本批落库 ${n} 条记录）`, "info");
     await renderRows();
@@ -857,6 +759,7 @@ async function openSettings() {
 function fillSettingsForm(s) {
   qs("#s-title").value = s.site_title || "";
   qs("#s-theme").value = s.default_theme || "auto";
+  qs("#s-utc").value = s.utc_offset_min ?? "";
   qs("#s-hint").value = s.cf_hint || "";
   qs("#s-timeout").value = s.timeout_ms || "";
   writeMagic(s.gp_magic || "");
@@ -901,6 +804,7 @@ qs("#setform").addEventListener("submit", async (e) => {
   const body = {
     site_title: qs("#s-title").value.trim(),
     default_theme: qs("#s-theme").value,
+    utc_offset_min: qs("#s-utc").value.trim(),
     cf_hint: qs("#s-hint").value,
     timeout_ms: qs("#s-timeout").value.trim(),
     gp_magic: readMagic(),

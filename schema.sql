@@ -41,12 +41,33 @@ CREATE INDEX IF NOT EXISTS idx_checks_ts ON checks(ts DESC);
 
 -- ── 每站点运行态 ──────────────────────────────────────────
 -- 单独一张表是因为「连续失败计数」必须跨轮次累积，不能靠查 checks 现算。
+--
+-- last_* 这几列是**最后一次探测结果的反范式缓存**：
+-- 展示侧（首页概览、后台列表）几乎每次都要「每个站点的最新一条」。
+-- 反范式到 state 后，读侧变成纯主键 LEFT JOIN，代价 O(站点数)，与历史数据量无关；
+-- 若改成对 checks 跑窗口函数 ROW_NUMBER() OVER (PARTITION BY site ORDER BY ts DESC)，
+-- 那就是全表分区排序，站点数与保留天数一涨，每次请求都要扫几万行。
+-- 写入侧在同一个 INSERT ... ON CONFLICT 里顺手带上，成本可忽略。
+--
+-- ⚠️ last_checked_ts 与 last_ts 是两个不同语义：
+--    last_checked_ts  调度用：上次「自动探测」完成的时刻，决定下次是否到期
+--    last_ts          展示用：最后一次结果的时刻（**含**后台手动「测」）
+--    手动测试刻意不更新前者（否则会把自动调度往后推），但会更新后者以便图表能看到。
 CREATE TABLE IF NOT EXISTS state (
   site             TEXT PRIMARY KEY,
   consecutive_fail INTEGER NOT NULL DEFAULT 0,
   last_checked_ts  TEXT,
   last_ok_ts       TEXT,
-  last_alert_ts    TEXT
+  last_alert_ts    TEXT,
+  -- ↓ 最后一次探测结果的快照（含手动测试）
+  last_ok          INTEGER,  -- 1 正常 / 0 故障
+  last_status      INTEGER,
+  last_ttfb_ms     INTEGER,
+  last_total_ms    INTEGER,
+  last_source      TEXT,     -- 'cf:apac' / 'gp:CN+datacenter-network'
+  last_probe       TEXT,     -- 机房代码(colo) 或 city/asn
+  last_ts          TEXT,
+  last_error       TEXT
 );
 
 -- ── Globalping 两阶段探测的待收结果 ──────────────────────

@@ -1,0 +1,25 @@
+/*
+ * Workers Static Assets 的自定义响应头。
+ * 文档：放在静态资源目录根部，随部署一起生效。
+ *
+ * ⚠️ 刻意**不在这里加 CSP**：三个 HTML 里都有内联 <script>（主题预设 / 首屏首包），
+ *    严格的 script-src 会让它们全部失效，页面直接白屏。要上 CSP 必须先给内联脚本
+ *    加 nonce 或哈希 —— 那是一笔独立的改造，别在没验证的情况下顺手加。
+ *    下列这几项**不会影响现有功能**，属于"免费的安全加固"。
+ */
+
+/*
+  X-Content-Type-Options: nosniff
+  X-Frame-Options: SAMEORIGIN
+  Referrer-Policy: strict-origin-when-cross-origin
+  Permissions-Policy: geolocation=(), microphone=(), camera=(), payment=()
+  Cross-Origin-Opener-Policy: same-origin
+  Cross-Origin-Resource-Policy: same-origin
+*/
+
+/* 静态资源本身内容不可变、且已由 Service Worker 按版本缓存，这里给短一点的 CDN 缓存即可 */
+/*.css
+  Cache-Control: public, max-age=300
+
+/*.svg
+  Cache-Control: public, max-age=86400
