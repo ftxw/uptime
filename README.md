@@ -77,13 +77,21 @@ npx wrangler secret put ADMIN_PASSWORD
 
 ### 3-A. 命令行部署（一条命令）
 
+生产：
+
 ```bash
 npm run deploy
 ```
 
-它会依次做四件事：
+预览（独立 Worker + 独立数据库，改坏也碰不到生产）：
 
-1. 列出账号下的 D1，找 `uptime-db`
+```bash
+npm run deploy:preview
+```
+
+两个命令做的事完全一样，只是目标不同：
+
+1. 列出账号下的 D1，按目标找 `uptime-db`（预览是 `uptime-db-preview`）
 2. **没有就创建**，并把 `database_name` 与 `database_id` **写回 `wrangler.toml`**（即自动绑定）；
    已有则校验配置与实际是否一致，不一致就修正
 3. 执行 `schema.sql` 建表
@@ -95,8 +103,20 @@ npm run deploy
 > **不会补列**。没有这道校验的话，改过表结构后部署照样通过，直到运行时才报
 > `no such column`。本项目不做增量迁移 —— 结构变了就换库名重建（见下方）。
 
-预览环境同理，用 `npm run deploy:preview`（会为 `uptime-preview` Worker 准备独立的
-`uptime-db-preview`，两个库互不影响）。
+预览环境（`npm run deploy:preview`）与生产的差异，都是刻意的隔离：
+
+| | 生产 | 预览 |
+|---|---|---|
+| Worker | `uptime` | `uptime-preview` |
+| D1 | `uptime-db` | `uptime-db-preview`（**独立库**） |
+| 定时任务 | 每分钟 | **不跑**（`crons = []`） |
+
+> 预览**必须**有自己的库，否则预览上的任何写操作都会直接落到生产数据上，等于没隔离。
+> 预览**必须**关掉 cron —— wrangler 的命名环境会继承顶层 `[triggers]`，不清空的话
+> 两个 Worker 会每分钟各探测一遍，白白双倍消耗额度，还要多占一个 cron 名额
+> （免费计划每账号上限 5 个）。
+>
+> 两个环境的域名同样都在控制台手动绑定，配置里不写 `[[routes]]`。
 
 > 只想做数据库准备、不部署：`npm run setup` / `npm run setup:preview`
 >
@@ -258,11 +278,33 @@ wrangler.toml   只有绑定配置（D1 / DO / 静态资源），**不含域名*
 ## 本地开发
 
 ```bash
-npm install     # 可选：只为装 wrangler。跳过则下面命令改用 npx wrangler ...
+npm install     # 装 wrangler（唯一 devDependency）
 npm run dev
 ```
 
 默认 `http://localhost:8787`。`npm run dev` 会先在本机的 D1 副本上建表再启动，直接可用。
 
-其他命令：`npm run deploy`（部署生产）、`npm run deploy:preview`（部署预览）、
-`npm run setup` / `npm run setup:preview`（只准备数据库，不部署）。
+> `npm install` 建议不要跳过：`scripts/setup-d1.mjs` 优先用本地的 wrangler，
+> 只有本地没装时才退回 `npx`，而 npx 缓存损坏过（缺 `ws` 模块）。
+
+### 命令一览
+
+| 命令 | 作用 |
+|---|---|
+| `npm run dev` | 本地起服务（先给本机 D1 副本建表） |
+| `npm run deploy` | 准备生产库 + 部署生产 |
+| `npm run deploy:preview` | 准备预览库 + 部署预览 |
+| `npm run setup` | 只准备生产库，不部署 |
+| `npm run setup:preview` | 只准备预览库，不部署 |
+| `npm run sw:bump` | 单独重写 Service Worker 版本号 |
+
+四个部署/准备类命令都会自动完成「建库 → 写绑定 → 建表 → 校验结构」，
+区别只在于目标是生产还是预览、以及最后是否执行 `wrangler deploy`。
+
+其它常用：
+
+```bash
+npx wrangler secret put ADMIN_PASSWORD      # 设/改管理员密码
+npx wrangler d1 execute uptime-db --remote --command "SELECT COUNT(*) FROM sites"
+npx wrangler tail                            # 看实时日志
+```
