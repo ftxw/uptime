@@ -11,6 +11,9 @@ node_modules/
 .env.*
 !.env.example
 
+# 项目本地记忆/状态（不入库）
+.workbuddy/
+
 # 日志
 *.log
 npm-debug.log*

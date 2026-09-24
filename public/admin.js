@@ -168,7 +168,7 @@ function sortSites(list) {
 
 const visibleSites = () => (FILTER ? SITES.filter((s) => groupOf(s) === FILTER) : SITES);
 
-/** 左侧分类目录：全部 → 各分类 → 未分组（仅当有站点落在这里） */
+/** 左侧分类目录：全部 → 各分类 → 未分组（永远常显，方便把游离站点归拢） */
 function catDir() {
   const counts = new Map();
   for (const s of SITES) {
@@ -176,13 +176,21 @@ function catDir() {
     counts.set(g, (counts.get(g) || 0) + 1);
   }
   const list = [{ key: ALL, name: "全部", count: SITES.length, system: true }];
+
+  const ungroupedExplicit = CATS.some((c) => c.name === UNGROUPED);
+
+  // 显式分类（含「未分组」）—— 一律常显，不再因无站点而隐藏
   for (const c of CATS) {
-    if (c.name === UNGROUPED && !counts.get(UNGROUPED)) continue;
     list.push({ key: c.name, name: c.name, count: counts.get(c.name) || 0 });
   }
-  // 站点上出现但没登记进分类表的（例如直接手输分类名）
+  // 站点上出现、但未登记进分类表的分类名（例如直接手输的分类名）
   for (const [g, n] of counts) {
+    if (g === UNGROUPED) continue; // 未分组单独兜底，避免重复
     if (!CATS.some((c) => c.name === g)) list.push({ key: g, name: g, count: n });
+  }
+  // 「未分组」兜底项：永远常显（即使没有任何站点落在它名下）
+  if (!ungroupedExplicit) {
+    list.push({ key: UNGROUPED, name: UNGROUPED, count: counts.get(UNGROUPED) || 0, system: true });
   }
   return list;
 }
@@ -262,7 +270,7 @@ async function renderRows() {
   )} · ${list.length} 个</span>`;
 
   if (!list.length) {
-    qs("#rows").innerHTML = `<tr><td colspan="7" class="empty">${
+    qs("#rows").innerHTML = `<tr><td colspan="6" class="empty">${
       SITES.length ? "该分类下还没有站点" : "还没有站点，点右上角「添加站点」"
     }</td></tr>`;
     return;
@@ -273,28 +281,12 @@ async function renderRows() {
       const st = s.last_ok === 1 ? "正常" : s.last_ok === 0 ? "故障" : "未检查";
       const cls = s.last_ok === 1 ? "b-up" : s.last_ok === 0 ? "b-down" : "b-unknown";
       const g = groupOf(s);
-      const same = SITES.filter((x) => groupOf(x) === g);
-      const gi = same.findIndex((x) => x.id === s.id);
 
-      return `<tr data-id="${escapeHtml(s.id)}" data-group="${escapeHtml(g)}" draggable="true">
-        <td>
-          <div class="row" style="gap:3px">
-            <span class="drag" title="拖拽调整分类内顺序">${ICON.grip}</span>
-            <span class="ord">
-              <button data-act="up" data-id="${escapeHtml(s.id)}" title="上移" ${
-        gi <= 0 ? "disabled" : ""
-      }>${ICON.up}</button>
-              <button data-act="down" data-id="${escapeHtml(s.id)}" title="下移" ${
-        gi === same.length - 1 ? "disabled" : ""
-      }>${ICON.down}</button>
-            </span>
-          </div>
-        </td>
+      return `<tr data-id="${escapeHtml(s.id)}" data-group="${escapeHtml(g)}">
         <td>
           <div style="font-weight:500">${escapeHtml(s.name)}${
         s.enabled ? "" : ' <span class="muted" style="font-size:11px">已暂停</span>'
       }</div>
-          <div class="muted" style="font-size:11px">${escapeHtml(g)} · ${escapeHtml(s.id)}</div>
         </td>
         <td><span class="mono" style="font-size:12px">${escapeHtml(s.url)}</span></td>
         <td class="muted" style="font-size:12px">${backendLabel(s)}<div style="font-size:11px;opacity:.65">${fmtInterval(
@@ -358,9 +350,8 @@ async function loadAll() {
   renderCats();
   await renderRows();
 
-  const parts = [`${SITES.length} 个站点 · ${CATS.length} 个分类`];
-  if (PWD_SOURCE === "none") parts.push("未设置管理员密码");
-  banner(parts.join(" · "), "info");
+  // 「X 站点 · Y 分类」的常驻绿色横幅已按需求移除；
+  // 未设置密码的警告仍由独立的 #pwd-warn 元素显示，不受影响。
   qs("#pwd-warn").hidden = PWD_SOURCE !== "none";
 }
 

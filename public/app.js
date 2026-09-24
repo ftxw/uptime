@@ -177,10 +177,8 @@ function renderGroups() {
   el.innerHTML = groups
     .map((g) => {
       const items = g.monitors || [];
-      const head =
-        GROUPS.length > 1
-          ? `<div class="mgroup-head">${escapeHtml(g.name)} <span class="count">(${items.length})</span></div>`
-          : "";
+      // 每个分类都显示标题（含单分类场景），保证前台能看到分类名
+      const head = `<div class="mgroup-head">${escapeHtml(g.name)} <span class="count">(${items.length})</span></div>`;
       return `<div class="card glass">
         ${head}
         <div class="mgroup-body">${items.map(monitorRow).join("")}</div>
@@ -189,10 +187,10 @@ function renderGroups() {
     .join("");
 }
 
-/* 分类筛选条：只在有多个分类时出现，避免单分类站点被无意义的 UI 占据 */
+/* 分类筛选条：有分类就显示（含单分类场景），让"前台显示分类"始终成立 */
 function renderChips() {
   const el = qs("#chips");
-  if (!GROUPS.length || GROUPS.length <= 1) {
+  if (!GROUPS.length) {
     el.innerHTML = "";
     return;
   }
