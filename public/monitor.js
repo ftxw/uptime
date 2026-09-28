@@ -449,6 +449,19 @@ function renderIncidents(incidents) {
 
 /* ── 主流程 ────────────────────────────────────────────── */
 
+/* 无缓存 + 请求失败时把骨架屏收掉。
+   否则页面会一直停在灰条上 —— 那比「加载中…」更容易被误读成"这站点没有记录"。
+   收掉后回到紧凑的失败态，只留标题/副标题上那句原因。 */
+function renderFailed(msg) {
+  document.querySelectorAll(".skel").forEach((el) => el.remove());
+  ["#recent", "#incidents"].forEach((sel) => {
+    const el = qs(sel);
+    if (el && !el.children.length) el.innerHTML = `<div class="empty">${escapeHtml(msg)}</div>`;
+  });
+  qs("#chart").innerHTML = `<div class="chart-empty">${escapeHtml(msg)}</div>`;
+  qs("#bar").innerHTML = '<span style="flex:1"></span>';
+}
+
 const params = new URLSearchParams(location.search);
 const SITE_ID = params.get("id") || "";
 let HOURS = Number(params.get("hours") || 24);
@@ -486,6 +499,7 @@ async function load() {
   if (!SITE_ID) {
     qs("#title").textContent = "缺少站点参数";
     qs("#subtitle").textContent = "请从总览页点击站点名称进入详情。";
+    renderFailed("缺少站点参数");
     return;
   }
 
@@ -509,9 +523,13 @@ async function load() {
     } else if (!cached) {
       qs("#title").textContent = "加载失败";
       qs("#subtitle").textContent = (data && data.error) || "接口返回异常";
+      renderFailed("加载失败");
     }
   } catch (e) {
-    if (!cached) qs("#subtitle").textContent = "加载失败，稍后重试";
+    if (!cached) {
+      qs("#subtitle").textContent = "加载失败，稍后重试";
+      renderFailed("加载失败，稍后重试");
+    }
   } finally {
     qs("#refresh").disabled = false;
   }

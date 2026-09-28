@@ -60,7 +60,7 @@
     </div>
   </div>
 
-  <!-- 站点基本信息 4 卡 -->
+  <!-- 站点基本信息 4 卡（内容由下方骨架脚本先占位） -->
   <section class="dcards" id="dcards"></section>
 
   <!-- 当前窗口的关键指标 -->
@@ -107,7 +107,7 @@
     </div>
     <!-- 占位与「故障记录」刻意用同一种样式：两张卡片同属一个 /api/site 响应、
          同一帧写入，加载期间看起来必须一样，否则空白会被误读成"这张更慢"。 -->
-    <div class="lst" id="recent"><div class="empty">加载中…</div></div>
+    <div class="lst" id="recent"></div>
   </div>
 
   <!-- 故障记录 -->
@@ -116,13 +116,85 @@
       <h2>故障记录</h2>
       <span class="muted" style="font-size:12px" id="incsum"></span>
     </div>
-    <div class="lst" id="incidents"><div class="empty">加载中…</div></div>
+    <div class="lst" id="incidents"></div>
   </div>
 
   <p class="muted" style="font-size:12px;margin:0" id="foot"></p>
 </main>
 
 <div class="tip" id="tip" role="tooltip"></div>
+
+<!-- 骨架屏：数据到达前先把每张卡的位置和尺寸搭出来（文字换成灰条）。
+     不占位的实测代价：数据到达的那一帧整页高度 937px → 2168px、CLS 0.74，
+     下面的卡片被整体顶下去一次 —— 观感就是"卡片被内容拖了一下"。
+     占位用的是与真实卡片**同一套 class**（.dcard/.stat/.lst-row/.inc-row + .sk 灰条），
+     行高由真实字号决定，因此是逐像素等高的占位，不是"估个大概"。
+     同步脚本，跑在 defer 的 monitor.js 之前、也跑在首帧之前：
+     有 localStorage 缓存时 monitor.js 会在首帧前就填好真实数据，骨架根本不会露脸。 -->
+<script>
+(function () {
+  var D = document;
+  var sk = function (t, cls) {
+    return '<span class="' + (cls ? cls + " " : "") + 'sk">' + t + "</span>";
+  };
+  var put = function (id, html) {
+    var el = D.getElementById(id);
+    if (el) el.innerHTML = html;
+  };
+  var card = function (inner, extra) {
+    return '<div class="card glass ' + extra + ' skel" aria-hidden="true">' + inner + "</div>";
+  };
+  var body = function (lines) {
+    return '<div style="min-width:0">' + lines + "</div>";
+  };
+
+  // 4 张站点信息卡：文案长度取真实数据的量级，灰条宽度才像成品
+  put("dcards", [
+    ["URL 地址", "http://example.com/health", ""],
+    ["检查间隔", "5 分钟", "font-family:var(--font-mono)"],
+    ["SSL 证书", "未检测", "font-family:var(--font-mono)"],
+    ["当前响应时间", "155 ms", "font-family:var(--font-mono)"]
+  ].map(function (c) {
+    return card(
+      '<span class="ic"></span>' +
+        body(
+          '<p class="k">' + sk(c[0]) + '</p><p class="v"' +
+            (c[2] ? ' style="' + c[2] + '"' : "") + ">" + sk(c[1]) + "</p>"
+        ),
+      "dcard"
+    );
+  }).join(""));
+
+  // 5 张指标卡
+  put("kpis", ["可用率", "平均响应", "P95 响应", "最快 / 最慢", "失败次数"].map(function (label) {
+    return card(
+      '<div class="stat-icon i-muted"></div>' +
+        body('<p class="stat-label">' + sk(label) + '</p><p class="stat-value">' + sk("000 ms") + "</p>"),
+      "stat"
+    );
+  }).join(""));
+
+  // 图表：整块灰底（高度由 .chart-wrap 的 min-height:260px 兜住）
+  put("chart", '<div class="chart-skel" aria-hidden="true"></div>');
+
+  // 色条：一条灰条，与"无数据"时同款，高度同为 34px
+  put("bar", '<span class="skel" aria-hidden="true"></span>');
+
+  // 最近检查：占位行结构与真实行完全一致（badge + 状态码 + 耗时 + 备注 + 时间）
+  // 条数取默认 recent_limit（见 src/settings.js 的 SETTING_META）——冷启动时
+  // 拿不到服务端配置，用默认值；改默认值时这里一并改。
+  put("recent", Array(21).join(
+    '<div class="lst-row skel" aria-hidden="true">' + sk("正常", "badge") +
+      sk("200") + sk("155 ms") + sk("cfapi · H2", "grow") + sk("2026-01-01 00:00:00") + "</div>"
+  ));
+
+  // 故障记录：占位一行。绝大多数站点此刻没有故障，真为空时卡片只会比占位矮约 10px
+  put("incidents", '<div class="inc-row skel" aria-hidden="true">' + sk("已恢复", "badge") +
+    '<div class="grow" style="min-width:0">' + sk("HTTP 500") +
+    '<div style="margin-top:3px">' + sk("2026-01-01 00:00:00 → 00:00:00 · 历时 1 分 0 秒") +
+    "</div></div></div>");
+})();
+</script>
 <script src="/monitor.js" defer></script>
 <script>
 if ("serviceWorker" in navigator) {

@@ -151,6 +151,9 @@ a { color: inherit; text-decoration: none; }
 
 .page-head h1 { margin: 0; font-size: 20px; font-weight: 600; letter-spacing: -0.01em; }
 .page-head p { margin: 2px 0 0; font-size: 13px; color: hsl(var(--muted-foreground)); }
+/* 副标题（分组 · URL · 最近检查…）数据到达前是空的。空 <p> 高 0，
+   文字一出现就把下方整块推下去 —— 先按一行字号把高度占住（13 × 1.6 ≈ 21px）。 */
+#subtitle:empty { min-height: 21px; }
 
 .topbar {
   position: sticky; top: 0; z-index: 20;
@@ -481,7 +484,41 @@ dialog::backdrop { background: hsl(220 30% 10% / 0.45); }
 
 .empty { padding: 44px 16px; text-align: center; color: hsl(var(--muted-foreground)); font-size: 13px; }
 
-/* ── 骨架屏 ─────────────────────────────────────────────── */
+/* ── 骨架屏（数据到达前的占位）────────────────────────────
+   为什么需要它：详情页的数据全在 /api/site 一个响应里，响应没到之前那几个容器
+   是空的 —— 实测（视口 1400、接口延迟 8s）加载中整页 937px，数据到达那一帧
+   直接变成 2168px、CLS 0.74：下面所有卡片被整体顶下去一次，看起来就是
+   "卡片被内容拖了一下"。先把位置占住，就没有这一下。
+
+   ⚠️ 灰条必须用**真实文字 + color:transparent + 背景色**画出来，不能用
+   定高定宽的 inline-block 假条：
+     · 假条比字矮 → 撑不起行盒，占位比成品矮（列表卡尤其明显）；
+     · 假条比字高 → 反而把行盒撑开，占位比成品高。
+   用真字的行盒，高度就与成品逐像素一致（字体/行高改了也自动跟随）。 */
+.sk {
+  color: transparent;
+  background: hsl(var(--muted-foreground) / 0.22);
+  border-radius: 4px;
+  user-select: none;
+  animation: sk-pulse 1.5s ease-in-out infinite;
+}
+.badge.sk { border-radius: 999px; }
+@keyframes sk-pulse {
+  0%, 100% { opacity: 0.55; }
+  50% { opacity: 1; }
+}
+/* 图表整块占位：高度由 .chart-wrap 的 min-height 兜住 */
+.chart-skel {
+  position: absolute; inset: 0;
+  border-radius: calc(var(--radius) - 4px);
+  background: hsl(var(--muted-foreground) / 0.12);
+  animation: sk-pulse 1.5s ease-in-out infinite;
+}
+/* 色条占位：与"无数据"时同款的一条灰条，高度同为 34px */
+.bar span.skel {
+  background: hsl(var(--muted-foreground) / 0.18);
+  animation: sk-pulse 1.5s ease-in-out infinite;
+}
 
 .mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
 .muted { color: hsl(var(--muted-foreground)); }
@@ -576,7 +613,9 @@ dialog::backdrop { background: hsl(220 30% 10% / 0.45); }
 }
 
 /* 图表 */
-.chart-wrap { position: relative; width: 100%; }
+/* min-height：加载中 / 切时间范围时这里是空的，SVG 出现后会占满 260px。
+   不预留的话卡身高会在 126px ↔ 386px 之间跳 —— 那是整页位移里第二大的来源。 */
+.chart-wrap { position: relative; width: 100%; min-height: 260px; }
 .chart-wrap svg { display: block; width: 100%; height: auto; overflow: visible; }
 .chart-empty {
   display: flex; align-items: center; justify-content: center;
