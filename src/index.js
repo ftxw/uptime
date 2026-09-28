@@ -551,6 +551,27 @@ function clampInt(v, min, max, dflt) {
 }
 
 /**
+ * 解析 URL 查询参数里的整数（**不能用 clampInt 代替**）。
+ *
+ * ⚠️ 两个真实踩过的坑：
+ *  1. `url.searchParams.get("x")` 缺省返回 **null**，而 `Number(null) === 0`
+ *     且 0 是有限数 —— 走 clampInt 会被当成"传了 0"钳成 min，而不是落到默认值。
+ *     后果是 /api/overview 不带 days 时 days=1：首页 30 天色条只剩今天一格，
+ *     被 CSS 的 flex:1 拉满整行，看上去就是「运行历史变成一根长条」。
+ *  2. `Number("abc")` 是 NaN，若让它漏下去，`new Date(NaN).toISOString()`
+ *     会直接抛异常 → 接口 500（`/api/site?days=abc` 原先就是这样）。
+ *
+ * 所以：缺失（null / undefined / 空白）与非法值都回落到 dflt，其余钳到 [min,max]。
+ */
+function queryInt(raw, dflt, min, max) {
+  if (raw === null || raw === undefined) return dflt;
+  const s = String(raw).trim();
+  if (s === "") return dflt;
+  const n = Number(s);
+  return Number.isFinite(n) ? Math.min(max, Math.max(min, Math.trunc(n))) : dflt;
+}
+
+/**
  * 站点 id 会拼进 URL（/monitor?id=）也用作主键。
  * SQL 是参数化的，不存在注入风险；真正要拦的是**会拆掉 URL 结构**的字符
  * （/ ? # % 与控制字符、空白），其余（含中文）放行，避免把已有的中文 id 站点变成无法编辑。
@@ -1344,10 +1365,7 @@ export default {
         //    更糟的是缓存 key 里带 days —— 每个不同的值都是**独立的缓存条目**，
         //    等于给了任何人一个「用任意 days 灌满边缘缓存 + 拉高 D1 扫描量」的入口。
         //    上限 90 与 /api/site 的 days 一致（前台 30 天色条只用得到 30 天）。
-        const rawDays = Number(url.searchParams.get("days"));
-        const days = Number.isFinite(rawDays)
-          ? Math.max(1, Math.min(Math.trunc(rawDays), 90))
-          : 30;
+        const days = queryInt(url.searchParams.get("days"), 30, 1, 90);
         // 缓存 key 带上配置版本：后台一改配置版本就 +1，所有机房的旧 key 立即不再命中
         const ver = await configVersion(env);
         const keyUrl = `${url.origin}/api/overview?days=${days}&pretty=${pretty ? 1 : 0}&v=${ver}`;
@@ -1536,7 +1554,10 @@ export default {
         const id = url.searchParams.get("id");
         if (!id) return json({ ok: false, error: "缺少 id 参数" }, 400, "no-store", pretty);
 
-        const hoursFor = Math.max(1, Math.min(Number(url.searchParams.get("hours") || 24), 720));
+        const hoursFor = queryInt(url.searchParams.get("hours"), 24, 1, 720);
+        // 色条天数（前台只用得到 30）。与 hoursFor 一样先在缓存 key 之外算好，
+        // 避免"key 里的值"与"实际查询用的值"两处各算一遍后分叉。
+        const daysFor = queryInt(url.searchParams.get("days"), 30, 1, 90);
         // 「最近检查」条数：后台设置 recent_limit（默认 20），?recent= 可临时覆盖
         const recentN = clampInt(
           url.searchParams.get("recent") || env.RECENT_LIMIT || defOf("recent_limit"),
@@ -1552,18 +1573,19 @@ export default {
           Number(defOf("incident_limit"))
         );
         const verS = await configVersion(env);
-        // ⚠️ recent / incident 必须进缓存 key：它们决定返回体的行数，
-        //    不进 key 的话先请求 ?recent=5 会把默认条数的响应污染成 5 条（或反之）。
+        // ⚠️ hours / days / recent / incident 都必须进缓存 key：它们决定**返回体的内容与长度**，
+        //    不进 key 的话先请求 ?recent=5（或 ?days=7）会把默认响应的缓存污染成 5 条 / 7 天（或反之）。
         const keyUrl = `${url.origin}/api/site?id=${encodeURIComponent(
           id
-        )}&hours=${hoursFor}&recent=${recentN}&incident=${incidentN}&pretty=${
+        )}&hours=${hoursFor}&days=${daysFor}&recent=${recentN}&incident=${incidentN}&pretty=${
           pretty ? 1 : 0
         }&v=${verS}`;
 
         return await withEdgeCache(request, ctx, 30, async () => {
           const d = await db(env);
-          const hours = Math.max(1, Math.min(Number(url.searchParams.get("hours") || 24), 720));
-          const days = Math.max(1, Math.min(Number(url.searchParams.get("days") || 30), 90));
+          // 复用上面那份（与缓存 key 同源），不再各自重算
+          const hours = hoursFor;
+          const days = daysFor;
           const since = new Date(Date.now() - hours * 3600 * 1000).toISOString();
           const sinceD = new Date(Date.now() - days * 86400000).toISOString();
           const bkt = bucketFor(hours);
