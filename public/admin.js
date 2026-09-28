@@ -25,6 +25,7 @@ let AUTHED = false;
 let PWD_SOURCE = "none"; // none | env —— 密码只来自环境变量 ADMIN_PASSWORD
 let SETTINGS = null;     // /admin 一次性带回的设置，用于设置面板预填
 let SSL_MAP = {};        // /admin 一次性带回的证书结果（site → 记录）
+let PWD_WARN_MUTED = false; // 用户手动关掉「未设密码」提醒后，本次会话不再自动弹出
 
 const UNGROUPED = "未分组";
 const ALL = "__all__";
@@ -51,16 +52,30 @@ function relTime(iso) {
   return `${Math.floor(s / 86400)} 天前`;
 }
 
+/**
+ * 顶部滑出提示（临时 toast）。
+ *
+ * 为什么改成 fixed 的 toast：这些提示原先插在页头下方、属文档流 ——
+ * 一出现就把下面的卡片整体顶下去，消失又弹回来，屏幕一直在跳。
+ * 现在统一挂到 body 末尾的 #toast-host 上（fixed，从顶部滑出），
+ * 完全不参与布局，出现/消失都不影响页面内容；多条提示会依次堆叠。
+ */
 function banner(msg, kind) {
-  const el = qs("#banner");
-  if (!msg) {
-    el.hidden = true;
-    return;
-  }
-  el.className = "alert alert-" + (kind || "info");
+  const host = qs("#toast-host");
+  if (!host || !msg) return;
+
+  const el = document.createElement("div");
+  el.className = "alert alert-" + (kind || "info") + " toast";
   el.textContent = msg;
-  el.hidden = false;
-  if (kind !== "error") setTimeout(() => { el.hidden = true; }, 4000);
+  host.appendChild(el);
+
+  // 先入 DOM 再加 .show：否则首次渲染就已是终态，滑出动画不会播。
+  requestAnimationFrame(() => el.classList.add("show"));
+
+  setTimeout(() => {
+    el.classList.remove("show");
+    setTimeout(() => el.remove(), 320); // 等过渡播完再摘掉节点
+  }, kind === "error" ? 6000 : 3000);
 }
 
 /* ── 请求封装：401 一律弹出登录 ─────────────────────────── */
@@ -291,8 +306,6 @@ async function renderRows() {
         s.last_ts
       )}</div></td>
         <td style="text-align:right;white-space:nowrap">
-          <a class="btn btn-sm" href="/monitor?id=${encodeURIComponent(s.id)}" target="_blank"
-             rel="noopener" title="查看详情">详情</a>
           <button class="btn btn-sm" data-act="proxy-test" data-id="${escapeHtml(s.id)}">测</button>
           <button class="btn btn-sm" data-act="edit" data-id="${escapeHtml(s.id)}">编辑</button>
           <button class="btn btn-sm btn-danger" data-act="del" data-id="${escapeHtml(s.id)}">删除</button>
@@ -344,9 +357,10 @@ async function loadAll() {
   renderCats();
   await renderRows();
 
-  // 「X 站点 · Y 分类」的常驻绿色横幅已按需求移除；
-  // 未设置密码的警告仍由独立的 #pwd-warn 元素显示，不受影响。
-  qs("#pwd-warn").hidden = PWD_SOURCE !== "none";
+  // 「X 站点 · Y 分类」的常驻绿色横幅已按需求移除。
+  // 未设置密码的提醒改为顶部滑出的常驻 toast（不占布局，不再顶动卡片）；
+  // 用户手动关掉后，本次会话不再自动弹。
+  qs("#pwd-warn").classList.toggle("show", PWD_SOURCE === "none" && !PWD_WARN_MUTED);
 }
 
 /* ── 分类：切换 / 新建 / 改名 / 删除 / 排序 ─────────────── */
@@ -657,9 +671,10 @@ document.addEventListener("click", async (e) => {
       const res = (d.results || [])[0] || {};
       const where = d.egress?.colo ? `机房 ${d.egress.colo}` : res.probe || "";
       const mark = d.persisted ? `（已记入检查记录${d.persisted.ok ? "" : "：" + (d.persisted.reason || "失败")}）` : "";
-      // ⚠️ 顺序要紧：先重渲染表格（让「状态 / 最近检查」立刻反映这次结果），
-      //    再显示提示。若反过来，banner() 会被刷新流程里的横幅覆盖掉。
-      //    这里只调 renderRows 而不是 loadAll —— 后者会写「N 个站点 · N 个分类」横幅。
+      // 顺序：先重渲染表格（让「状态 / 最近检查」立刻反映这次结果），再弹提示 ——
+      // 这样用户看到的是"表已更新"而不是先闪一条提示再等表格刷新。
+      // 这里只调 renderRows 而不是 loadAll：后者会重拉一次全量数据，
+      // 让这条刚弹出的结果提示白等一个 RTT。
       if (d.persisted) await renderRows();
       banner(
         `${site.name}：HTTP ${res.status ?? "—"} · ${res.ttfb ?? "—"} ms · ${where} · 往返 ${
@@ -778,8 +793,14 @@ function fillSettingsForm(s) {
 
   // 密码只来自环境变量：这里只用于决定是否显示「尚未设置」警告
   PWD_SOURCE = s.password_source || "none";
-  qs("#pwd-warn").hidden = PWD_SOURCE !== "none";
+  qs("#pwd-warn").classList.toggle("show", PWD_SOURCE === "none" && !PWD_WARN_MUTED);
 }
+
+// 常驻提示（「未设密码」）可以手动关掉；关掉后本次会话不再自动弹
+qs("#pwd-warn-close").addEventListener("click", () => {
+  PWD_WARN_MUTED = true;
+  qs("#pwd-warn").classList.remove("show");
+});
 
 qs("#settings-open").addEventListener("click", openSettings);
 

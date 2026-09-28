@@ -58,13 +58,8 @@
     </div>
   </div>
 
-  <div class="alert alert-info" id="banner" hidden></div>
-  <div class="alert alert-warn" id="pwd-warn" hidden>
-    <b>尚未设置管理员密码</b> —— 当前任何人都能修改配置。<br>
-    请给 Worker 添加变量 <code>ADMIN_PASSWORD</code>，<b>类型必须选 Secret</b>：
-    若选成 Text（明文），下一次部署会把它清掉，就会出现"明明设了却还说没设"。
-    设置后无需重新部署，刷新本页即生效。
-  </div>
+  <!-- 提示区不放在这里：此处属文档流，提示一出现就会把下方卡片整体顶下去。
+       所有提示统一改到 body 末尾的 #toast-host（fixed 定位，从顶部滑出，不占布局）。 -->
 
   <!-- 左右两栏：左 = 分类，右 = 站点 -->
   <div class="adm-grid">
@@ -393,6 +388,25 @@
     <div class="alert alert-error" id="login-err" hidden></div>
     <button class="btn btn-primary" type="submit" id="login-btn">登录</button>
   </form>
+</div>
+
+<!-- ══════════ 顶部滑出提示 ══════════
+     fixed 定位、不参与文档流 —— 出现与消失都不会推挤下面的卡片。
+     层级高于 topbar(20)、低于登录遮罩(100)，所以不会盖住登录框。
+     #pwd-warn 是常驻的一条（未设密码时显示），带关闭按钮；
+     其余临时提示由 admin.js 的 banner() 动态插入到这里。 -->
+<div class="toast-host" id="toast-host" aria-live="polite">
+  <div class="alert alert-warn toast" id="pwd-warn">
+    <div class="toast-body">
+      <b>尚未设置管理员密码</b> —— 当前任何人都能修改配置。<br>
+      请给 Worker 添加变量 <code>ADMIN_PASSWORD</code>，<b>类型必须选 Secret</b>：
+      若选成 Text（明文），下一次部署会把它清掉，就会出现"明明设了却还说没设"。
+      设置后无需重新部署，刷新本页即生效。
+    </div>
+    <button class="toast-x" id="pwd-warn-close" type="button" aria-label="关闭提示">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>
+    </button>
+  </div>
 </div>
 
 <script src="/admin.js" defer></script>

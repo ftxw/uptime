@@ -439,6 +439,45 @@ dialog::backdrop { background: hsl(220 30% 10% / 0.45); }
   background: hsl(var(--muted) / .8);
 }
 
+/* ── 顶部滑出提示（toast）─────────────────────────────────
+   原先提示插在页头下方，属文档流：一出现就把卡片整体顶下去，
+   消失又弹回来，页面一直跳。改成 fixed 定位后完全不参与布局。
+   层级刻意取在 topbar(20) 之上、登录遮罩(100) 之下 ——
+   盖住吸顶导航没问题，但绝不会挡住登录框。 */
+.toast-host {
+  position: fixed; top: 0; left: 0; right: 0; z-index: 60;
+  display: flex; flex-direction: column; align-items: center; gap: 8px;
+  padding: 12px 16px 0;
+  pointer-events: none; /* 容器不吃点击，只有卡片本身可交互 */
+}
+.toast {
+  width: 100%; max-width: 760px;
+  /* toast 是浮层，会压在 topbar / 页头之上：必须用**不透明**底色，
+     否则 .alert-* 的半透明底会让下层文字透上来，看着发脏。
+     语义色仍由 .alert-* 提供（文字色 + 边框色），这里再加一条左侧色条。 */
+  background: hsl(var(--card));
+  border-left-width: 3px;
+  box-shadow: 0 12px 32px hsl(220 40% 10% / .18), 0 2px 8px hsl(220 40% 10% / .08);
+  /* 初始停在视口上方（多移 16px 保证完全出屏），opacity 配合做淡入 */
+  transform: translateY(calc(-100% - 16px)); opacity: 0;
+  visibility: hidden;
+  transition: transform .28s cubic-bezier(.22, 1, .36, 1), opacity .22s ease, visibility 0s .28s;
+  pointer-events: auto;
+}
+.toast.show {
+  transform: none; opacity: 1; visibility: visible;
+  transition: transform .28s cubic-bezier(.22, 1, .36, 1), opacity .22s ease, visibility 0s 0s;
+}
+.toast-body { flex: 1; }
+/* 关闭按钮：给常驻提示（如「未设密码」）用 */
+.toast-x {
+  flex: none; display: inline-flex; align-items: center; justify-content: center;
+  width: 22px; height: 22px; margin-left: 4px; padding: 0;
+  border: 0; border-radius: 6px; cursor: pointer;
+  background: transparent; color: inherit; opacity: .65;
+}
+.toast-x:hover { background: hsl(var(--foreground) / .08); opacity: 1; }
+
 .empty { padding: 44px 16px; text-align: center; color: hsl(var(--muted-foreground)); font-size: 13px; }
 
 /* ── 骨架屏 ─────────────────────────────────────────────── */
