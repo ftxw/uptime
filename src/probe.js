@@ -255,7 +255,19 @@ export async function gpCreate(env, site) {
   };
 }
 
-/** 收取 Globalping 测量结果，转成统一结构 */
+/**
+ * 收取 Globalping 测量结果，转成统一结构。
+ *
+ * 返回契约（调用方**必须**按这三种分支处理，尤其是 broken）：
+ *   { done: false }                       —— 还在跑，pending 留到下一轮
+ *   { done: true, broken: true, error }   —— 结果不可用，调用方应**丢弃 pending 且不记检查记录**
+ *   { done: true, results, status }       —— 正常结果
+ *
+ * broken 分支存在的原因：原来只判断 `status !== "finished" && !== "failed"` 就一律当成
+ * "还在跑"。可测量 id 失效 / API 返回错误体时响应里**压根没有 status**，于是会永远返回
+ * done:false → pending 行永不删除 → 而 dispatch 里 `if (pendingSet.has(s.id)) continue`
+ * 会让该站点**永久不再被发起探测**，静默停摆且没有任何告警。
+ */
 export async function gpCollect(env, pending) {
   const token = env && env.GLOBALPING_TOKEN;
   const res = await fetch(
@@ -263,6 +275,14 @@ export async function gpCollect(env, pending) {
     { headers: token ? { Authorization: `Bearer ${token}` } : {} }
   );
   const d = await res.json();
+  if (!d || typeof d.status !== "string") {
+    return {
+      done: true,
+      broken: true,
+      results: [],
+      error: "响应缺少 status：" + JSON.stringify(d).slice(0, 120),
+    };
+  }
   if (d.status !== "finished" && d.status !== "failed") {
     return { done: false, results: [] };
   }
@@ -285,6 +305,28 @@ export async function gpCollect(env, pending) {
 }
 
 /* ─────────────────────────── SSL 检测 ─────────────────────────── */
+
+/**
+ * SSL 检测的两个时间常量。
+ *
+ * `GP_SSL_PROBE_TIMEOUT_SEC` 会作为**顶层** `timeout` 传给 Globalping —— 它是探针端的
+ * 墙钟超时（整数秒，允许 5–30；省略时平台按测量参数自行推算、上限 30s）。
+ * ⚠️ 它不在 `measurementOptions` 里，`measurementOptions.request` 只认
+ *    host/path/query/method/headers（且 additionalProperties: false），
+ *    所以**必须和 type/target/locations/limit 平级**，塞进 measurementOptions 会被 422 拒掉。
+ *
+ * 为什么显式压到 10s（而不是吃平台的 30s 默认值）：
+ *   ① 官方要求调用方在客户端超时上再留 ≥10s 给探针↔API 通信与测量收尾。不压探针侧的话，
+ *      最坏要等 30+10=40s 才敢判超时；而这段时间是本 Worker **同步轮询**掉的，每 2s 一次
+ *      子请求，窗口每多 2s 就多一个子请求（SSL_PER_TICK 默认 2 个站点共用 subreq_budget 30）。
+ *   ② 正常站点从国内机房探针做一次 TLS 握手 + GET 快得多 —— 实测北京探针打 baidu.com 是
+ *      total 68ms / firstByte 16ms，绝大多数情况第一次轮询（2s）就拿到 finished。
+ *      压到 10s 对正常站点没有任何影响；真超过 10s 的站点本就该判为证书检测失败。
+ */
+const GP_SSL_PROBE_TIMEOUT_SEC = 10;
+
+/** 探针↔API 通信 + 测量收尾的余量。官方口径要求 ≥10s，这里给 15s。 */
+const GP_SSL_FINALIZE_GRACE_MS = 15_000;
 
 /**
  * 查一个站点的 SSL 证书。
@@ -323,6 +365,8 @@ export async function gpSslCheck(env, site) {
         target: u.hostname,
         locations: [{ magic }],
         limit: 1,
+        // 顶层字段，不是 measurementOptions 的子键（见 GP_SSL_PROBE_TIMEOUT_SEC 注释）
+        timeout: GP_SSL_PROBE_TIMEOUT_SEC,
         measurementOptions: {
           protocol: "HTTPS",
           port: u.port ? Number(u.port) : 443,
@@ -338,12 +382,22 @@ export async function gpSslCheck(env, site) {
     return { error: "globalping create failed: " + JSON.stringify(created).slice(0, 150) };
   }
 
-  const deadline = Date.now() + 25_000;
+  // 窗口 = 探针侧超时 + 收尾余量 = 25s。不再拍一个凭空的 25s，而是由两个可解释的量推出来：
+  // 探针最多跑 GP_SSL_PROBE_TIMEOUT_SEC 秒，之后平台还要收尾，窗口必须比两者之和大，
+  // 否则慢测量会在结果就绪前被判超时。
+  // 最坏 14 个子请求/站点（1 次发起 + 13 次轮询，即 25s 按 2s 走满）—— 与改动前逐一相同，
+  // 这里只是把窗口**变成可以被论证的**，并没有把它拉长。健康站点实测第 1 次轮询就 finished。
+  const deadline = Date.now() + GP_SSL_PROBE_TIMEOUT_SEC * 1000 + GP_SSL_FINALIZE_GRACE_MS;
   while (Date.now() < deadline) {
     await new Promise((r) => setTimeout(r, 2000));
     const d = await (
       await fetch(`https://api.globalping.io/v1/measurements/${created.id}`, { headers: H })
     ).json();
+    // 响应体里没有 status（测量 id 失效、API 返回错误体）→ 立刻失败并带上原文，
+    // 不要傻等到 deadline：那种情况下再怎么轮询都等不到 finished。
+    if (!d || typeof d.status !== "string") {
+      return { error: "globalping 查询失败：" + JSON.stringify(d).slice(0, 120) };
+    }
     if (d.status !== "finished" && d.status !== "failed") continue;
 
     const r0 = (d.results || [])[0] || {};
@@ -366,6 +420,10 @@ export async function gpSslCheck(env, site) {
       probe: `${r0.probe?.city || "?"}/${r0.probe?.asn || "?"}`,
     };
   }
-  return { error: "SSL 检测超时" };
+  return {
+    error: `SSL 检测超时（探针 ${GP_SSL_PROBE_TIMEOUT_SEC}s + 收尾 ${
+      GP_SSL_FINALIZE_GRACE_MS / 1000
+    }s 内未返回结果）`,
+  };
 }
 

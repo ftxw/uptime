@@ -672,32 +672,79 @@ async function probeViaCf(env, hint, list, timeoutMs) {
   };
 }
 
+/**
+ * pending 行的最长存活时间（兜底）。
+ *
+ * 为什么必须有：`dispatch` 里 `if (pendingSet.has(s.id)) continue` 会让**已有 pending 的
+ * 站点不再被发起探测**，所以一条永不收尾的 pending 就等于该站点**永久静默停摆** ——
+ * 页面上还在显示旧状态，实际早已不再检测，且不会有任何告警。
+ *
+ * 取值依据：正常测量一定在 ~40s 内进入 finished/failed（探针侧最多 30s + 收尾 ≥10s），
+ * 而 cron 每分钟醒一次 —— 3 分钟远大于任何正常情况，不会误杀在途测量；
+ * 又短到让异常在一两个监测周期内自愈。
+ * gpCollect 已经直接把"响应缺 status"判为 broken（见其返回契约），这里只是最后一道兜底。
+ */
+const PENDING_TTL_MS = 180_000;
+
 /** 阶段一：收取上一轮发起的 Globalping 测量 */
 async function collectGlobalping(env) {
   const d = await db(env);
   const { results: pending } = await d.prepare("SELECT * FROM pending").all();
-  // ⚠️ 返回值结构必须与下面的完整分支保持一致（尤其是 alerts）——
+  // ⚠️ 返回值结构必须与下面的完整分支保持一致（尤其是 alerts / dropped）——
   //    调用方会无条件读 collected.alerts.length，少了这个字段就会抛 TypeError，
   //    导致整轮 cron 在打完日志前失败。
-  if (!pending || !pending.length) return { collected: 0, rows: [], alerts: [] };
+  if (!pending || !pending.length) return { collected: 0, rows: [], alerts: [], dropped: [] };
 
   const sites = await loadSites(env);
   const byId = Object.fromEntries(sites.map((s) => [s.id, s]));
   const rows = [];
   const perSite = {};
   const doneIds = [];
+  // 被丢弃、且**没有**写检查记录的 pending。正常恒为空，非空即代表有异常需要排查。
+  const dropped = [];
 
   for (const p of pending) {
+    // ── 兜底：存活过久的 pending 一律丢弃 ──
+    // 拿不到可解析的 created_ts 也一并丢弃：既然无法给它定上界，就当作可能永久占位处理，
+    // 代价只是多探一次，好过站点悄悄停摆。
+    const born = Date.parse(p.created_ts);
+    if (!Number.isFinite(born) || Date.now() - born > PENDING_TTL_MS) {
+      dropped.push({
+        site: p.site,
+        id: p.measurement_id,
+        why: "ttl",
+        age_ms: Number.isFinite(born) ? Date.now() - born : null,
+      });
+      doneIds.push(p.site);
+      continue;
+    }
+
     let out;
     try {
       out = await gpCollect(env, p);
     } catch (e) {
-      // 收取失败就丢弃，避免 pending 永久占位
+      // 收取失败就丢弃，避免 pending 永久占位。同样不记检查记录（不知道站点当时的状态）
+      dropped.push({
+        site: p.site,
+        id: p.measurement_id,
+        why: "throw",
+        error: String((e && e.message) || e),
+      });
       doneIds.push(p.site);
       continue;
     }
     if (!out.done) continue; // 还没跑完，留到下一轮
     doneIds.push(p.site);
+
+    // 结果不可用（measurement id 失效 / API 返回错误体）：丢弃 pending，但**不写检查记录**。
+    // 为什么不能记成一次失败：我们对站点当时的可达性一无所知，记失败会凭空造出一次"故障"，
+    // 攒到阈值还会发告警 —— 那是把"我们没拿到数据"谎报成"站点挂了"。
+    // 丢弃 pending 让下一轮能重新发起，比让它永久占位（站点静默停摆）安全得多。
+    if (out.broken) {
+      dropped.push({ site: p.site, id: p.measurement_id, why: "broken", error: out.error });
+      continue;
+    }
+
     const site = byId[p.site];
     if (!site) continue;
     const good = out.results.filter((r) => r.ok);
@@ -736,7 +783,7 @@ async function collectGlobalping(env) {
   }
   const alerts = await bumpState(env, perSite);
   const alertResult = await sendAlerts(env, alerts);
-  return { collected: rows.length, rows, alerts, alertResult };
+  return { collected: rows.length, rows, alerts, alertResult, dropped };
 }
 
 /**
@@ -1002,7 +1049,8 @@ async function persistManualTest(env, site, { source, probe, result }) {
  * 刷新过期/缺失的 SSL 信息。
  *
  * ⚠️ 额度与子请求都要小心：gpSslCheck 是「发起 + 轮询」的同步写法，
- *    单站点最多消耗 ~13 个子请求，而 Workers 免费层每次调用上限 50。
+ *    单站点最坏 14 个子请求（1 次发起 + 25s 窗口内每 2s 轮询一次），
+ *    而 Workers 免费层每次调用上限 50。
  *    所以定时任务里每轮只处理 limit 个（默认 2 个），
  *    10 个站点大约半小时内轮完一遍 —— 对"证书每天查一次"完全够。
  */
@@ -1989,6 +2037,17 @@ export default {
           const out = await gpCollect(env, { measurement_id: id });
           if (out.done) finished = out;
         }
+        // 结果不可用（id 失效 / API 报错）→ 明确报错并**不落库**。
+        // gpCollect 把这种响应判成 done+broken（见其返回契约），照旧往下走会把
+        // "压根没拿到数据"存成一条假的失败记录，反而污染页面。
+        if (finished?.broken) {
+          return json(
+            { ok: false, kind: "globalping", source, quota, error: finished.error },
+            502,
+            "no-store",
+            pretty
+          );
+        }
         const results = finished?.results || [];
         let persisted = null;
         if (site) {
@@ -2081,6 +2140,9 @@ export default {
         sites: sites.length,
         due: due.length, // 本轮按间隔筛选后实际该查的站点数
         collected: collected.collected,
+        // 丢弃且未记检查记录的 pending（ttl / broken / throw）。正常恒为 []；
+        // 非空说明 Globalping 那边有异常，且该站点本轮没有产出检查记录。
+        gpDropped: collected.dropped,
         dispatched: disp.started,
         gpStarted: disp.gpStarted,
         skipped: disp.skipped,
