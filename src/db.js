@@ -135,18 +135,23 @@ export async function insertChecks(env, rows) {
 /**
  * state 的 upsert 语句 —— 一次写完「计数」与「最后一次结果快照」。
  *
- * last_ok_ts / last_alert_ts 用 COALESCE(excluded.X, state.X) 是刻意的：
- * 传入 NULL 表示"本次没有新的成功/告警"，应当**保留原值**而不是清空。
+ * last_ok_ts 用 COALESCE(excluded.last_ok_ts, state.last_ok_ts) 是刻意的：
+ * 传入 NULL 表示"本次没有成功"，应当**保留上一次成功的时间**而不是清空。
+ *
+ * ⚠️ 这里**不再写 `last_alert_ts`**。它曾经由 sendAlerts 逐条 UPDATE 写入，但：
+ *    ① 没有任何读者（不在任何响应里）；
+ *    ② 每条告警一次 D1 往返，而告警发生在时间敏感路径上；
+ *    ③ 每次检查都会被 STATE_UPSERT 重新置回 null，写了等于白写。
+ *    列本身保留在 schema 里（避免动表结构），只是不再有人读写它。
  */
 const STATE_UPSERT =
-  `INSERT INTO state (site, consecutive_fail, last_ok_ts, last_checked_ts, last_alert_ts,
+  `INSERT INTO state (site, consecutive_fail, last_ok_ts, last_checked_ts,
      last_ok, last_status, last_ttfb_ms, last_total_ms, last_source, last_probe, last_ts, last_error)
-   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
    ON CONFLICT(site) DO UPDATE SET
      consecutive_fail = excluded.consecutive_fail,
      last_ok_ts       = COALESCE(excluded.last_ok_ts, state.last_ok_ts),
      last_checked_ts  = excluded.last_checked_ts,
-     last_alert_ts    = COALESCE(excluded.last_alert_ts, state.last_alert_ts),
      last_ok          = excluded.last_ok,
      last_status      = excluded.last_status,
      last_ttfb_ms     = excluded.last_ttfb_ms,
@@ -205,7 +210,7 @@ export async function bumpState(env, perSite) {
     batch.push(
       d
         .prepare(STATE_UPSERT)
-        .bind(site, fail, info.ok ? nowIso : null, nowIso, null, ...lastResultFields(info, nowIso))
+        .bind(site, fail, info.ok ? nowIso : null, nowIso, ...lastResultFields(info, nowIso))
     );
 
     if (info.ok && before >= info.threshold) {

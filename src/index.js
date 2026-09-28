@@ -133,11 +133,11 @@ async function withEdgeCache(request, ctx, ttl, producer, keyUrl) {
     ...JSON_HEADERS,
     "Cache-Control": `public, s-maxage=${ttl}`,
   };
-  // ⚠️ 这里必须 await 而不是 ctx.waitUntil：
-  //    写接口的 purgeOverview() 会 delete 同一个 key。若 PUT 是异步的，
-  //    就可能出现「delete 先执行（当时 key 还不存在）→ PUT 随后落地」，
-  //    于是后台改完分类/顺序后前台仍读到旧值，最坏要等 TTL 过期。
-  //    实测正是踩到这个竞态。PUT 是机房本地操作，同步等待的成本可忽略。
+  // ⚠️ 用 await 而不是 ctx.waitUntil：PUT 是机房本地的同步操作，耗时可忽略；
+  //    而异步 PUT 会让写入跨越请求边界（响应已返回、PUT 才落地），
+  //    在 config_version 递增这类时序里留下难以复现的残影。
+  //    顺带说明：缓存**失效**不依赖任何 append/delete 动作，
+  //    全靠 key 里带 config_version（写操作一改版本号，旧 key 就再也不会被命中）。
   try {
     await cache.put(key, new Response(text, { status: 200, headers }));
   } catch {}
@@ -157,7 +157,19 @@ async function configVersion(env) {
   }
 }
 
-/** 写操作后递增配置版本 —— 让所有机房的旧缓存 key 立即失效 */
+/**
+ * 写操作后让缓存失效。
+ *
+ * ⚠️ 这里**只**递增 config_version，不再手动 delete 缓存条目 —— 原因：
+ *    overview / site 的缓存 key 形如 `...?days=..&pretty=..&v=<config_version>`，
+ *    版本号一变，所有旧 key 立刻不再命中，等于**全机房同时失效**；
+ *    而 `caches.default.delete()` 是**机房本地**的，只能清当前这一台，
+ *    其他机房仍会命中旧值（实测「改完分类顺序前台没变」正是这个原因）。
+ *
+ *    早先还有一个 `purgeOverview()` 在 delete「不带查询串的 /api/overview」——
+ *    而写入用的 key 始终带 `?days=&pretty=&v=`，两者**永远不相等**，
+ *    那行代码从头到尾都是空的。已删掉，避免后人以为"已经清过缓存了"。
+ */
 async function bumpConfigVersion(env) {
   try {
     const d = await db(env);
@@ -167,23 +179,6 @@ async function bumpConfigVersion(env) {
           "ON CONFLICT(key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)"
       )
       .run();
-  } catch {}
-}
-
-/**
- * 写操作后清掉 overview 的边缘缓存。
- * 为什么需要：overview 走 Cache API 缓存了 30 秒。后台改完分类 / 顺序 / 站点后若不清，
- * 前台最长 30 秒仍显示旧数据 —— 与「保存后立即生效」不符。
- * 注意 caches.default 是**机房本地**缓存，这里只清当前机房的副本，其他机房靠 TTL 自然过期。
- */
-async function purgeOverview(request) {
-  try {
-    const u = new URL(request.url);
-    await Promise.all(
-      [`${u.origin}/api/overview`, `${u.origin}/?api=overview`].map((k) =>
-        caches.default.delete(new Request(k, { method: "GET" }))
-      )
-    );
   } catch {}
 }
 
@@ -211,7 +206,7 @@ async function buildAdminPayload(env) {
       .all(),
     buildCategories(d),
     // ⚠️ 只读已有证书结果，绝不在渲染路径上触发检测。
-    //    SSL 检测走 Globalping，单站点约 13 个子请求、耗时数秒 —— 若放在这里，
+    //    SSL 检测走 Globalping，**单站点最坏 14 个子请求**、耗时数秒 —— 若放在这里，
     //    每次打开后台、每次轮询都会触发，既拖慢加载也白白消耗额度。
     //    检测由 cron（每轮 SSL_PER_TICK 个）与用户手动点「刷新证书」负责。
     d.prepare("SELECT * FROM ssl").all(),
@@ -219,16 +214,34 @@ async function buildAdminPayload(env) {
 
   const lastMap = Object.fromEntries((lastsRes.results || []).map((r) => [r.site, r]));
   const sslMap = Object.fromEntries((sslRes.results || []).map((r) => [r.site, r]));
-  const sites = (sitesRes.results || []).map((s) => ({
-    ...s,
-    resolved_kind: resolveKind(s),
-    last_ok: lastMap[s.id]?.ok ?? null,
-    last_status: lastMap[s.id]?.status ?? null,
-    last_ttfb: lastMap[s.id]?.ttfb_ms ?? null,
-    last_source: lastMap[s.id]?.source ?? null,
-    last_probe: lastMap[s.id]?.probe ?? null,
-    last_ts: lastMap[s.id]?.ts ?? null,
-  }));
+  const sites = (sitesRes.results || []).map((s) => {
+    const ssl = sslMap[s.id] || null;
+    const merged = {
+      ...s,
+      resolved_kind: resolveKind(s),
+      last_ok: lastMap[s.id]?.ok ?? null,
+      last_status: lastMap[s.id]?.status ?? null,
+      last_ttfb: lastMap[s.id]?.ttfb_ms ?? null,
+      last_source: lastMap[s.id]?.source ?? null,
+      last_probe: lastMap[s.id]?.probe ?? null,
+      last_ts: lastMap[s.id]?.ts ?? null,
+      // stateOf() 读的是 ssl_* 前缀的**扁平**字段（与 overview 的 SQL 别名同形），
+      // 这里把 ssl 表的列重命名摊平后再交给它，避免后台自算一套三态逻辑。
+      ssl_checked_ts: ssl?.checked_ts ?? null,
+      ssl_authorized: ssl?.authorized ?? null,
+      ssl_protocol: ssl?.protocol ?? null,
+      ssl_issuer: ssl?.issuer ?? null,
+      ssl_subject: ssl?.subject ?? null,
+      ssl_key_type: ssl?.key_type ?? null,
+      ssl_expires_at: ssl?.expires_at ?? null,
+      ssl_days_left: ssl?.days_left ?? null,
+      ssl_error: ssl?.error ?? null,
+    };
+    // 后台列表也要显示「降级」—— 只回 last_ok 的话，"证书快过期 / 响应偏慢"的站点
+    // 在这里会显示成绿色「正常」，而后台恰恰是最该看见降级的地方。
+    const { state, degrade_reason } = stateOf(merged, env);
+    return { ...merged, state, degrade_reason };
+  });
 
   return {
     sites,
@@ -610,14 +623,20 @@ function publicSettings(env, raw) {
 async function sendAlerts(env, alerts) {
   const hook = env && env.ALERT_WEBHOOK;
   if (!hook || !alerts.length) return null;
-  const lines = alerts.map(
-    (a) =>
-      `[${a.kind === "down" ? "故障" : "恢复"}] ${a.site} — 连续 ${a.failCount} 次${
-        a.kind === "down" ? "失败" : "正常"
-      }${a.info.status ? ` · 状态码 ${a.info.status}` : ""}${
-        a.info.reason ? ` · ${a.info.reason}` : ""
-      }`
-  );
+  const lines = alerts.map((a) => {
+    // ⚠️ `failCount` 的两个语义完全不同，不能套同一个模板：
+    //    故障时 = 这次累计到的**失败**次数；
+    //    恢复时 = 恢复**之前**连续失败的次数（bumpState 里 `failCount: before`）。
+    //    旧文案统一写成"连续 N 次正常"，于是恢复通知会谎报成功次数
+    //    （"连续 3 次正常"其实那 3 次全是失败）。
+    const head =
+      a.kind === "down"
+        ? `[故障] ${a.site} — 连续 ${a.failCount} 次失败`
+        : `[恢复] ${a.site} — 连续 ${a.failCount} 次失败后恢复`;
+    return `${head}${a.info.status ? ` · 状态码 ${a.info.status}` : ""}${
+      a.info.reason ? ` · ${a.info.reason}` : ""
+    }`;
+  });
   try {
     const r = await fetch(hook, {
       method: "POST",
@@ -627,14 +646,10 @@ async function sendAlerts(env, alerts) {
         alerts: alerts.map((a) => ({ ...a, info: undefined })),
       }),
     });
-    const stamp = new Date().toISOString();
-    const d = await db(env);
-    for (const a of alerts) {
-      await d
-        .prepare("UPDATE state SET last_alert_ts = ? WHERE site = ?")
-        .bind(stamp, a.site)
-        .run();
-    }
+    // 早先这里还会逐条 `UPDATE state SET last_alert_ts = ?`：
+    //   ① 告警每条一次 D1 往返（N 次网络开销），而告警路径本就在时间敏感处；
+    //   ② 那个字段**从来没有读者**（STATE_UPSERT 每次都会把它 COALESCE 成 null），
+    //      纯属写了个寂寞。删掉既省往返也不损失任何可见行为。
     return { sent: alerts.length, status: r.status };
   } catch (e) {
     return { sent: 0, error: String((e && e.message) || e) };
@@ -1153,8 +1168,7 @@ export default {
 
     // 跨站写请求一律拒 —— 放在 **认证之后**：先回答"你有没有权限"（401 / 403），
     // 再回答"这个请求从哪来"。反过来的话，明明是没登录，却收到"跨站请求被拒绝"，
-    // 排查起来会被带偏。也放在下面的 bumpConfigVersion/purgeOverview **之前**，
-    // 避免无谓的 D1 写。
+    // 排查起来会被带偏。也放在下面的 bumpConfigVersion **之前**，避免无谓的 D1 写。
     if (request.method !== "GET" && request.method !== "HEAD" && !sameOriginOk(request, url)) {
       return json(
         { ok: false, error: "跨站请求被拒绝（同源校验失败）" },
@@ -1164,12 +1178,10 @@ export default {
       );
     }
 
-    // 任何写操作：① 递增配置版本（所有机房的 overview 旧缓存 key 立即失效）
-    //            ② 顺手清掉本机房副本
-    // 只做 ② 不够 —— Cache API 是机房本地缓存，请求落到别的机房仍会命中旧值。
-    // 实测「改完分类顺序前台没变」就是这个原因，所以必须以 ① 为准。
+    // 任何写操作：递增配置版本 —— overview / site 的缓存 key 里带版本号，
+    // 它一变所有机房的旧 key 立刻失效（比只清本机房副本可靠，见 bumpConfigVersion 注释）。
     if (request.method !== "GET" && request.method !== "HEAD") {
-      await Promise.all([bumpConfigVersion(env), purgeOverview(request)]);
+      await bumpConfigVersion(env);
     }
 
     try {
@@ -1300,14 +1312,22 @@ export default {
       // ── 前台一次性取全量：统计卡 + 分组 + 每站点 30 天色条 + SSL ──
       // 刻意做成"单接口返回全部"，避免前端对 N 个站点发 N 个请求
       if (api === "overview") {
+        // ⚠️ days 必须钳制（这是公开接口，不需要登录）。
+        //    改之前它直接 `Number(...)` 就用了，实测放大效应：
+        //      days=30    →  1.7 KB / 1.7s
+        //      days=36500 →  1.13 MB / 4.6s（30 万次迭代的日期轴 + 全量扫描）
+        //    更糟的是缓存 key 里带 days —— 每个不同的值都是**独立的缓存条目**，
+        //    等于给了任何人一个「用任意 days 灌满边缘缓存 + 拉高 D1 扫描量」的入口。
+        //    上限 90 与 /api/site 的 days 一致（前台 30 天色条只用得到 30 天）。
+        const rawDays = Number(url.searchParams.get("days"));
+        const days = Number.isFinite(rawDays)
+          ? Math.max(1, Math.min(Math.trunc(rawDays), 90))
+          : 30;
         // 缓存 key 带上配置版本：后台一改配置版本就 +1，所有机房的旧 key 立即不再命中
         const ver = await configVersion(env);
-        const keyUrl = `${url.origin}/api/overview?days=${Number(
-          url.searchParams.get("days") || 30
-        )}&pretty=${pretty ? 1 : 0}&v=${ver}`;
+        const keyUrl = `${url.origin}/api/overview?days=${days}&pretty=${pretty ? 1 : 0}&v=${ver}`;
         return await withEdgeCache(request, ctx, 30, async () => {
           const d = await db(env);
-          const days = Number(url.searchParams.get("days") || 30);
           const since30 = new Date(Date.now() - days * 86400000).toISOString();
           const since24 = new Date(Date.now() - 86400000).toISOString();
 
@@ -1534,7 +1554,7 @@ export default {
                           s.fail_threshold, s.interval_min, s.expect_codes, s.keyword,
                           s.enabled, s.sort,
                           COALESCE(st.consecutive_fail, 0) AS consecutive_fail,
-                          st.last_checked_ts, st.last_ok_ts,
+                          st.last_checked_ts,
                           l.ok AS last_ok, l.status AS last_status, l.ttfb_ms AS last_ttfb,
                           l.total_ms AS last_total,
                           l.source AS last_source, l.probe AS last_probe,
@@ -1892,8 +1912,22 @@ export default {
           return json({ ok: true, deleted: id });
         }
         if (request.method === "POST") {
-          const body = await request.json();
-          const list = Array.isArray(body) ? body : [body];
+          // `.catch()` 不能少：其它写端点（login / run / test）都有，唯独这里漏了 ——
+          // body 不是合法 JSON 时 request.json() 直接抛，被最外层 catch 兜成 **500**。
+          // 注意不能 `.catch(() => ({}))` —— 那会把"解析失败"伪装成"写了一个空对象"，
+          // 返回 200 + upserted:1 的假成功。这里显式区分"解析失败"与"内容为空"。
+          const parsed = await request.json().catch(() => null);
+          if (!parsed || typeof parsed !== "object") {
+            return json(
+              { ok: false, error: "请求体不是合法的 JSON 对象" },
+              400,
+              "no-store",
+              pretty
+            );
+          }
+          const list = Array.isArray(parsed) ? parsed : [parsed];
+          const warnings = [];
+          let upserted = 0; // 真实写入条数 —— 不是 list.length（空 id/url 的会被跳过）
           const stmt = d.prepare(
             `INSERT INTO sites (id,name,url,group_name,expect_codes,keyword,probe_kind,fail_threshold,interval_min,enabled,sort,created_ts)
                  VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
@@ -1934,6 +1968,17 @@ export default {
                 pretty
               );
             }
+            const kind =
+              s.probe_kind === "globalping" ? "globalping" : s.probe_kind === "cf" ? "cf" : null;
+            // Globalping 后端**不返回响应正文**，`gpCollect` 产出的结果里也没有
+            // `keywordHit` 字段 —— 于是 judge() 的 `r.keywordHit === false` 永远不成立，
+            // 关键字校验对 GP 站点是彻底的静默空转。存下来只会让人误以为它在生效，
+            // 所以这里直接不落库，并回一条 warning 让前端提示用户。
+            const keyword =
+              kind === "globalping" || !s.keyword ? null : String(s.keyword).slice(0, 200);
+            if (kind === "globalping" && s.keyword) {
+              warnings.push(`站点 ${id}：Globalping 后端不返回正文，「正文关键字」已忽略`);
+            }
             await stmt
               .bind(
                 id,
@@ -1941,8 +1986,8 @@ export default {
                 url,
                 String(s.group_name ?? UNGROUPED).trim().slice(0, 64) || UNGROUPED,
                 String(s.expect_codes ?? "").trim(),
-                s.keyword ? String(s.keyword).slice(0, 200) : null,
-                s.probe_kind === "globalping" ? "globalping" : s.probe_kind === "cf" ? "cf" : null,
+                keyword,
+                kind,
                 // 阈值 1–20、间隔 1–1440 分钟（≤1 天）：防负数/超大值污染调度
                 clampInt(s.fail_threshold, 1, 20, 3),
                 clampInt(s.interval_min, 1, 1440, 5),
@@ -1951,8 +1996,13 @@ export default {
                 new Date().toISOString()
               )
               .run();
+            upserted++;
           }
-          return json({ ok: true, upserted: list.length });
+          return json({
+            ok: true,
+            upserted,
+            ...(warnings.length ? { warning: warnings.join("；") } : {}),
+          });
         }
         // GET 不支持：读取一律走 /api/admin（一次返回站点+状态+分类+设置）
         return json({ ok: false, error: "请用 /api/admin" }, 405, "no-store", pretty);

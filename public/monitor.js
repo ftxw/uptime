@@ -388,7 +388,9 @@ function renderBars(bars) {
 
 /* ── 最近检查 / 故障记录 ───────────────────────────────── */
 
-function renderRecent(recent, ssl) {
+// 注意：曾经这里是 renderRecent(recent, ssl)，但 ssl 从未被用到 —— 调用点也只传了一个。
+// 多余的形参容易让读者以为"最近检查"里会显示证书信息，删掉以免误导。
+function renderRecent(recent) {
   const el = qs("#recent");
   const list = recent || [];
   qs("#recentsum").textContent = list.length ? `最近 ${list.length} 条` : "";

@@ -161,7 +161,7 @@
         <div class="field">
           <label for="f-keyword">正文关键字</label>
           <input id="f-keyword" placeholder="（可空）">
-          <span class="hint">必须包含，防 200 假页面</span>
+          <span class="hint" id="f-keyword-hint">必须包含，防 200 假页面</span>
         </div>
         <div class="field">
           <label for="f-threshold">连续失败几次告警</label>
@@ -274,7 +274,6 @@
         <div class="field">
           <label for="s-hint">CF 区域组</label>
           <select id="s-hint">
-            <option value="">（不指定）</option>
             <option value="apac">亚太</option>
             <option value="apac-se">东南亚</option>
             <option value="apac-ne">东北亚</option>
@@ -330,7 +329,7 @@
         <div class="field">
           <label for="s-per-tick">每轮补检 SSL 数</label>
           <input id="s-per-tick" type="number" min="1" max="10" placeholder="2">
-          <span class="hint">别调大：单站点可能吃掉约 13 个子请求</span>
+          <span class="hint">别调大：单站点最坏吃掉 14 个子请求</span>
         </div>
         <div class="field">
           <label for="s-warn">证书降级阈值（天）</label>

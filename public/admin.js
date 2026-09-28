@@ -297,13 +297,67 @@ function fillGroupSelect(current) {
   if (keep && names.includes(keep)) sel.value = keep;
 }
 
+/**
+ * 监测间隔下拉：**动态补项**，绝不静默改写站点的间隔。
+ *
+ * 为什么必须这样做：下拉只有 1/5/10/30/60，而服务端 `clampInt(interval_min,1,1440,5)`
+ * 允许 1–1440 的**任意**整数（接口直连、或早期数据都可能出现 15、45 这类值）。
+ * 旧写法 `qs("#f-interval").value = String(n)` 遇到列表里没有的值时，
+ * `<select>` 找不到匹配项 → `selectedIndex = -1`、下拉**一片空白**；
+ * 用户接着点「保存」，`Number("") || 5` 会把 15 **静默改成 5** ——
+ * 一次「打开编辑 → 保存」就改掉了配置，页面没有任何提示。
+ * 这里照搬 fillGroupSelect 的思路：列表里没有就补一项并选中。
+ */
+function fillIntervalSelect(current) {
+  const sel = qs("#f-interval");
+  if (!sel) return;
+  const want = String(current ?? 5);
+  if (![...sel.options].some((o) => o.value === want)) {
+    const o = document.createElement("option");
+    o.value = want;
+    o.textContent = fmtInterval(want);
+    sel.appendChild(o);
+  }
+  sel.value = want;
+}
+
+/**
+ * 探测后端决定「正文关键字」是否可用。
+ *
+ * Globalping 的 HTTP 测量**不返回响应正文**，`gpCollect` 产出的结果里也没有
+ * `keywordHit` 字段 —— 于是 `judge()` 里 `r.keywordHit === false` 永远不成立，
+ * 关键字校验对 GP 站点是**静默空转**：表单写着「必须包含，防 200 假页面」，
+ * 实际一个字节都不看，用户以为配了保护、其实没有。这项能力没法补
+ * （补就得自己 fetch 正文，也就失去了"从国内探针看"的意义），
+ * 所以直接禁用输入并写明原因；保存时服务端也会把该值清掉。
+ */
+function syncKindUi() {
+  const gp = qs("#f-kind").value === "globalping";
+  qs("#f-keyword").disabled = gp;
+  qs("#f-keyword-hint").textContent = gp
+    ? "Globalping 后端不返回正文，此项无法生效（保存时会清空）"
+    : "必须包含，防 200 假页面";
+}
+
+/**
+ * 证书降级阈值（天）—— **跟随后台设置**，不写死。
+ *
+ * 原实现是硬编码 `d <= 14`，而 `ssl_warn_days` 是可配置项（默认 14）。
+ * 一旦把阈值调到 30 天，前台页脚会跟着变，后台却仍按 14 天判色 ——
+ * 剩 20 天的证书在后台显示为**绿色**，正好在最该报警的地方报喜不报忧。
+ */
+function warnDays() {
+  const n = Number(SETTINGS && SETTINGS.ssl_warn_days);
+  return Number.isFinite(n) && n > 0 ? n : 14;
+}
+
 function sslCell(ssl) {
   if (!ssl || !ssl.checked_ts) return `<span class="muted">未检测</span>`;
   if (ssl.error) return `<span class="ssl ssl-warn">未知</span>`;
   const d = ssl.days_left;
   let cls = "ssl-ok";
   if (ssl.authorized === 0) cls = "ssl-bad";
-  else if (d !== null && d <= 14) cls = "ssl-warn";
+  else if (d !== null && d <= warnDays()) cls = "ssl-warn";
   const text = d === null ? "有效" : d < 0 ? "已过期" : `${d} 天`;
   return `<span class="ssl ${cls}" title="${escapeHtml(ssl.issuer || "")} · ${escapeHtml(
     ssl.protocol || ""
@@ -333,8 +387,27 @@ async function renderRows() {
 
   qs("#rows").innerHTML = list
     .map((s) => {
-      const st = s.last_ok === 1 ? "正常" : s.last_ok === 0 ? "故障" : "未检查";
-      const cls = s.last_ok === 1 ? "b-up" : s.last_ok === 0 ? "b-down" : "b-unknown";
+      // 三态（与前台同一口径）：后端在 buildAdminPayload 里用 stateOf() 算好，
+      // 这里不能只看 last_ok —— 那会把「证书快过期 / 响应偏慢」的站点显示成绿色「正常」，
+      // 而后台恰恰是最该看到降级的地方。
+      const st =
+        s.state === "up"
+          ? "正常"
+          : s.state === "down"
+          ? "故障"
+          : s.state === "degraded"
+          ? "降级"
+          : "未检查";
+      const cls =
+        s.state === "up"
+          ? "b-up"
+          : s.state === "down"
+          ? "b-down"
+          : s.state === "degraded"
+          ? "b-degraded"
+          : "b-unknown";
+      // 降级原因放在 badge 的 title 里，鼠标悬浮可见（不额外占列宽）
+      const stTitle = s.degrade_reason ? ` title="${escapeHtml(s.degrade_reason)}"` : "";
       const g = groupOf(s);
 
       return `<tr data-id="${escapeHtml(s.id)}" data-group="${escapeHtml(g)}">
@@ -348,7 +421,7 @@ async function renderRows() {
           s.interval_min
         )}</div></td>
         <td>${sslCell(sslMap[s.id])}</td>
-        <td><span class="badge ${cls}">${st}</span><div class="muted" style="font-size:11px">${relTime(
+        <td><span class="badge ${cls}"${stTitle}>${st}</span><div class="muted" style="font-size:11px">${relTime(
         s.last_ts
       )}</div></td>
         <td style="text-align:right;white-space:nowrap">
@@ -656,12 +729,16 @@ function openForm(site) {
   qs("#f-codes").value = site?.expect_codes || "";
   qs("#f-keyword").value = site?.keyword || "";
   qs("#f-threshold").value = site?.fail_threshold ?? 3;
-  qs("#f-interval").value = String(site?.interval_min ?? 5);
+  fillIntervalSelect(site?.interval_min ?? 5);
   qs("#f-sort").value = site?.sort ?? 0;
   qs("#f-enabled").value = String(site?.enabled ?? 1);
+  syncKindUi();
   qs("#dlg-err").hidden = true;
   dlg.showModal();
 }
+
+// 切换后端时同步「正文关键字」的可用性（GP 后端用不上这个字段）
+qs("#f-kind").addEventListener("change", syncKindUi);
 
 qs("#form").addEventListener("submit", async (e) => {
   // 只处理「保存」（`submitter` 为空时也按保存走，做一层防御）。
@@ -695,7 +772,10 @@ qs("#form").addEventListener("submit", async (e) => {
     const d = await post("/sites", body);
     if (!d.ok) throw new Error(d.error || "保存失败");
     dlg.close();
-    banner("已保存", "info");
+    // 服务端在 GP 后端下会清掉 keyword 并回一条 warning —— 必须让用户看到，
+    // 否则就变成"填了没生效"的静默失败（这正是本次要修掉的那类问题）。
+    if (d.warning) banner(d.warning, "error");
+    else banner("已保存", "info");
     await loadAll();
   } catch (err) {
     const el = qs("#dlg-err");
@@ -788,6 +868,38 @@ qs("#checkall").addEventListener("click", async () => {
 
 const setdlg = qs("#setdlg");
 
+/**
+ * CF 区域组下拉的预设值（必须与 admin.html 里 #s-hint 的 <option value> 一致）。
+ * ⚠️ [0] 被当作「内置默认值」（见 writeHint）—— 必须等于 `src/settings.js` 的
+ *    `SETTING_META.cf_hint.def`（`apac`），否则"库里没这一行"时回显的选中项会与
+ *    服务端实际生效的区域组不一致。
+ */
+const HINT_PRESETS = [
+  "apac",
+  "apac-se",
+  "apac-ne",
+  "oc",
+  "wnam",
+  "enam",
+  "weur",
+  "eeur",
+  "me",
+  "afr",
+  "sam",
+];
+
+/**
+ * 写 CF 区域组。
+ *
+ * 下拉里**没有「不指定」这一项**（按要求移除）—— 因为"不指定"在探测层压根没有语义：
+ * `cfHintOf()` 对空值/非法值一律回落到内置默认，`dispatch` 时总会带上一个 locationHint。
+ * 于是"不指定"只是"回落到 apac"的另一种说法，却会让人以为自己能控制"让 CF 自己选"。
+ * 现在空值一律映射成预设里的默认项，界面永远有确定选中项。
+ */
+function writeHint(v) {
+  qs("#s-hint").value = HINT_PRESETS.includes(v) ? v : HINT_PRESETS[0];
+}
+
 /** 位置筛选下拉里的「自定义…」哨兵值 */
 const MAGIC_CUSTOM = "__custom__";
 /**
@@ -863,7 +975,7 @@ function fillSettingsForm(s) {
   qs("#s-title").value = s.site_title || "";
   qs("#s-theme").value = s.default_theme || "auto";
   qs("#s-utc").value = s.utc_offset_min ?? "";
-  qs("#s-hint").value = s.cf_hint || "";
+  writeHint(s.cf_hint || "");
   qs("#s-timeout").value = s.timeout_ms || "";
   writeMagic(s.gp_magic || "");
   qs("#s-limit").value = s.gp_limit || "";
@@ -992,6 +1104,11 @@ async function bootstrap() {
 qs("#setup-reload").addEventListener("click", () => location.reload());
 
 bootstrap();
+// 每 2 分钟**重新拉数据**，而不是只重渲染 DOM。
+// 旧实现只调 renderRows()：相对时间（"3 分钟前"）会不停变新，但底层数据一直是你
+// 上次操作时的那份 —— 于是页面上会出现"刚刚检查过"却其实是半小时前的错觉。
+// loadAll 失败时静默（401 会由 api() 弹登录框，其余交给下次轮询）。
 setInterval(() => {
-  if (!document.hidden && AUTHED) renderRows();
+  if (document.hidden || !AUTHED) return;
+  loadAll().catch(() => {});
 }, 120000);
