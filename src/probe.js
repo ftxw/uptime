@@ -268,6 +268,23 @@ export async function gpCreate(env, site) {
  * done:false → pending 行永不删除 → 而 dispatch 里 `if (pendingSet.has(s.id)) continue`
  * 会让该站点**永久不再被发起探测**，静默停摆且没有任何告警。
  */
+/**
+ * Globalping 单探针的测量状态 → 人能看懂的原因。
+ *
+ * 为什么不能直接透传 `result.status`：它只会给 `"failed"` / `"offline"` 这类单词，
+ * 落进 `checks.error` 就是一条 **`failed`** —— 排查时完全分不清是
+ * 「探针超时」还是「站点真的挂了」，而这两件事的处理方式正相反。
+ * （实测样例：家庭宽带筛选下约 1/3 的检查是 `failed` + `total_ms≈15001`，
+ *   目标站点本身完全正常，是探针没在时限内跑完。）
+ */
+function gpResultReason(rr) {
+  const s = String((rr && rr.status) || "");
+  if (s === "finished") return null;
+  if (s === "offline") return "探针离线";
+  if (s === "failed") return "探针未能在时限内完成测量（目标不可达或响应过慢）";
+  return s || "未知状态";
+}
+
 export async function gpCollect(env, pending) {
   const token = env && env.GLOBALPING_TOKEN;
   const res = await fetch(
@@ -297,7 +314,7 @@ export async function gpCollect(env, pending) {
       ttfb: t.firstByte ?? 0,
       total: t.total ?? 0,
       bytes: 0,
-      error: rr.status !== "finished" ? String(rr.status) : null,
+      error: gpResultReason(rr),
       probe: `${p.city || "?"}/${p.asn || "?"}`,
     };
   });
