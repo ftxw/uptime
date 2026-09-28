@@ -454,6 +454,21 @@ async function handleCatAction(btn) {
   }
 }
 
+/**
+ * 「取消 / 关闭」按钮统一在这里关掉所属弹窗。
+ *
+ * ⚠️ 它们刻意**不是** submit 按钮，原因不只是风格：表单是 `method="dialog"`，
+ *    而「隐式提交」（在任意输入框里按回车）用的 submitter 是表单的**默认按钮**——
+ *    即树序里第一个 submit 按钮。原先关闭按钮在弹窗右上角、排在保存按钮之前，
+ *    于是按回车会以 `submitter.value === "cancel"` 触发 submit：保存处理器把它当成
+ *    "取消"直接 return（且**没有** preventDefault），method="dialog" 随即关掉弹窗。
+ *    结果就是「在输入框里改完按回车 = 关闭弹窗且丢掉全部改动，还没有任何报错」。
+ *    改成 type="button" 后，保存按钮成为唯一的（也就是默认的）submit 按钮，回车即保存。
+ */
+for (const b of document.querySelectorAll("[data-close]")) {
+  b.addEventListener("click", () => b.closest("dialog")?.close());
+}
+
 /* ── 分类表单弹窗（新建 / 重命名共用同一个 dialog）───────── */
 
 const catdlg = qs("#catdlg");
@@ -478,7 +493,16 @@ function openCatForm(name) {
 qs("#cat-add-toggle").addEventListener("click", () => openCatForm(null));
 
 qs("#catform").addEventListener("submit", async (e) => {
-  if (e.submitter?.value !== "save") return;
+  // 只处理「保存」（`submitter` 为空时也按保存走，做一层防御）。
+  //
+  // ⚠️ 原写法 `if (e.submitter?.value !== "save") return;` 是个静默 bug：
+  //    隐式提交（在输入框里按回车）的 submitter 是表单的**默认按钮**，
+  //    而当时关闭按钮是树序里第一个 submit 按钮 → submitter.value === "cancel"，
+  //    于是这里直接 return 且**不执行 preventDefault()**，method="dialog" 随即关掉弹窗 ——
+  //    用户看到弹窗关闭、没有任何报错或提示，以为保存成功，实际一个字都没提交。
+  //    现已把关闭/取消按钮改成 type="button"（见 [data-close] 的处理），
+  //    保存按钮成为唯一的默认按钮，回车即保存。
+  if (e.submitter && e.submitter.value !== "save") return;
   e.preventDefault();
 
   const errEl = qs("#catdlg-err");
@@ -640,7 +664,16 @@ function openForm(site) {
 }
 
 qs("#form").addEventListener("submit", async (e) => {
-  if (e.submitter?.value !== "save") return;
+  // 只处理「保存」（`submitter` 为空时也按保存走，做一层防御）。
+  //
+  // ⚠️ 原写法 `if (e.submitter?.value !== "save") return;` 是个静默 bug：
+  //    隐式提交（在输入框里按回车）的 submitter 是表单的**默认按钮**，
+  //    而当时关闭按钮是树序里第一个 submit 按钮 → submitter.value === "cancel"，
+  //    于是这里直接 return 且**不执行 preventDefault()**，method="dialog" 随即关掉弹窗 ——
+  //    用户看到弹窗关闭、没有任何报错或提示，以为保存成功，实际一个字都没提交。
+  //    现已把关闭/取消按钮改成 type="button"（见 [data-close] 的处理），
+  //    保存按钮成为唯一的默认按钮，回车即保存。
+  if (e.submitter && e.submitter.value !== "save") return;
   e.preventDefault();
 
   const body = {
@@ -845,7 +878,16 @@ qs("#s-magic").addEventListener("change", () => {
 });
 
 qs("#setform").addEventListener("submit", async (e) => {
-  if (e.submitter?.value !== "save") return;
+  // 只处理「保存」（`submitter` 为空时也按保存走，做一层防御）。
+  //
+  // ⚠️ 原写法 `if (e.submitter?.value !== "save") return;` 是个静默 bug：
+  //    隐式提交（在输入框里按回车）的 submitter 是表单的**默认按钮**，
+  //    而当时关闭按钮是树序里第一个 submit 按钮 → submitter.value === "cancel"，
+  //    于是这里直接 return 且**不执行 preventDefault()**，method="dialog" 随即关掉弹窗 ——
+  //    用户看到弹窗关闭、没有任何报错或提示，以为保存成功，实际一个字都没提交。
+  //    现已把关闭/取消按钮改成 type="button"（见 [data-close] 的处理），
+  //    保存按钮成为唯一的默认按钮，回车即保存。
+  if (e.submitter && e.submitter.value !== "save") return;
   e.preventDefault();
 
   const errEl = qs("#set-err");
