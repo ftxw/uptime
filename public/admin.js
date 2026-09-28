@@ -802,6 +802,8 @@ function fillSettingsForm(s) {
   qs("#s-ipver").value = s.gp_ip_version || "4";
   qs("#s-budget").value = s.subreq_budget || "";
   qs("#s-keep").value = s.check_keep_days || "";
+  qs("#s-recent").value = s.recent_limit || "";
+  qs("#s-incident").value = s.incident_limit || "";
   qs("#s-webhook").value = s.alert_webhook || "";
   qs("#s-gp-token").value = "";
   qs("#s-gp-token-hint").textContent = s.has_globalping_token
@@ -847,6 +849,8 @@ qs("#setform").addEventListener("submit", async (e) => {
     gp_ip_version: qs("#s-ipver").value,
     subreq_budget: qs("#s-budget").value.trim(),
     check_keep_days: qs("#s-keep").value.trim(),
+    recent_limit: qs("#s-recent").value.trim(),
+    incident_limit: qs("#s-incident").value.trim(),
     alert_webhook: qs("#s-webhook").value.trim(),
     // 留空 = 不修改已有 token（后端识别 __KEEP__）
     globalping_token: qs("#s-gp-token").value.trim() || "__KEEP__",

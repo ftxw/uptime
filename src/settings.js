@@ -27,6 +27,8 @@ export const SETTING_META = {
   ssl_warn_days:    { env: "SSL_WARN_DAYS",    def: "14" },                    // 剩余 ≤ N 天判为降级
   subreq_budget:    { env: "SUBREQ_BUDGET",    def: "30" },                    // 子请求预算，免费层上限 50
   check_keep_days:  { env: "CHECK_KEEP_DAYS",  def: "30" },                    // 探测明细保留天数
+  recent_limit:     { env: "RECENT_LIMIT",     def: "20" },                    // 详情页「最近检查」最多显示几条
+  incident_limit:   { env: "INCIDENT_LIMIT",   def: "10" },                    // 详情页「故障记录」最多显示几条
   utc_offset_min:   { env: "UTC_OFFSET_MIN",   def: "480" },                   // 展示时区，480 = UTC+8
   alert_webhook:    { env: "ALERT_WEBHOOK",    def: "" },
   globalping_token: { env: "GLOBALPING_TOKEN", def: "" },                      // 后台只写、不放回滚

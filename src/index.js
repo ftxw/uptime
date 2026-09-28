@@ -411,6 +411,12 @@ function normalizeSetting(k, v) {
       return num(1, 45);
     case "check_keep_days":
       return num(1, 365);
+    case "recent_limit":
+      // 上限 200 与 /api/site 的 recent 参数钳制保持一致 —— 再大对页面没有意义，
+      // 只会让详情页的返回体变大
+      return num(5, 200);
+    case "incident_limit":
+      return num(1, 100);
     case "utc_offset_min":
       return num(-720, 840);
     case "gp_limit":
@@ -1354,15 +1360,32 @@ export default {
         if (!id) return json({ ok: false, error: "缺少 id 参数" }, 400, "no-store", pretty);
 
         const hoursFor = Math.max(1, Math.min(Number(url.searchParams.get("hours") || 24), 720));
+        // 「最近检查」条数：后台设置 recent_limit（默认 20），?recent= 可临时覆盖
+        const recentN = clampInt(
+          url.searchParams.get("recent") || env.RECENT_LIMIT || defOf("recent_limit"),
+          5,
+          200,
+          Number(defOf("recent_limit"))
+        );
+        // 「故障记录」显示条数：纯展示上限，后台可改（默认 10）
+        const incidentN = clampInt(
+          env.INCIDENT_LIMIT || defOf("incident_limit"),
+          1,
+          100,
+          Number(defOf("incident_limit"))
+        );
         const verS = await configVersion(env);
-        const keyUrl = `${url.origin}/api/site?id=${encodeURIComponent(id)}&hours=${hoursFor}&pretty=${
+        // ⚠️ recent / incident 必须进缓存 key：它们决定返回体的行数，
+        //    不进 key 的话先请求 ?recent=5 会把默认条数的响应污染成 5 条（或反之）。
+        const keyUrl = `${url.origin}/api/site?id=${encodeURIComponent(
+          id
+        )}&hours=${hoursFor}&recent=${recentN}&incident=${incidentN}&pretty=${
           pretty ? 1 : 0
         }&v=${verS}`;
 
         return await withEdgeCache(request, ctx, 30, async () => {
           const d = await db(env);
           const hours = Math.max(1, Math.min(Number(url.searchParams.get("hours") || 24), 720));
-          const recentN = Math.max(5, Math.min(Number(url.searchParams.get("recent") || 50), 200));
           const days = Math.max(1, Math.min(Number(url.searchParams.get("days") || 30), 90));
           const since = new Date(Date.now() - hours * 3600 * 1000).toISOString();
           const sinceD = new Date(Date.now() - days * 86400000).toISOString();
@@ -1513,13 +1536,19 @@ export default {
                 ongoing: !e.end,
                 duration_s,
                 error: e.error,
-                // 用时长估算段内检查次数，与告警口径（连续 N 次失败）对齐
-                checks_est: Math.max(1, Math.round(duration_s / (intervalMin * 60)) + 1),
+                // 用时长估算段内的失败次数，与告警口径（连续 N 次失败）对齐。
+                // start = 首个失败点、end = 其后第一个成功点，所以
+                //   duration ≈ 失败次数 × 间隔
+                // ⚠️ 不要再 +1：那会把「1 次失败」估成 2 次，使阈值判定整体少一次，
+                //    连单次抖动都会被当成故障事件（与告警不一致）。
+                checks_est: Math.max(1, Math.round(duration_s / (intervalMin * 60))),
               };
             })
             // 未达 fail_threshold 的单次抖动不算故障事件（与告警判定一致）
             .filter((e) => e.ongoing || e.checks_est >= failThreshold)
-            .reverse();
+            // 上面的遍历是按时间正序，这里翻成最新在前，再按设置只留最近 N 条
+            .reverse()
+            .slice(0, incidentN);
 
           // 30 天色条（最左最新 → 最右最早，与首页一致）
           const dayMap = {};
