@@ -25,7 +25,7 @@ let AUTHED = false;
 let PWD_SOURCE = "none"; // none | env —— 密码只来自环境变量 ADMIN_PASSWORD
 let SETTINGS = null;     // /admin 一次性带回的设置，用于设置面板预填
 let SSL_MAP = {};        // /admin 一次性带回的证书结果（site → 记录）
-let PWD_WARN_MUTED = false; // 用户手动关掉「未设密码」提醒后，本次会话不再自动弹出
+let PWD_WARNED = false;  // 「未设密码」提示本次会话只弹一次（loadAll 会被反复调用）
 
 const UNGROUPED = "未分组";
 const ALL = "__all__";
@@ -53,13 +53,20 @@ function relTime(iso) {
 }
 
 /**
- * 顶部滑出提示（临时 toast）。
+ * 顶部滑出提示（toast）。形态对齐 HaoNav 的「链接已复制」：
+ * 顶部居中、宽度随文案自适应的小胶囊，一句话短文案，几秒后自动消失。
  *
- * 为什么改成 fixed 的 toast：这些提示原先插在页头下方、属文档流 ——
- * 一出现就把下面的卡片整体顶下去，消失又弹回来，屏幕一直在跳。
- * 现在统一挂到 body 末尾的 #toast-host 上（fixed，从顶部滑出），
- * 完全不参与布局，出现/消失都不影响页面内容；多条提示会依次堆叠。
+ * ⚠️ 文案务必短 —— 挤在一条胶囊里，超过一屏宽度就会折行、失去"一眼扫过"的效果。
+ *
+ * 为什么是 fixed：这些提示原先插在页头下方、属文档流 —— 一出现就把下面的
+ * 卡片整体顶下去，消失又弹回来，屏幕一直在跳。现在挂到 body 末尾的
+ * #toast-host 上（fixed，从顶部滑出），完全不参与布局；多条会依次堆叠。
+ *
+ * 生命周期：入 DOM → 下一帧加 .show 触发滑出 → 到时移除 .show → 过渡结束摘节点。
+ * 时长按严重程度分档（warn/error 给足阅读时间，但仍会自动消失，没有常驻条目）。
  */
+const TOAST_MS = { info: 3000, warn: 5000, error: 6000 };
+
 function banner(msg, kind) {
   const host = qs("#toast-host");
   if (!host || !msg) return;
@@ -75,7 +82,17 @@ function banner(msg, kind) {
   setTimeout(() => {
     el.classList.remove("show");
     setTimeout(() => el.remove(), 320); // 等过渡播完再摘掉节点
-  }, kind === "error" ? 6000 : 3000);
+  }, TOAST_MS[kind] || TOAST_MS.info);
+}
+
+/**
+ * 「未设置管理员密码」提醒。
+ * 每次会话只弹一次 —— loadAll() 在每次增删改后都会跑，不设闸门就会反复弹。
+ */
+function warnNoPassword() {
+  if (PWD_SOURCE !== "none" || PWD_WARNED) return;
+  PWD_WARNED = true;
+  banner("未设置管理员密码，任何人可改配置（需 Secret 变量 ADMIN_PASSWORD）", "warn");
 }
 
 /* ── 请求封装：401 一律弹出登录 ─────────────────────────── */
@@ -357,10 +374,9 @@ async function loadAll() {
   renderCats();
   await renderRows();
 
-  // 「X 站点 · Y 分类」的常驻绿色横幅已按需求移除。
-  // 未设置密码的提醒改为顶部滑出的常驻 toast（不占布局，不再顶动卡片）；
-  // 用户手动关掉后，本次会话不再自动弹。
-  qs("#pwd-warn").classList.toggle("show", PWD_SOURCE === "none" && !PWD_WARN_MUTED);
+  // 「X 站点 · Y 分类」的常驻绿色横幅已按需求移除；
+  // 「未设密码」也改成一闪而过的顶部提示（每次会话只弹一次，见 warnNoPassword）。
+  warnNoPassword();
 }
 
 /* ── 分类：切换 / 新建 / 改名 / 删除 / 排序 ─────────────── */
@@ -406,7 +422,7 @@ async function handleCatAction(btn) {
       const d = await post("/categories", { action: "delete", name });
       if (!d.ok) throw new Error(d.error || "删除失败");
       if (FILTER === name) FILTER = "";
-      banner(`分类「${name}」已删除，${n} 个站点已移到「${UNGROUPED}」`, "info");
+      banner(`已删除分类「${name}」，${n} 个站点移到「${UNGROUPED}」`, "info");
       await loadAll();
     } catch (err) {
       if (!err.needLogin) banner("删除失败：" + err.message, "error");
@@ -466,10 +482,10 @@ qs("#catform").addEventListener("submit", async (e) => {
 
     if (CAT_EDITING) {
       if (FILTER === CAT_EDITING) FILTER = name;
-      banner(`分类「${CAT_EDITING}」已重命名为「${name}」`, "info");
+      banner(`已重命名「${CAT_EDITING}」→「${name}」`, "info");
     } else {
       FILTER = name; // 新建后直接切过去，方便紧接着往里加站点
-      banner(`分类「${name}」已创建`, "info");
+      banner(`已创建分类「${name}」`, "info");
     }
     CAT_EDITING = null;
     catdlg.close();
@@ -509,7 +525,7 @@ async function saveCatOrder(names) {
   try {
     const d = await post("/categories", { action: "reorder", names: only });
     if (!d.ok) throw new Error(d.error || "排序失败");
-    banner("分类顺序已保存，前台立即生效", "info");
+    banner("分类顺序已保存", "info");
     await loadAll();
   } catch (err) {
     if (!err.needLogin) banner("分类排序失败：" + err.message, "error");
@@ -622,7 +638,7 @@ qs("#form").addEventListener("submit", async (e) => {
     const d = await post("/sites", body);
     if (!d.ok) throw new Error(d.error || "保存失败");
     dlg.close();
-    banner("已保存，立即生效", "info");
+    banner("已保存", "info");
     await loadAll();
   } catch (err) {
     const el = qs("#dlg-err");
@@ -670,16 +686,17 @@ document.addEventListener("click", async (e) => {
       const d = await post("/test", { kind, site: site.id });
       const res = (d.results || [])[0] || {};
       const where = d.egress?.colo ? `机房 ${d.egress.colo}` : res.probe || "";
-      const mark = d.persisted ? `（已记入检查记录${d.persisted.ok ? "" : "：" + (d.persisted.reason || "失败")}）` : "";
+      // 文案压成一条紧凑的短句：toast 是单个胶囊，字段用 · 分隔比用中文更省宽度
+      const mark = d.persisted ? (d.persisted.ok ? " · 已记录" : ` · 未记录：${d.persisted.reason || "失败"}`) : "";
       // 顺序：先重渲染表格（让「状态 / 最近检查」立刻反映这次结果），再弹提示 ——
       // 这样用户看到的是"表已更新"而不是先闪一条提示再等表格刷新。
       // 这里只调 renderRows 而不是 loadAll：后者会重拉一次全量数据，
       // 让这条刚弹出的结果提示白等一个 RTT。
       if (d.persisted) await renderRows();
       banner(
-        `${site.name}：HTTP ${res.status ?? "—"} · ${res.ttfb ?? "—"} ms · ${where} · 往返 ${
+        `${site.name} · HTTP ${res.status ?? "—"} · ${res.ttfb ?? "—"}ms · ${where} · ${
           d.roundTripMs ?? "—"
-        } ms${mark}`,
+        }ms${mark}`,
         res.ok ? "info" : "error"
       );
     } catch (err) {
@@ -700,7 +717,7 @@ qs("#checkall").addEventListener("click", async () => {
     // 同理必须是 POST —— 手动跑一轮会真实发起探测并写库
     const d = await post("/run", {});
     const n = (d.persisted?.persisted || 0) + (d.collect?.collected || 0);
-    banner(`已执行一轮检查（本批落库 ${n} 条记录）`, "info");
+    banner(`已执行一轮检查 · 落库 ${n} 条`, "info");
     await renderRows();
   } catch (e) {
     if (!e.needLogin) banner("执行失败：" + e.message, "error");
@@ -791,16 +808,10 @@ function fillSettingsForm(s) {
     ? `已配置：${s.globalping_token_masked}（留空则保留）`
     : "未配置（额度 250 次/小时；配置后 500 次/小时）";
 
-  // 密码只来自环境变量：这里只用于决定是否显示「尚未设置」警告
+  // 密码只来自环境变量：这里只用于决定是否弹「未设置」提醒
   PWD_SOURCE = s.password_source || "none";
-  qs("#pwd-warn").classList.toggle("show", PWD_SOURCE === "none" && !PWD_WARN_MUTED);
+  warnNoPassword();
 }
-
-// 常驻提示（「未设密码」）可以手动关掉；关掉后本次会话不再自动弹
-qs("#pwd-warn-close").addEventListener("click", () => {
-  PWD_WARN_MUTED = true;
-  qs("#pwd-warn").classList.remove("show");
-});
 
 qs("#settings-open").addEventListener("click", openSettings);
 
@@ -845,7 +856,7 @@ qs("#setform").addEventListener("submit", async (e) => {
     const d = await post("/settings", body);
     if (!d.ok) throw new Error(d.error || "保存失败");
     setdlg.close();
-    banner("设置已保存，立即生效", "info");
+    banner("设置已保存", "info");
     await loadAll();
   } catch (err) {
     errEl.textContent = err.needLogin ? "会话已过期，请重新登录" : "保存失败：" + err.message;
