@@ -5,7 +5,7 @@
 // ⚠️ 版本号由 scripts/bump-sw.mjs 在部署前按 public/ 内容哈希自动重写，**不要手改**。
 //    原先是人工 +1，漏一次就会出现「部署了新代码但界面没变」（缓存优先）。
 //    现在只要 public/ 下任一文件内容变了，哈希就变 → 缓存名变 → activate 清掉旧缓存。
-const VERSION = "v-7e82fc6a0aed";
+const VERSION = "v-e2399a9dccad";
 const SHELL = `/shell-${VERSION}`;
 const PRECACHE = [
   "/",
