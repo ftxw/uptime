@@ -790,6 +790,20 @@ dialog::backdrop { background: hsl(220 30% 10% / 0.45); }
 .login-card p { margin: 0; font-size: 13px; }
 .login-card .btn { width: 100%; }
 
+/* 未配密码的说明卡：比登录卡宽一点 —— 里面是操作步骤，窄了会折得很碎 */
+.setup-card { width: min(460px, 100%); }
+.setup-steps {
+  margin: 0; padding-left: 1.15em;
+  display: flex; flex-direction: column; gap: 7px;
+  font-size: 12.5px; line-height: 1.55;
+}
+.setup-card code {
+  font-family: var(--font-mono); font-size: 12px;
+  padding: 1px 5px; border-radius: 5px;
+  background: hsl(var(--secondary));
+  color: hsl(var(--foreground));
+}
+
 @media (prefers-reduced-motion: reduce) {
   * { animation-duration: .001ms !important; transition-duration: .001ms !important; }
 }

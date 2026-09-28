@@ -403,6 +403,27 @@
   </form>
 </div>
 
+<!-- ══════════ 未设置管理员密码 → 后台停用 ══════════
+     服务端在 ADMIN_PASSWORD 未配置时**整体停用后台**（fail-closed）：
+     所有后台接口一律 403，所以这个页面拿不到任何数据，它是唯一的界面。
+     这里刻意**不给密码输入框** —— 密码根本没配置，输什么都进不去。 -->
+<div class="login-mask" id="setup-mask" hidden>
+  <div class="card glass login-card setup-card">
+    <h2>后台已停用</h2>
+    <p class="muted">
+      未设置管理员密码，后台不提供任何服务 —— 否则任何人打开这个网址就能改配置、
+      读到告警 Webhook 与 Globalping Token。
+    </p>
+    <ol class="setup-steps muted">
+      <li>打开 Cloudflare 控制台 → Workers &amp; Pages → 本 Worker → Settings → Variables and Secrets</li>
+      <li>新增一条变量：名称 <code>ADMIN_PASSWORD</code>，类型选 <b>Secret</b>，值填你的管理员密码</li>
+      <li>保存后回来刷新本页即可登录（变量秒级生效，不用等重新部署）</li>
+    </ol>
+    <button class="btn btn-primary" type="button" id="setup-reload">我已设置，重新检查</button>
+    <a class="btn" href="/">返回前台</a>
+  </div>
+</div>
+
 <!-- ══════════ 顶部滑出提示 ══════════
      fixed 定位、不参与文档流 —— 出现与消失都不会推挤下面的卡片。
      层级高于 topbar(20)、低于登录遮罩(100)，所以不会盖住登录框。

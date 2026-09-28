@@ -604,7 +604,6 @@ function publicSettings(env, raw) {
   s.globalping_token = "";
   s.globalping_token_masked = maskToken(env.GLOBALPING_TOKEN);
   s.has_globalping_token = Boolean(env.GLOBALPING_TOKEN);
-  s.password_source = env.ADMIN_PASSWORD ? "env" : "none";
   return s;
 }
 
@@ -1061,11 +1060,7 @@ export default {
     const pwdConfigured = Boolean(env.ADMIN_PASSWORD);
 
     let authed = false;
-    if (!pwdConfigured) {
-      // 还没设置过密码 → 不启用认证（否则首次部署根本进不去后台）。
-      // 前端会显示醒目警告提醒尽快设置；一旦设置密码即开始强制登录。
-      authed = true;
-    } else {
+    if (pwdConfigured) {
       const token = getSessionToken(request.headers.get("cookie"));
       if (token) {
         authed = Boolean(await verifySession(token, await sessionSecret(env, rawSettings)));
@@ -1076,17 +1071,42 @@ export default {
 
     // 公开接口：前台只读展示 + 登录/登出。其余（含所有写接口）都要求已登录。
     const PUBLIC_APIS = new Set(["overview", "site", "login", "logout"]);
-    if (pwdConfigured && !PUBLIC_APIS.has(api) && !authed) {
-      return json(
-        { ok: false, error: "未登录或会话已过期", need_login: true },
-        401,
-        "no-store",
-        pretty
-      );
+
+    /* ── 认证闸门：**fail-closed** ────────────────────────────────────
+       没配 ADMIN_PASSWORD 时后台**一律不提供服务**，而不是"不启用认证"。
+       早先的写法是"未配置就 authed = true"—— 后果是任何猜到 /admin 的人都能
+       改配置、读到告警 Webhook 与 Globalping Token，一个 URL 就是全部权限，
+       而页面上只是顶部闪一条 5 秒的提示，很容易被忽略。
+
+       现在的行为：/admin 这个 HTML 照常能打开（静态资源由 Assets 直接返回，
+       不经 Worker，拦不住也没必要拦 —— 页面里只有空壳，没有任何数据），
+       但它拿不到任何数据，前端会停在"未设置密码"的说明页。
+
+       用 403 + need_setup 而不是 401：此时弹登录框毫无意义（密码未配置，
+       输什么都进不去），前端据此直接切到说明页，而不是让用户白试一遍密码。 */
+    if (!PUBLIC_APIS.has(api)) {
+      if (!pwdConfigured) {
+        return json(
+          { ok: false, error: "未设置管理员密码，后台已停用", need_setup: true },
+          403,
+          "no-store",
+          pretty
+        );
+      }
+      if (!authed) {
+        return json(
+          { ok: false, error: "未登录或会话已过期", need_login: true },
+          401,
+          "no-store",
+          pretty
+        );
+      }
     }
 
-    // 跨站写请求一律拒 —— 放在 **认证之后**（未登录仍给 401，不泄漏是否配置了后台）
-    // 且放在下面的 bumpConfigVersion/purgeOverview **之前**（避免无谓的 D1 写）
+    // 跨站写请求一律拒 —— 放在 **认证之后**：先回答"你有没有权限"（401 / 403），
+    // 再回答"这个请求从哪来"。反过来的话，明明是没登录，却收到"跨站请求被拒绝"，
+    // 排查起来会被带偏。也放在下面的 bumpConfigVersion/purgeOverview **之前**，
+    // 避免无谓的 D1 写。
     if (request.method !== "GET" && request.method !== "HEAD" && !sameOriginOk(request, url)) {
       return json(
         { ok: false, error: "跨站请求被拒绝（同源校验失败）" },
@@ -1111,6 +1131,17 @@ export default {
         if (request.method !== "POST") {
           return json({ ok: false, error: "仅支持 POST" }, 405, "no-store", pretty);
         }
+        // 未配密码 → 说清原因就收工。**不要**落到下面的"密码错误"分支：
+        // 那会记一次登录失败（多试几次还会把 IP 拉黑），而真正的问题在部署配置，
+        // 跟用户输什么完全无关。
+        if (!pwdConfigured) {
+          return json(
+            { ok: false, error: "未设置管理员密码，后台已停用", need_setup: true },
+            403,
+            "no-store",
+            pretty
+          );
+        }
         const ip = request.headers.get("cf-connecting-ip") || "unknown";
         // 第一道：内存限速（isolate 复用时零成本）
         if (!loginLimiter.check(ip)) {
@@ -1134,7 +1165,8 @@ export default {
         const body = await request.json().catch(() => ({}));
         const input = String(body.password || "");
 
-        // fail-closed：ADMIN_PASSWORD 为空时一律不放行（此时闸门本来也不会走到这里）
+        // 兜底：走到这里说明 pwdConfigured 为真（上面已拦下未配置的情况），
+        // 仍保留 `expected.length > 0` —— 空密码永不匹配，避免任何意外路径放行空串。
         const expected = env.ADMIN_PASSWORD || "";
         const pass = expected.length > 0 && constantTimeEqual(input, expected);
 
@@ -1214,16 +1246,7 @@ export default {
         }
 
         // GET：回显设置。token 永不回传明文，只给掩码 + 是否存在
-        return json(
-          {
-            ok: true,
-            authed,
-            settings: publicSettings(env, rawSettings),
-          },
-          200,
-          "no-store",
-          pretty
-        );
+        return json({ ok: true, settings: publicSettings(env, rawSettings) }, 200, "no-store", pretty);
       }
 
       // ── 前台一次性取全量：统计卡 + 分组 + 每站点 30 天色条 + SSL ──
@@ -1895,19 +1918,7 @@ export default {
         const payload = await buildAdminPayload(env);
         // 复用请求开头已读到的 rawSettings，不再多查一次 D1
         const settings = publicSettings(env, rawSettings);
-        return json(
-          {
-            ok: true,
-            ...payload,
-            settings,
-            // 只反映「密码是否已配置」，用于前端决定是否显示警告/退出按钮。
-            // 与 settings.password_source 同源，避免两处逻辑漂移。
-            password_source: settings.password_source,
-          },
-          200,
-          "no-store",
-          pretty
-        );
+        return json({ ok: true, ...payload, settings }, 200, "no-store", pretty);
       }
 
       // 手动跑一轮（调试用）：?api=run&limit=3

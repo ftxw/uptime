@@ -22,10 +22,8 @@ let CATS = [];
 let FILTER = "";  // "" = 全部
 let DRAG_CAT = null;     // 正在拖拽的分类名
 let AUTHED = false;
-let PWD_SOURCE = "none"; // none | env —— 密码只来自环境变量 ADMIN_PASSWORD
 let SETTINGS = null;     // /admin 一次性带回的设置，用于设置面板预填
 let SSL_MAP = {};        // /admin 一次性带回的证书结果（site → 记录）
-let PWD_WARNED = false;  // 「未设密码」提示本次会话只弹一次（loadAll 会被反复调用）
 
 const UNGROUPED = "未分组";
 const ALL = "__all__";
@@ -86,16 +84,31 @@ function banner(msg, kind) {
 }
 
 /**
- * 「未设置管理员密码」提醒。
- * 每次会话只弹一次 —— loadAll() 在每次增删改后都会跑，不设闸门就会反复弹。
+ * 「未设置管理员密码」——不是提示，而是**唯一的界面**。
+ *
+ * 服务端在 ADMIN_PASSWORD 未配置时整体停用后台（fail-closed，见 src/index.js），
+ * 所以这里不会有任何数据可显示：后台的骨架一直保持 visibility:hidden。
+ *
+ * 之前的行为是"未配置就放开认证"，只在顶部闪一条 5 秒警告 ——
+ * 那等于用一个瞬间消失的提示去兜住"任何人都能改配置"这件事，兜不住。
  */
-function warnNoPassword() {
-  if (PWD_SOURCE !== "none" || PWD_WARNED) return;
-  PWD_WARNED = true;
-  banner("未设置管理员密码，任何人可改配置（需 Secret 变量 ADMIN_PASSWORD）", "warn");
+function showSetup() {
+  AUTHED = false;
+  // dialog 在 top layer，层级高于遮罩 —— 不关掉的话，用户看到的是
+  // 「设置弹窗」压在「后台已停用」遮罩上面，两个界面叠在一起。
+  for (const d of document.querySelectorAll("dialog[open]")) d.close();
+  qs("#setup-mask").hidden = false;
+  qs("#main").style.visibility = "hidden";
+  qs("#logout").hidden = true;
 }
 
-/* ── 请求封装：401 一律弹出登录 ─────────────────────────── */
+/**
+ * 「整屏遮罩」类错误：未登录（401）与后台停用（403 need_setup）。
+ * 这两种情况遮罩已经把界面盖住了，再弹 toast 没人看得到 —— 静默即可。
+ */
+const isMasked = (e) => Boolean(e && (e.needLogin || e.needSetup));
+
+/* ── 请求封装：401 弹登录、403 need_setup 弹「后台已停用」───────── */
 
 async function api(path, opts = {}) {
   const headers = { accept: "application/json", ...(opts.headers || {}) };
@@ -105,19 +118,35 @@ async function api(path, opts = {}) {
     headers,
     body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
   });
-  if (r.status === 401) {
-    showLogin();
-    const e = new Error("未登录或会话已过期");
-    e.needLogin = true;
-    throw e;
-  }
-  let d;
+
+  // 先解析一次响应体：下面两种错误分支都要用它的 error 文案。
+  // （body 只能读一次，所以不能在各分支里各读一遍。）
+  let d = null;
   try {
     d = await r.json();
   } catch {
-    d = { ok: false, error: `HTTP ${r.status}` };
+    d = null;
   }
-  return d;
+
+  // 401 = 配了密码但没登录 / 会话过期 → 弹登录框
+  if (r.status === 401) {
+    showLogin();
+    const e = new Error((d && d.error) || "未登录或会话已过期");
+    e.needLogin = true;
+    throw e;
+  }
+
+  // 403 + need_setup = 服务端没配 ADMIN_PASSWORD，后台整体停用。
+  // 这时**不能**弹登录框 —— 密码根本没配置，输什么都进不去，
+  // 用户只会以为是自己记错了密码。改弹说明页，直接告诉他去设变量。
+  if (r.status === 403 && d && d.need_setup) {
+    showSetup();
+    const e = new Error(d.error || "未设置管理员密码");
+    e.needSetup = true;
+    throw e;
+  }
+
+  return d || { ok: false, error: `HTTP ${r.status}` };
 }
 
 const post = (path, body) => api(path, { method: "POST", body });
@@ -352,8 +381,8 @@ function applyBrandTitle(st) {
 /**
  * 拉取后台全量数据（一次 /admin 拿到站点 + 分类 + 证书 + 设置）。
  *
- * ⚠️ 401 时**必须让 `needLogin` 继续往上抛**，不要在这里吞掉：
- *    `api()` 已经弹出了登录框，而 bootstrap 要靠这个异常来判断"没登录"。
+ * ⚠️ 401 / 403(need_setup) 时**必须让异常继续往上抛**，不要在这里吞掉：
+ *    `api()` 已经弹出了对应的遮罩，而 bootstrap 要靠这个异常来判断"没进去"。
  *    一旦在此 return，bootstrap 会以为加载成功、继续执行 hideLogin()，
  *    把刚弹出的登录框又藏回去 —— 表现为后台一片空白且无法登录。
  */
@@ -368,15 +397,10 @@ async function loadAll() {
   CATS = d.categories || [];
   SSL_MAP = d.ssl || {}; // 已有证书结果（只读），渲染不再单独发 /api/ssl
   if (d.settings) SETTINGS = d.settings; // 供设置面板预填，打开时不必先等网络
-  if (d.password_source) PWD_SOURCE = d.password_source;
   applyBrandTitle(SETTINGS);
 
   renderCats();
   await renderRows();
-
-  // 「X 站点 · Y 分类」的常驻绿色横幅已按需求移除；
-  // 「未设密码」也改成一闪而过的顶部提示（每次会话只弹一次，见 warnNoPassword）。
-  warnNoPassword();
 }
 
 /* ── 分类：切换 / 新建 / 改名 / 删除 / 排序 ─────────────── */
@@ -425,7 +449,7 @@ async function handleCatAction(btn) {
       banner(`已删除分类「${name}」，${n} 个站点移到「${UNGROUPED}」`, "info");
       await loadAll();
     } catch (err) {
-      if (!err.needLogin) banner("删除失败：" + err.message, "error");
+      if (!isMasked(err)) banner("删除失败：" + err.message, "error");
     }
   }
 }
@@ -491,7 +515,7 @@ qs("#catform").addEventListener("submit", async (e) => {
     catdlg.close();
     await loadAll();
   } catch (err) {
-    errEl.textContent = err.needLogin ? "会话已过期，请重新登录" : "保存失败：" + err.message;
+    errEl.textContent = isMasked(err) ? err.message : "保存失败：" + err.message;
     errEl.hidden = false;
   } finally {
     btn.disabled = false;
@@ -528,7 +552,7 @@ async function saveCatOrder(names) {
     banner("分类顺序已保存", "info");
     await loadAll();
   } catch (err) {
-    if (!err.needLogin) banner("分类排序失败：" + err.message, "error");
+    if (!isMasked(err)) banner("分类排序失败：" + err.message, "error");
     await loadAll().catch(() => {}); // 同上：catch 里再抛会变成未处理的 rejection
   }
 }
@@ -642,7 +666,7 @@ qs("#form").addEventListener("submit", async (e) => {
     await loadAll();
   } catch (err) {
     const el = qs("#dlg-err");
-    el.textContent = err.needLogin ? "会话已过期，请重新登录" : "保存失败：" + err.message;
+    el.textContent = isMasked(err) ? err.message : "保存失败：" + err.message;
     el.hidden = false;
   }
 });
@@ -667,7 +691,7 @@ document.addEventListener("click", async (e) => {
       banner(d.ok ? "已删除" : "删除失败：" + d.error, d.ok ? "info" : "error");
       await loadAll();
     } catch (err) {
-      if (!err.needLogin) banner("删除失败：" + err.message, "error");
+      if (!isMasked(err)) banner("删除失败：" + err.message, "error");
     }
     return;
   }
@@ -700,7 +724,7 @@ document.addEventListener("click", async (e) => {
         res.ok ? "info" : "error"
       );
     } catch (err) {
-      if (!err.needLogin) banner("测试失败：" + err.message, "error");
+      if (!isMasked(err)) banner("测试失败：" + err.message, "error");
     } finally {
       btn.disabled = false;
       btn.textContent = "测";
@@ -720,7 +744,7 @@ qs("#checkall").addEventListener("click", async () => {
     banner(`已执行一轮检查 · 落库 ${n} 条`, "info");
     await renderRows();
   } catch (e) {
-    if (!e.needLogin) banner("执行失败：" + e.message, "error");
+    if (!isMasked(e)) banner("执行失败：" + e.message, "error");
   } finally {
     b.disabled = false;
     b.innerHTML = old;
@@ -783,7 +807,7 @@ async function openSettings() {
     fillSettingsForm(SETTINGS);
     setdlg.showModal();
   } catch (e) {
-    if (!e.needLogin) banner("读取设置失败：" + e.message, "error");
+    if (!isMasked(e)) banner("读取设置失败：" + e.message, "error");
   }
 }
 
@@ -809,10 +833,6 @@ function fillSettingsForm(s) {
   qs("#s-gp-token-hint").textContent = s.has_globalping_token
     ? `已配置：${s.globalping_token_masked}（留空则保留）`
     : "未配置（额度 250 次/小时；配置后 500 次/小时）";
-
-  // 密码只来自环境变量：这里只用于决定是否弹「未设置」提醒
-  PWD_SOURCE = s.password_source || "none";
-  warnNoPassword();
 }
 
 qs("#settings-open").addEventListener("click", openSettings);
@@ -863,7 +883,7 @@ qs("#setform").addEventListener("submit", async (e) => {
     banner("设置已保存", "info");
     await loadAll();
   } catch (err) {
-    errEl.textContent = err.needLogin ? "会话已过期，请重新登录" : "保存失败：" + err.message;
+    errEl.textContent = isMasked(err) ? err.message : "保存失败：" + err.message;
     errEl.hidden = false;
   } finally {
     btn.disabled = false;
@@ -903,10 +923,17 @@ async function bootstrap() {
     await loadAll();
     hideLogin();
   } catch (e) {
-    if (e.needLogin) return; // 登录框已由 api() 弹出，交给用户输入
+    // ① needLogin：配了密码但未登录 → 登录框已由 api() 弹出
+    // ② needSetup：没配密码（后台停用）→ 说明页已由 api() 弹出
+    // 两种都交给用户，不要在这里再弹 toast（遮罩已经把界面挡住了，提示没人看得到）。
+    if (e.needLogin || e.needSetup) return;
     banner("加载失败：" + e.message, "error");
   }
 }
+
+// 「我已设置，重新检查」——只刷新页面，重新走一次 bootstrap 的判定。
+// 变量在 Cloudflare 侧是**秒级生效**的，不需要等部署，所以刷新就能进。
+qs("#setup-reload").addEventListener("click", () => location.reload());
 
 bootstrap();
 setInterval(() => {
