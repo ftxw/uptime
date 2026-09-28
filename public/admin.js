@@ -790,7 +790,12 @@ const setdlg = qs("#setdlg");
 
 /** 位置筛选下拉里的「自定义…」哨兵值 */
 const MAGIC_CUSTOM = "__custom__";
-/** 预设选项（与 admin.html 里的 <option> 一致） */
+/**
+ * 预设选项（必须与 admin.html 里 #s-magic 的 <option value> 一致，顺序也一致）。
+ * ⚠️ **[0] 被当作「内置默认值」使用**（见 writeMagic）—— 它必须等于
+ *    `src/settings.js` 的 `SETTING_META.gp_magic.def`，否则"库里没这一行"时回显的选中项会与
+ *    服务端实际生效的筛选不一致。改默认值要两边一起改。
+ */
 const MAGIC_PRESETS = [
   "CN+datacenter-network",
   "CN+eyeball-network",
@@ -805,11 +810,20 @@ function readMagic() {
   return v === MAGIC_CUSTOM ? qs("#s-magic-custom").value.trim() : v;
 }
 
-/** 写位置筛选：预设值→选中对应项；非预设值→切到「自定义」并填入输入框 */
+/**
+ * 写位置筛选：预设值→选中对应项；非预设值→切到「自定义」并填入输入框。
+ *
+ * ⚠️ 下拉里**已经没有「不指定」这一项**（按要求移除），所以空值不能再映射成 `""`——
+ *    那会让 <select> 找不到匹配项而变成"什么都不选中"的空白态。
+ *    改为回落到 `MAGIC_PRESETS[0]`（内置默认），界面上永远有确定的选中项，
+ *    保存时会把该值显式写进 meta。**实际探测效果不变**：空值与
+ *    `CN+datacenter-network` 本来等价（`probe.js`：`env.GP_MAGIC || defOf("gp_magic")`），
+ *    区别只是从「跟着代码默认走」变成「把当前默认显式落库」。
+ */
 function writeMagic(v) {
-  const val = v || "";
+  const val = v || MAGIC_PRESETS[0];
   const isPreset = MAGIC_PRESETS.includes(val);
-  qs("#s-magic").value = isPreset ? val : val ? MAGIC_CUSTOM : "";
+  qs("#s-magic").value = isPreset ? val : MAGIC_CUSTOM;
   qs("#s-magic-custom").value = isPreset ? "" : val;
   qs("#s-magic-custom").hidden = qs("#s-magic").value !== MAGIC_CUSTOM;
 }
