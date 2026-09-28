@@ -365,8 +365,14 @@ function sslCell(ssl) {
 }
 
 /** 后端标签。后端现在是站点级必选项，直接显示解析结果 */
+/**
+ * 后端显示名（后台下拉、表格列共用）。
+ * 不再直接吐 `cf` / `globalping` 这种内部标识 —— 界面上统一叫 Cloudflare / Globalping，
+ * 与「添加站点 → 探测后端」下拉里的写法一致（见 admin.html 的 #f-kind）。
+ * ⚠️ 传进来的通常是 resolved_kind（服务端已归一化过），非法值一律按 Cloudflare 显示。
+ */
 function backendLabel(s) {
-  return s.resolved_kind || "cf";
+  return s.resolved_kind === "globalping" ? "Globalping" : "Cloudflare";
 }
 
 async function renderRows() {
@@ -417,7 +423,9 @@ async function renderRows() {
       }</div>
         </td>
         <td><span class="mono" style="font-size:12px">${escapeHtml(s.url)}</span></td>
-        <td class="muted" style="font-size:12px">${backendLabel(s)}<div style="font-size:11px;opacity:.65">${fmtInterval(
+        <td class="muted" style="font-size:12px"${
+          s.origin ? ` title="${escapeHtml(s.origin)}"` : ""
+        }>${backendLabel(s)}<div style="font-size:11px;opacity:.65">${fmtInterval(
           s.interval_min
         )}</div></td>
         <td>${sslCell(sslMap[s.id])}</td>
@@ -822,7 +830,9 @@ document.addEventListener("click", async (e) => {
       const kind = site?.resolved_kind || "cf";
       const d = await post("/test", { kind, site: site.id });
       const res = (d.results || [])[0] || {};
-      const where = d.egress?.colo ? `机房 ${d.egress.colo}` : res.probe || "";
+      // 来源标签由服务端算好（origin），与前台首页 / 详情页同一口径 ——
+      // 以前这里自己拼「机房 SJC」，与前台写法不一致。
+      const where = d.origin || "";
       // 文案压成一条紧凑的短句：toast 是单个胶囊，字段用 · 分隔比用中文更省宽度
       const mark = d.persisted ? (d.persisted.ok ? " · 已记录" : ` · 未记录：${d.persisted.reason || "失败"}`) : "";
       // 顺序：先重渲染表格（让「状态 / 最近检查」立刻反映这次结果），再弹提示 ——
@@ -903,10 +913,10 @@ function writeHint(v) {
 /** 位置筛选下拉里的「自定义…」哨兵值 */
 const MAGIC_CUSTOM = "__custom__";
 /**
- * 预设选项（必须与 admin.html 里 #s-magic 的 <option value> 一致，顺序也一致）。
- * ⚠️ **[0] 被当作「内置默认值」使用**（见 writeMagic）—— 它必须等于
- *    `src/settings.js` 的 `SETTING_META.gp_magic.def`，否则"库里没这一行"时回显的选中项会与
- *    服务端实际生效的筛选不一致。改默认值要两边一起改。
+ * 预设选项（必须与 admin.html 里 `#s-magic` / `#s-sslmagic` 的 <option> 一致，顺序也一致）。
+ * ⚠️ **[0] 被当作「内置默认值」使用**（见 writeMagicLike）—— 它必须等于
+ *    `src/settings.js` 的 `SETTING_META.gp_magic.def`（两者同值），否则"库里没这一行"时
+ *    回显的选中项会与服务端实际生效的筛选不一致。改默认值要三处一起改。
  */
 const MAGIC_PRESETS = [
   "CN+datacenter-network",
@@ -916,28 +926,49 @@ const MAGIC_PRESETS = [
   "north-america",
 ];
 
-/** 读位置筛选：下拉选中预设就取预设值，选中「自定义」则取输入框 */
-function readMagic() {
-  const v = qs("#s-magic").value;
-  return v === MAGIC_CUSTOM ? qs("#s-magic-custom").value.trim() : v;
+/**
+ * 读「预设 + 自定义」型下拉：选中预设就取预设值，选中「自定义」则取旁边的输入框。
+ *
+ * `#s-magic`（站点位置筛选）与 `#s-sslmagic`（证书检测筛选）共用这一对函数 ——
+ * 两个下拉的选项集完全一样，只是作用对象不同，没必要各写一份（写两份必然漂移）。
+ */
+function readMagicLike(selId, customId) {
+  const v = qs(selId).value;
+  return v === MAGIC_CUSTOM ? qs(customId).value.trim() : v;
 }
 
 /**
- * 写位置筛选：预设值→选中对应项；非预设值→切到「自定义」并填入输入框。
+ * 写「预设 + 自定义」型下拉：预设值→选中对应项；非预设值→切到「自定义」并填入输入框。
  *
- * ⚠️ 下拉里**已经没有「不指定」这一项**（按要求移除），所以空值不能再映射成 `""`——
- *    那会让 <select> 找不到匹配项而变成"什么都不选中"的空白态。
+ * ⚠️ 两个下拉里都**没有「不指定」这一项**（按要求移除），所以空值不能再映射成 `""`——
+ *    那会让 <select> 找不到匹配项而变成"什么都不选中"的空白态（selectedIndex = -1）。
  *    改为回落到 `MAGIC_PRESETS[0]`（内置默认），界面上永远有确定的选中项，
  *    保存时会把该值显式写进 meta。**实际探测效果不变**：空值与
- *    `CN+datacenter-network` 本来等价（`probe.js`：`env.GP_MAGIC || defOf("gp_magic")`），
+ *    `CN+datacenter-network` 本来等价（`effectiveEnv` 对空值回落 `SETTING_META` 的 def），
  *    区别只是从「跟着代码默认走」变成「把当前默认显式落库」。
  */
-function writeMagic(v) {
+function writeMagicLike(selId, customId, v) {
   const val = v || MAGIC_PRESETS[0];
   const isPreset = MAGIC_PRESETS.includes(val);
-  qs("#s-magic").value = isPreset ? val : MAGIC_CUSTOM;
-  qs("#s-magic-custom").value = isPreset ? "" : val;
-  qs("#s-magic-custom").hidden = qs("#s-magic").value !== MAGIC_CUSTOM;
+  qs(selId).value = isPreset ? val : MAGIC_CUSTOM;
+  qs(customId).value = isPreset ? "" : val;
+  qs(customId).hidden = qs(selId).value !== MAGIC_CUSTOM;
+}
+
+/** `#s-magic`：对所有用 globalping 后端的站点的**可用性探测**生效 */
+function readMagic() {
+  return readMagicLike("#s-magic", "#s-magic-custom");
+}
+function writeMagic(v) {
+  writeMagicLike("#s-magic", "#s-magic-custom", v);
+}
+
+/** `#s-sslmagic`：证书检测专用，与站点自己的筛选解耦（避免窄筛选连带失败） */
+function readSslMagic() {
+  return readMagicLike("#s-sslmagic", "#s-sslmagic-custom");
+}
+function writeSslMagic(v) {
+  writeMagicLike("#s-sslmagic", "#s-sslmagic-custom", v);
 }
 
 async function openSettings() {
@@ -979,7 +1010,7 @@ function fillSettingsForm(s) {
   qs("#s-timeout").value = s.timeout_ms || "";
   writeMagic(s.gp_magic || "");
   qs("#s-limit").value = s.gp_limit || "";
-  qs("#s-sslmagic").value = s.gp_ssl_magic || "";
+  writeSslMagic(s.gp_ssl_magic || "");
   qs("#s-per-tick").value = s.ssl_per_tick || "";
   qs("#s-warn").value = s.ssl_warn_days || "";
   qs("#s-ipver").value = s.gp_ip_version || "4";
@@ -996,12 +1027,17 @@ function fillSettingsForm(s) {
 
 qs("#settings-open").addEventListener("click", openSettings);
 
-// 位置筛选选到「自定义…」时展开输入框
-qs("#s-magic").addEventListener("change", () => {
-  const custom = qs("#s-magic").value === MAGIC_CUSTOM;
-  qs("#s-magic-custom").hidden = !custom;
-  if (custom) qs("#s-magic-custom").focus();
-});
+// 位置筛选类下拉选到「自定义…」时展开旁边的输入框（#s-magic 与 #s-sslmagic 同样处理）
+for (const [selId, customId] of [
+  ["#s-magic", "#s-magic-custom"],
+  ["#s-sslmagic", "#s-sslmagic-custom"],
+]) {
+  qs(selId).addEventListener("change", () => {
+    const custom = qs(selId).value === MAGIC_CUSTOM;
+    qs(customId).hidden = !custom;
+    if (custom) qs(customId).focus();
+  });
+}
 
 qs("#setform").addEventListener("submit", async (e) => {
   // 只处理「保存」（`submitter` 为空时也按保存走，做一层防御）。
@@ -1031,7 +1067,7 @@ qs("#setform").addEventListener("submit", async (e) => {
     timeout_ms: qs("#s-timeout").value.trim(),
     gp_magic: readMagic(),
     gp_limit: qs("#s-limit").value.trim(),
-    gp_ssl_magic: qs("#s-sslmagic").value.trim(),
+    gp_ssl_magic: readSslMagic(),
     ssl_per_tick: qs("#s-per-tick").value.trim(),
     ssl_warn_days: qs("#s-warn").value.trim(),
     gp_ip_version: qs("#s-ipver").value,

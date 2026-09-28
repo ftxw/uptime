@@ -127,9 +127,7 @@ function monitorRow(m) {
       <div class="mrow-sub">
         <span class="ico url">${svg("globe")}${escapeHtml(m.url)}</span>
         <span class="ico">${svg("clock")}${fmtInterval(m.interval_min)}</span>
-        <span class="ico muted" title="${escapeHtml(m.last_source || "")}">${escapeHtml(
-          m.probe_kind === "globalping" ? "Globalping" : "CF · " + (m.cf_hint || "").toUpperCase()
-        )}${m.last_probe ? " · " + escapeHtml(m.last_probe) : ""}</span>
+        <span class="ico muted" title="${escapeHtml(m.last_source || "")}">${escapeHtml(m.origin || "")}</span>
         <span class="muted">${relTime(m.last_ts)}${degrade}</span>
       </div>
     </div>

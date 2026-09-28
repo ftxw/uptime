@@ -28,25 +28,8 @@ export const REGION_GROUPS = [
   "oc", "afr", "me",
 ];
 
-export const siteOf = (u) => {
-  try {
-    return new URL(u).hostname.replace(/^www\./, "");
-  } catch {
-    return String(u);
-  }
-};
-
 export function normalizeUrl(u) {
   return /^https?:\/\//i.test(u) ? u : `https://${u}`;
-}
-
-/** Globalping 的 target 不能带 scheme，要单独剥出来 */
-function hostOf(u) {
-  try {
-    return new URL(normalizeUrl(u)).hostname;
-  } catch {
-    return String(u).replace(/^https?:\/\//, "").split("/")[0];
-  }
 }
 
 /**
@@ -367,7 +350,15 @@ export async function gpSslCheck(env, site) {
   // ⚠️ 刻意**不用可用性探测的筛选**（GP_MAGIC）：
   // 可用性探测的筛选可能很窄（例如 CN+xian+eyeball-network），窄到没有探针；
   // 而 SSL 检测只需要任意一个能建立 TLS 的探针即可，用窄条件会让证书检测连带失败。
-  const magic = env.GP_SSL_MAGIC || env.GP_MAGIC || defOf("gp_ssl_magic");
+  // 所以这里只认自己的 GP_SSL_MAGIC（后台「SSL 检测筛选」下拉）。
+  //
+  // 原来写的是 `env.GP_SSL_MAGIC || env.GP_MAGIC || defOf("gp_ssl_magic")`，是**误导**：
+  // effectiveEnv 组装时已把空值回落成 def（`s[k] !== "" ? s[k] : env[m.env] || m.def`），
+  // 而 gp_ssl_magic 的 def 非空 → GP_SSL_MAGIC 在真实调用路径上**永不为空**，
+  // 中间那段 `|| env.GP_MAGIC` 是死分支。留着只会让人以为"SSL 会跟随站点筛选"，
+  // 与上面刻意的解耦设计正好相反。`|| defOf(...)` 仅作防御：
+  // 直接调本函数（如测试）时 env 未必被 effectiveEnv 合并过。
+  const magic = env.GP_SSL_MAGIC || defOf("gp_ssl_magic");
   const H = {
     "Content-Type": "application/json",
     ...(token ? { Authorization: `Bearer ${token}` } : {}),

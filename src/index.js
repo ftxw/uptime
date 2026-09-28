@@ -25,7 +25,6 @@ import {
 import { Prober } from "./prober.js";
 import {
   REGION_GROUPS,
-  siteOf,
   judge,
   normalizeUrl,
   zhError,
@@ -45,6 +44,8 @@ import {
   sleep,
 } from "./auth.js";
 import { SETTING_META, SETTING_KEYS, defOf } from "./settings.js";
+// 「谁在哪跑的」统一口径 —— 三个前端共用这一个格式化函数（原因见模块注释）
+import { formatOrigin } from "./origin.js";
 
 export { Prober };
 
@@ -224,6 +225,9 @@ async function buildAdminPayload(env) {
       last_ttfb: lastMap[s.id]?.ttfb_ms ?? null,
       last_source: lastMap[s.id]?.source ?? null,
       last_probe: lastMap[s.id]?.probe ?? null,
+      // 「谁在哪跑的」由服务端统一算好（见 originOf / origin.js）—— 后台表格 / 前台首页 /
+      // 详情页三个前端共用同一口径，避免各自拼串导致同一次检查有三种写法。
+      origin: originOf(s, lastMap[s.id]?.source, lastMap[s.id]?.probe, env),
       last_ts: lastMap[s.id]?.ts ?? null,
       // stateOf() 读的是 ssl_* 前缀的**扁平**字段（与 overview 的 SQL 别名同形），
       // 这里把 ssl 表的列重命名摊平后再交给它，避免后台自算一套三态逻辑。
@@ -290,6 +294,27 @@ function cfHintOf(env) {
 /** Globalping 位置筛选：同样是全局设置。null 表示用 probe.js 的内置默认 */
 function gpMagicOf(env) {
   return (env && env.GP_MAGIC) || null;
+}
+
+/**
+ * 站点的来源标签（首页 / 详情页 / 后台共用，格式见 origin.js）。
+ *
+ * 有检查记录时用**最近一次实际跑的那台**（last_source/last_probe）——
+ * 这样降级路径（Globalping 发起失败自动改走 CF 边缘）会如实显示成 `CF:…（降级）`，
+ * 而不是照抄配置写成 GP。
+ * 从未检查过的站点则用后端配置推一个（`GP:CN` / `CF:APAC`），
+ * 免得首页那一行留一块空白 —— 那时"配置是哪个后端"就是唯一已知的事实。
+ */
+function originOf(site, lastSource, lastProbe, env) {
+  const real = formatOrigin(lastSource, lastProbe);
+  if (real) return real;
+  const kind = resolveKind(site);
+  return formatOrigin(
+    kind === "globalping"
+      ? `gp:${gpMagicOf(env) || defOf("gp_magic")}`
+      : `cf:${cfHintOf(env)}`,
+    null
+  );
 }
 
 /**
@@ -1446,6 +1471,8 @@ export default {
               last_ttfb: s.last_ttfb,
               last_source: s.last_source,
               last_probe: s.last_probe,
+              // 服务端统一口径（见 originOf / origin.js）；前端不再各自拼 source/probe
+              origin: originOf(s, s.last_source, s.last_probe, env),
               last_ts: s.last_ts,
               last_error: s.last_error,
               consecutive_fail: s.consecutive_fail,
@@ -1801,6 +1828,7 @@ export default {
                 total: r.total_ms,
                 source: r.source,
                 probe: r.probe,
+                origin: formatOrigin(r.source, r.probe),
                 error: r.error,
               })),
               incidents: evts,
@@ -2072,6 +2100,8 @@ export default {
           return json({
             ok: true, kind: "cf", hint,
             count: list.length,
+            // 与后台表格 / 前台同一口径的来源标签（见 origin.js）
+            origin: formatOrigin(`cf:${hint}`, out.colo),
             egress: out.egress, wall: out.wall, roundTripMs: Date.now() - t0,
             results: out.results,
             persisted,
@@ -2099,18 +2129,26 @@ export default {
           );
         }
         const results = finished?.results || [];
+        // 与 collectGlobalping 同口径：取成功结果里最快的那条为代表
+        const good = results.filter((r) => r.ok);
+        const best = good.sort((a, b) => (a.ttfb || 1e9) - (b.ttfb || 1e9))[0] || results[0];
+        // 多探测点（gp_limit>1）时用逗号连接 —— 落库与标签取自同一个值，
+        // 免得"提示里显示的"和"checks 表里存的"对不上
+        const probeLabel = good.map((r) => r.probe).join(",") || null;
         let persisted = null;
         if (site) {
-          // 与 collectGlobalping 同口径：取成功结果里最快的那条为代表
-          const good = results.filter((r) => r.ok);
-          const best = good.sort((a, b) => (a.ttfb || 1e9) - (b.ttfb || 1e9))[0] || results[0];
           persisted = await persistManualTest(env, site, {
             source,
-            probe: good.map((r) => r.probe).join(",") || null,
+            probe: probeLabel,
             result: best,
           });
         }
-        return json({ ok: true, kind: "globalping", source, quota, results, persisted });
+        return json({
+          ok: true, kind: "globalping", source, quota,
+          // 与后台表格 / 前台同一口径的来源标签（见 origin.js）
+          origin: formatOrigin(source, probeLabel),
+          results, persisted,
+        });
       }
 
       // 未知接口一律 404 —— 返回 200 + 服务信息会让删掉的接口"看起来还在"，

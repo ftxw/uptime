@@ -402,7 +402,10 @@ function renderRecent(recent) {
     .map((r) => {
       const cls = r.ok ? "b-up" : "b-down";
       const label = r.ok ? "正常" : "故障";
-      const src = r.probe ? `${r.source || ""} · ${r.probe}` : r.source || "";
+      // 来源标签由服务端算好（origin，格式 GP:CN · Beijing/9808 / CF:APAC · SJC）——
+      // 以前这里直接吐 source 原文（`gp:CN+datacenter-network · Beijing/45090`），
+      // 与首页 / 后台的写法各不相同。取不到 origin 时退回 source 原文，不显示空白。
+      const src = r.origin || r.source || "";
       return `<div class="lst-row">
         <span class="badge ${cls}">${label}</span>
         <span class="mono" style="min-width:34px">${r.status ?? "--"}</span>
@@ -410,7 +413,9 @@ function renderRecent(recent) {
           r.ttfb != null ? r.ttfb + " ms" : "--"
         }</span>
         <span class="grow muted" style="font-size:12px" title="${escapeHtml(
-          r.error || src
+          // 失败行优先显示错误原因（比"在哪跑的"更要紧），但来源仍放进 title ——
+          // 否则排查"这次是怎么失败的"时完全看不到是哪台跑的
+          r.error ? `${r.error} · ${src}` : src
         )}">${escapeHtml(r.error || src)}</span>
         <span class="mono muted" style="font-size:12px">${fmtFull(r.ts)}</span>
       </div>`;
@@ -493,7 +498,7 @@ function render(d) {
     `探测后端 ${
       d.site.probe_kind === "globalping"
         ? `Globalping（${d.site.gp_magic || "默认筛选"}）`
-        : `CF Durable Object（${(d.site.cf_hint || "").toUpperCase()}）`
+        : `Cloudflare（${(d.site.cf_hint || "").toUpperCase()}）`
     } · SSL 由 Globalping 每站点每日检测一次`;
 }
 

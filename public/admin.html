@@ -145,8 +145,8 @@
         <div class="field">
           <label for="f-kind">探测后端</label>
           <select id="f-kind">
-            <option value="cf">cf（Cloudflare Durable Object）</option>
-            <option value="globalping">globalping（第三方探针）</option>
+            <option value="cf">Cloudflare</option>
+            <option value="globalping">Globalping</option>
           </select>
           <span class="hint">区域组 / 位置筛选在「设置 → 探测」里统一配置</span>
         </div>
@@ -323,8 +323,16 @@
       <div class="grid-3">
         <div class="field">
           <label for="s-sslmagic">SSL 检测筛选</label>
-          <input id="s-sslmagic" placeholder="CN+datacenter-network">
-          <span class="hint">与站点自己的筛选解耦，避免窄筛选导致失败</span>
+          <select id="s-sslmagic">
+            <option value="CN+datacenter-network">中国 · 云机房</option>
+            <option value="CN+eyeball-network">中国 · 家庭宽带</option>
+            <option value="east-asia">东亚</option>
+            <option value="western-europe">西欧</option>
+            <option value="north-america">北美</option>
+            <option value="__custom__">自定义…</option>
+          </select>
+          <input id="s-sslmagic-custom" placeholder="CN+changsha+4837" hidden aria-label="自定义 SSL 检测筛选">
+          <span class="hint">与站点的位置筛选解耦，避免窄筛选导致证书检测连带失败</span>
         </div>
         <div class="field">
           <label for="s-per-tick">每轮补检 SSL 数</label>
