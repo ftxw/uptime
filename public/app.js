@@ -80,19 +80,20 @@ function renderStats(s) {
 }
 
 function barHtml(m) {
+  // 色条语义与服务端 / 详情页保持一致：fault = 当天有「连续失败 ≥ 阈值」的真故障，
+  // blip = 当天只有零星抖动（不算故障，故不标红）。
   const segs = (m.bars || [])
     .map((b) => {
       const cls =
         b.st === "up" ? "s-up"
-        : b.st === "down" ? "s-down"
-        : b.st === "recovered" ? "s-recovered"
-        : b.st === "degraded" ? "s-degraded"
-        : "";
+        : b.st === "fault" ? "s-fault"
+        : b.st === "blip" ? "s-blip"
+        : "s-none";
       const label =
         b.st === "none" ? "无数据"
         : b.st === "up" ? "全天正常"
-        : b.st === "down" ? "全天故障"
-        : "当天有故障";
+        : b.st === "fault" ? "当天有故障"
+        : "当天有抖动";
       return `<span class="${cls}" data-d="${b.d}" data-s="${label}"></span>`;
     })
     .join("");

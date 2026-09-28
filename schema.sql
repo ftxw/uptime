@@ -39,6 +39,13 @@ CREATE TABLE IF NOT EXISTS checks (
 CREATE INDEX IF NOT EXISTS idx_checks_site_ts ON checks(site, ts DESC);
 CREATE INDEX IF NOT EXISTS idx_checks_ts ON checks(ts DESC);
 
+-- 专门给「取一段时间内的失败」用。
+-- 失败是稀疏的（正常情况下百万行里只有个位数），把 ok 放在最左列后，
+-- 这类查询只读匹配到的失败行，而不是整段时间的全部检查；
+-- 30 天可用率色条判断「当天有没有真的连续故障」就靠它，成本与失败次数成正比。
+-- 末列带 site 是为了让单站点查询（详情页）也能走索引而不回表。
+CREATE INDEX IF NOT EXISTS idx_checks_ok_ts_site ON checks(ok, ts, site);
+
 -- ── 每站点运行态 ──────────────────────────────────────────
 -- 单独一张表是因为「连续失败计数」必须跨轮次累积，不能靠查 checks 现算。
 --

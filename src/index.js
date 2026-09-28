@@ -388,6 +388,48 @@ function dayMod(env) {
   return `${min < 0 ? "-" : "+"}${Math.abs(min)} minutes`;
 }
 
+/**
+ * 按天算出「最长的一段连续失败有多长（次数）」。
+ *
+ * 为什么需要：30 天可用率色条原先只看当天的失败**次数** —— 只要有失败就标成
+ * 「当天有故障」。但一次没到 fail_threshold 的失败（下一拍就恢复）本就不是故障
+ * （见「故障记录」卡片的口径），却被涂成红色，同一件事在同一个页面上有两种说法。
+ * 现在色条改用与告警 / 故障记录**同一个定义**：当天出现过「连续失败 ≥ fail_threshold」
+ * 的段才算故障（`fault`），其余只有 `blip`（有抖动，不标红）。
+ *
+ * 连续性只能靠时间戳间隔判断：同一站点的探测是等间隔的，两次失败的时间差接近一个
+ * 间隔就说明它们相邻（中间没有成功过）。容差取 1.3 倍间隔 —— 既容忍调度抖动
+ * （cron 相位、Globalping 两阶段带来的 ±秒级偏移），又保证 < 2 倍间隔，从而**不会**
+ * 把"中间夹着一次成功"的两次失败并成一段。
+ *
+ * 跨天的段在按天分组时会被切开，属保守处理：宁可少标红，不多标红。
+ * 代价上这是"只读失败行"，配合 idx_checks_ok_ts_site 索引，读取量与该段时间的
+ * 失败次数成正比，而不是与总检查数成正比。
+ *
+ * @param {Array<{d: string, ts: string}>} rows 失败检查，需按 ts 升序（同一天的行连续）
+ * @param {number} intervalMin 该站点的期望检查间隔（分钟）
+ * @returns {Object<string, number>} 天 → 当天最长连续失败次数
+ */
+function maxFailRunPerDay(rows, intervalMin) {
+  const tol = Math.max(1, Number(intervalMin) || 5) * 60 * 1.3; // 秒，见上方容差说明
+  const out = {};
+  let day = null;
+  let prevS = null;
+  let run = 0;
+  for (const r of rows || []) {
+    if (r.d !== day) {
+      day = r.d;
+      prevS = null;
+      run = 0;
+    }
+    const s = Date.parse(r.ts) / 1000;
+    run = prevS !== null && s - prevS <= tol ? run + 1 : 1;
+    prevS = s;
+    if (out[day] === undefined || run > out[day]) out[day] = run;
+  }
+  return out;
+}
+
 /** 会话签名密钥：优先生效环境变量，否则用 D1 里的随机值（首次访问时生成） */
 /**
  * 按 key 做取值的类型/范围规范化。
@@ -1198,7 +1240,7 @@ export default {
           const since30 = new Date(Date.now() - days * 86400000).toISOString();
           const since24 = new Date(Date.now() - 86400000).toISOString();
 
-          const [siteRows, dayRows, h24, u24] = await Promise.all([
+          const [siteRows, dayRows, h24, u24, failRows] = await Promise.all([
             // ⚠️ 刻意**不用**窗口函数取"每个站点的最新一条"（那是对 checks 全表分区排序）。
             //    最后一行的结果快照由落库路径同步写进 state（见 STATE_UPSERT），
             //    这里只是主键 LEFT JOIN —— 代价与历史数据量无关。
@@ -1248,6 +1290,16 @@ export default {
               )
               .bind(since24)
               .all(),
+            // 失败明细的时间戳（30 天、全站点）—— 判断"某天是否真的连续故障"。
+            // 走 idx_checks_ok_ts_site，读失败行而非全部检查；正常情况只有个位数。
+            d
+              .prepare(
+                `SELECT site, date(ts, '${dayMod(env)}') AS d, ts
+                 FROM checks WHERE ts > ? AND ok = 0
+                 ORDER BY site, ts`
+              )
+              .bind(since30)
+              .all(),
           ]);
 
           // 30 天日期轴。最左是今天，最右是最早；"今天"按 utc_offset_min 起算，
@@ -1267,16 +1319,23 @@ export default {
             u24map[r.site] = r.n ? Math.round((Number(r.ok) / Number(r.n)) * 1000) / 10 : null;
           }
 
+          // 失败行按站点归堆（SQL 已按 site, ts 排好，故站点内 ts 仍是有序的）
+          const failBySite = {};
+          for (const r of failRows.results || []) (failBySite[r.site] = failBySite[r.site] || []).push(r);
+
           const groups = {};
           const seen = new Set();
           for (const s of siteRows.results || []) {
             const map = bySite[s.id] || {};
+            // 色条颜色与「故障记录」同一口径：当天出现「连续失败 ≥ fail_threshold」
+            // 的段才标红（fault）；只有零星抖动的天标黄（blip）。
+            const runMap = maxFailRunPerDay(failBySite[s.id], s.interval_min);
+            const thr = Number(s.fail_threshold || 3);
             const bars = axis.map((dkey) => {
               const c = map[dkey];
               if (!c || !c.n) return { d: dkey, st: "none" };
               if (c.ok >= c.n) return { d: dkey, st: "up" };
-              if (c.ok === 0) return { d: dkey, st: "down" };
-              return { d: dkey, st: "recovered" };
+              return { d: dkey, st: Number(runMap[dkey] || 0) >= thr ? "fault" : "blip" };
             });
 
             // 三态判定：up / down / degraded（规则见 stateOf）
@@ -1391,7 +1450,7 @@ export default {
           const sinceD = new Date(Date.now() - days * 86400000).toISOString();
           const bkt = bucketFor(hours);
 
-          const [meta, agg, p95, seriesRows, recentRows, changeRows, dayRows] =
+          const [meta, agg, p95, seriesRows, recentRows, changeRows, dayRows, failRows] =
             await Promise.all([
               // ① 配置 + 状态 + 最近一次 + SSL
               d
@@ -1490,6 +1549,16 @@ export default {
                 )
                 .bind(id, sinceD)
                 .all(),
+              // ⑧ 失败明细的**时间戳**（30 天窗口）—— 只为判断「某天有没有真的连续故障」。
+              //    走 idx_checks_ok_ts_site，读的是失败行而不是全部检查。
+              d
+                .prepare(
+                  `SELECT date(ts, '${dayMod(env)}') AS d, ts
+                   FROM checks WHERE site = ?1 AND ts > ?2 AND ok = 0
+                   ORDER BY ts`
+                )
+                .bind(id, sinceD)
+                .all(),
             ]);
 
           if (!meta) {
@@ -1551,6 +1620,9 @@ export default {
             .slice(0, incidentN);
 
           // 30 天色条（最左最新 → 最右最早，与首页一致）
+          // 颜色语义与「故障记录」一致：只有出现「连续失败 ≥ fail_threshold」的段才算
+          // 真故障（红，fault）；只有零星抖动的天是黄（blip），不再一律涂红。
+          const runMap = maxFailRunPerDay(failRows.results, intervalMin);
           const dayMap = {};
           for (const r of dayRows.results || []) dayMap[r.d] = r;
           const bars = [];
@@ -1566,9 +1638,9 @@ export default {
                   ? "none"
                   : Number(c.ok) >= Number(c.n)
                   ? "up"
-                  : Number(c.ok) === 0
-                  ? "down"
-                  : "recovered",
+                  : Number(runMap[dkey] || 0) >= failThreshold
+                  ? "fault"
+                  : "blip",
               n: c ? Number(c.n) : 0,
               ok: c ? Number(c.ok) : 0,
             });

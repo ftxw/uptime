@@ -364,14 +364,16 @@ function renderBars(bars) {
   }
   el.innerHTML = list
     .map((b) => {
+      // 与服务端 / 首页同一口径：fault 才是"真故障"，blip 只是抖动。
+      // 措辞上把判据写进提示，避免再出现「明明有失败为什么不是红的」这类疑问。
       const label =
         b.st === "none"
           ? "无数据"
           : b.st === "up"
           ? "全天正常"
-          : b.st === "down"
-          ? "全天故障"
-          : "当天有故障";
+          : b.st === "fault"
+          ? "当天有故障（连续失败达到该站点阈值）"
+          : "当天有抖动（失败未达故障阈值）";
       const detail = b.n ? `（${b.ok}/${b.n} 次成功）` : "";
       return `<span class="s-${b.st}" data-d="${b.d}" data-s="${label}" data-n="${detail}"></span>`;
     })

@@ -318,9 +318,10 @@ a { color: inherit; text-decoration: none; }
 }
 .bar span:hover { filter: brightness(1.12); }
 .bar .s-up { background: hsl(var(--success)); }
-.bar .s-down { background: hsl(var(--destructive)); }
-.bar .s-recovered { background: hsl(var(--destructive) / 0.5); }
-.bar .s-degraded { background: hsl(var(--warning)); }
+/* 红 = 当天出现「连续失败达到该站点阈值」的段（真故障，与「故障记录」同一口径）。
+   只有零星抖动的天用黄 —— 单次失败不算故障，涂红会与故障记录卡片自相矛盾。 */
+.bar .s-fault { background: hsl(var(--destructive)); }
+.bar .s-blip { background: hsl(var(--warning)); }
 
 /* ── 按钮 ───────────────────────────────────────────────── */
 

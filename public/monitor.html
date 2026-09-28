@@ -105,7 +105,9 @@
       <h2>最近检查</h2>
       <span class="muted" style="font-size:12px" id="recentsum"></span>
     </div>
-    <div class="lst" id="recent"></div>
+    <!-- 占位与「故障记录」刻意用同一种样式：两张卡片同属一个 /api/site 响应、
+         同一帧写入，加载期间看起来必须一样，否则空白会被误读成"这张更慢"。 -->
+    <div class="lst" id="recent"><div class="empty">加载中…</div></div>
   </div>
 
   <!-- 故障记录 -->
@@ -114,7 +116,7 @@
       <h2>故障记录</h2>
       <span class="muted" style="font-size:12px" id="incsum"></span>
     </div>
-    <div class="lst" id="incidents"></div>
+    <div class="lst" id="incidents"><div class="empty">加载中…</div></div>
   </div>
 
   <p class="muted" style="font-size:12px;margin:0" id="foot"></p>
