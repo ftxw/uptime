@@ -257,12 +257,12 @@ a { color: inherit; text-decoration: none; }
 .mrow-bar { width: 100%; }
 @media (min-width: 960px) { .mrow-bar { width: 12rem; flex-shrink: 0; } }
 
-/* 三列指标（响应时间 / SSL / 可用率）用网格 + 竖向分隔线隔开，
+/* 三列指标（响应时间 / SSL / 可用率）用网格 + 空格隔开（无竖线），
    对齐参考项目的「分列」布局；移动端同样三列并排。 */
 .mrow-metrics {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 0;
+  gap: 16px;
   font-size: 13px;
   flex-shrink: 0;
 }
@@ -270,10 +270,7 @@ a { color: inherit; text-decoration: none; }
 
 .metric {
   display: flex; flex-direction: column; align-items: flex-start; min-width: 0;
-  padding: 0 10px;
-  border-left: 1px solid hsl(var(--border) / 0.8);
 }
-.metric:first-child { padding-left: 0; border-left: none; }
 @media (min-width: 960px) { .metric { align-items: flex-end; } }
 .metric .k { font-size: 12px; color: hsl(var(--muted-foreground)); white-space: nowrap; }
 .metric .v {
