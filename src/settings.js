@@ -26,7 +26,7 @@ export const SETTING_META = {
   timeout_ms:       { env: "TIMEOUT_MS",       def: "8000" },
   ssl_per_tick:     { env: "SSL_PER_TICK",     def: "2" },                     // 每轮 cron 补检几个站点的 SSL
   ssl_warn_days:    { env: "SSL_WARN_DAYS",    def: "14" },                    // 剩余 ≤ N 天判为降级
-  subreq_budget:    { env: "SUBREQ_BUDGET",    def: "30" },                    // 子请求预算，免费层上限 50
+  subreq_budget:    { env: "SUBREQ_BUDGET",    def: "30" },                    // 本轮出网子请求额度（探测 + SSL 共用；D1 另计，见 normalizeSetting 说明）
   check_keep_days:  { env: "CHECK_KEEP_DAYS",  def: "30" },                    // 探测明细保留天数
   recent_limit:     { env: "RECENT_LIMIT",     def: "20" },                    // 详情页「最近检查」最多显示几条
   incident_limit:   { env: "INCIDENT_LIMIT",   def: "10" },                    // 详情页「故障记录」最多显示几条

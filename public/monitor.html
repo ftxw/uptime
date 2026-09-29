@@ -81,8 +81,10 @@
       <div class="chart-wrap" id="chart"></div>
     </div>
     <div class="legend">
-      <span><i style="background:hsl(160 84% 39%)"></i>平均响应时间</span>
-      <span><i style="background:hsl(0 72% 51%)"></i>该时段存在失败</span>
+      <!-- 颜色一律引用 CSS 变量：写死 hsl 值会让图例与折线/红点各走一套，
+           以后调主色或故障色时必然出现"图例是旧色、图上是新色"。 -->
+      <span><i style="background:hsl(var(--primary))"></i>平均响应时间</span>
+      <span><i style="background:hsl(var(--destructive))"></i>该时段存在失败</span>
       <span class="muted" id="bucket"></span>
     </div>
   </div>
@@ -180,9 +182,10 @@
   // 色条：一条灰条，与"无数据"时同款，高度同为 34px
   put("bar", '<span class="skel" aria-hidden="true"></span>');
 
-  // 最近检查：占位行结构与真实行完全一致（badge + 状态码 + 耗时 + 备注 + 时间）
-  // 条数取默认 recent_limit（见 src/settings.js 的 SETTING_META）——冷启动时
-  // 拿不到服务端配置，用默认值；改默认值时这里一并改。
+  // 最近检查：占位行结构与真实行完全一致（badge + 状态码 + 耗时 + 备注 + 时间）。
+  // 20 行是**刻意写死**的：骨架的作用只是"在数据到达前把卡片撑到接近最终高度、避免 CLS"，
+  // 不必与 recent_limit 精确相等 —— 反过来，跟着配置变就等于把"防跳动"这件事
+  // 和服务端设置耦合起来，改一次默认值要记得回来同步这里。真数据到达时整块被替换。
   put("recent", Array(21).join(
     '<div class="lst-row skel" aria-hidden="true">' + sk("正常", "badge") +
       sk("200") + sk("155 ms") + sk("cfapi · H2", "grow") + sk("2026-01-01 00:00:00") + "</div>"

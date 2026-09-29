@@ -481,8 +481,12 @@ function applyBrandTitle(st) {
 async function loadAll() {
   const d = await api("/admin");
   if (!d.ok) {
-    banner(d.error || "加载失败", "error");
-    return;
+    // ⚠️ 必须让异常继续往上抛（不是弹个提示就 return）：
+    //    bootstrap 正是靠"有没有异常"判断"到底进没进去"，一旦在此 return，
+    //    它会以为加载成功、继续执行 hideLogin() —— 于是 /admin 返回 5xx 时
+    //    用户看到的是一个**空壳后台**（提示一闪而过、表格永远是空的），
+    //    而不是一个说得清原因的失败态。提示统一由 bootstrap 弹，避免弹两条。
+    throw new Error(d.error || "加载失败");
   }
 
   SITES = sortSites(d.sites || []);
@@ -512,6 +516,10 @@ qs("#cats").addEventListener("click", async (e) => {
 
 qs("#cats").addEventListener("keydown", (e) => {
   if (e.key !== "Enter" && e.key !== " ") return;
+  // 分类项里还嵌着「编辑 / 删除」两个按钮。Enter / Space 在按钮上的默认动作就是"点击"，
+  // 而下面那句 preventDefault() 会把这个默认动作吃掉 —— 不放行按钮的话，
+  // 键盘用户按下去毫无反应（鼠标点击是另一条路径，所以只有键盘会撞上）。
+  if (e.target.closest("button")) return;
   const item = e.target.closest(".cat-item");
   if (!item) return;
   e.preventDefault();
@@ -883,7 +891,10 @@ qs("#form").addEventListener("submit", async (e) => {
     dlg.close();
     // 服务端在 GP 后端下会清掉 keyword 并回一条 warning —— 必须让用户看到，
     // 否则就变成"填了没生效"的静默失败（这正是本次要修掉的那类问题）。
-    if (d.warning) banner(d.warning, "error");
+    // 这是**部分成功**：站点已经存下来了，只是某个字段没按预期生效
+    //（典型：Globalping 后端下"正文关键字"被忽略）。用 warn 级的中性琥珀色，
+    // 用红色 error 会被读成"保存失败"，反而误导。
+    if (d.warning) banner(d.warning, "warn");
     else banner("已保存", "info");
     await loadAll();
   } catch (err) {
@@ -941,11 +952,17 @@ document.addEventListener("click", async (e) => {
       // 这里只调 renderRows 而不是 loadAll：后者会重拉一次全量数据，
       // 让这条刚弹出的结果提示白等一个 RTT。
       if (d.persisted) await renderRows();
+      // 上色按**判定结果**，不是按"传输是否成功"：
+      //   `res.ok` 只说明 fetch 没抛错，而「期望 200、实得 500」这类**判定失败**
+      //   在它看来仍是 true —— 于是文案写着"未记录：状态码 500 不在期望集合"、
+      //   气泡却是绿色，读起来自相矛盾。
+      //   verdict 由 /api/test 按 gpDecide / judge 给出（与自动探测同一口径）。
+      const judged = d.verdict ? d.verdict.ok : d.persisted ? d.persisted.ok : res.ok;
       banner(
         `${site.name} · HTTP ${res.status ?? "—"} · ${res.ttfb ?? "—"}ms · ${where} · ${
           d.roundTripMs ?? "—"
         }ms${mark}`,
-        res.ok ? "info" : "error"
+        judged ? "info" : "error"
       );
     } catch (err) {
       if (!isMasked(err)) banner("测试失败：" + err.message, "error");
@@ -1021,6 +1038,7 @@ const MAGIC_CUSTOM = "__custom__";
  */
 const MAGIC_PRESETS = [
   "CN+datacenter-network",
+  "CN",
   "CN+eyeball-network",
   "east-asia",
   "western-europe",
@@ -1110,9 +1128,16 @@ function fillSettingsForm(s) {
   writeHint(s.cf_hint || "");
   qs("#s-timeout").value = s.timeout_ms || "";
   writeMagic(s.gp_magic || "");
-  // 只可能是 1 / 3 / 5（下面这个下拉就是取值的唯一定义处）→ 直接赋值。
-  // 不像 #f-interval 要动态补项：那个字段用户能填任意分钟数，这个不能
-  qs("#s-limit").value = s.gp_limit;
+  // 回填 gp_limit。取值**只**由这个下拉的 <option> 定义（服务端刻意不做校验），
+  // 但库里仍可能是下拉之外的值 —— 环境变量 GP_LIMIT=7，或早期用数字框存下的值。
+  // 直接赋值会让 selectedIndex = -1（显示成空白），点保存又被洗成默认档，
+  // 等于静默改掉用户配置。所以这里补一项：没有引入任何校验，只保证"所见即所存"。
+  const limitSel = qs("#s-limit");
+  const limitVal = String(s.gp_limit ?? "");
+  if (limitVal && ![...limitSel.options].some((o) => o.value === limitVal)) {
+    limitSel.add(new Option(`${limitVal} · 非预设档`, limitVal));
+  }
+  if (limitVal) limitSel.value = limitVal;
   qs("#s-gptimeout").value = s.gp_timeout_sec || "";
   writeSslMagic(s.gp_ssl_magic || "");
   qs("#s-per-tick").value = s.ssl_per_tick || "";
@@ -1130,6 +1155,31 @@ function fillSettingsForm(s) {
 }
 
 qs("#settings-open").addEventListener("click", openSettings);
+
+/**
+ * 「清除 Token」—— 界面上删除已配置 Globalping Token 的**唯一**入口。
+ *
+ * 服务端的 `clear_globalping_token` 分支一直存在，但前端从来没发送过它，
+ * 于是这个能力等于不存在：输入框留空只会走"保留旧值"（发 `__KEEP__`），
+ * 用户配错 token 之后没有任何办法撤回。破坏性操作，先确认一次。
+ */
+qs("#s-gp-token-clear").addEventListener("click", async () => {
+  if (!confirm("清除已保存的 Globalping Token？\n清除后额度回落到匿名档（250 次/小时）。")) return;
+  const btn = qs("#s-gp-token-clear");
+  btn.disabled = true;
+  try {
+    const r = await post("/settings", { clear_globalping_token: true });
+    if (!r.ok) throw new Error(r.error || "清除失败");
+    qs("#s-gp-token").value = "";
+    qs("#s-gp-token-hint").textContent = "未配置（额度 250 次/小时；配置后 500 次/小时）";
+    banner("Token 已清除", "info");
+    await loadAll();
+  } catch (err) {
+    if (!isMasked(err)) banner("清除失败：" + err.message, "error");
+  } finally {
+    btn.disabled = false;
+  }
+});
 
 // 位置筛选类下拉选到「自定义…」时展开旁边的输入框（#s-magic 与 #s-sslmagic 同样处理）
 for (const [selId, customId] of [

@@ -160,7 +160,7 @@ export async function runAllDirect(items, timeoutMs) {
  * 注意：这里只判断 up / down 两态。第三态 **degraded（降级）** 在 /api/overview 里
  * 结合 SSL 与响应时间实时算出 —— 因为 SSL 是每天一查的数据，不该塞进 5 分钟一次的检查行里。
  * 降级规则：证书无效 或 剩余 ≤ ssl_warn_days 天 或 响应时间 > 超时上限的一半。
- * （阈值本身可在后台「设置 → 证书」改，这里是默认 14 天的口径说明。）
+ * （阈值本身是后台「设置 → 探测」里的「证书降级阈值」，这里是默认 14 天的口径说明。）
  */
 export function judge(site, r) {
   if (!r || r.ok === false) return { ok: false, reason: r?.error || "请求失败" };
@@ -451,29 +451,35 @@ const GP_SSL_FINALIZE_GRACE_MS = 15_000;
  * 低频调用：证书不会 5 分钟变一次，每站点每天查一次足够。
  * 这里用「发起 + 轮询」的同步写法（不像可用性检测走两阶段），
  * 因为它是每日一次的低频任务，多几个子请求无所谓，换来实现更简单。
+ *
+ * ⚠️ `maxSubreq` 是本站点**允许消耗的子请求上限**，由调用方按本轮剩余预算传入。
+ *    同步轮询意味着这段开销是"不可中断地花出去"的 —— 不设上限时，
+ *    2 个站点最坏就能吃掉 28 个子请求，与探测预算叠加后直接顶穿免费层的 50 上限，
+ *    结果是**整轮 cron 报 Too many subrequests、当轮什么都不做**（静默失败）。
+ *    返回值里的 `subreq` 是实际消耗，调用方据此继续扣减。
  */
-export async function gpSslCheck(env, site) {
+export async function gpSslCheck(env, site, { maxSubreq = null } = {}) {
   const token = env && env.GLOBALPING_TOKEN;
   const u = new URL(normalizeUrl(site.url));
   if (u.protocol !== "https:") {
-    return { error: "非 HTTPS 站点，跳过证书检测" };
+    return { error: "非 HTTPS 站点，跳过证书检测", subreq: 0 };
   }
   // ⚠️ 刻意**不用可用性探测的筛选**（GP_MAGIC）：
   // 可用性探测的筛选可能很窄（例如 CN+xian+eyeball-network），窄到没有探针；
   // 而 SSL 检测只需要任意一个能建立 TLS 的探针即可，用窄条件会让证书检测连带失败。
   // 所以这里只认自己的 GP_SSL_MAGIC（后台「SSL 检测筛选」下拉）。
-  //
-  // 原来写的是 `env.GP_SSL_MAGIC || env.GP_MAGIC || defOf("gp_ssl_magic")`，是**误导**：
-  // effectiveEnv 组装时已把空值回落成 def（`s[k] !== "" ? s[k] : env[m.env] || m.def`），
-  // 而 gp_ssl_magic 的 def 非空 → GP_SSL_MAGIC 在真实调用路径上**永不为空**，
-  // 中间那段 `|| env.GP_MAGIC` 是死分支。留着只会让人以为"SSL 会跟随站点筛选"，
-  // 与上面刻意的解耦设计正好相反。`|| defOf(...)` 仅作防御：
-  // 直接调本函数（如测试）时 env 未必被 effectiveEnv 合并过。
   const magic = env.GP_SSL_MAGIC || defOf("gp_ssl_magic");
   const H = {
     "Content-Type": "application/json",
     ...(token ? { Authorization: `Bearer ${token}` } : {}),
   };
+
+  let subreq = 0;
+  // 发起前先结算：一次都花不出去就别发，免得"发起成功但收不了"，反而留下一条空结果。
+  if (maxSubreq !== null && subreq >= maxSubreq) {
+    return { error: "本轮子请求预算不足，证书检测顺延到下一轮", subreq };
+  }
+  subreq++;
 
   const created = await (
     await fetch("https://api.globalping.io/v1/measurements", {
@@ -498,24 +504,31 @@ export async function gpSslCheck(env, site) {
   ).json();
 
   if (!created || !created.id) {
-    return { error: "globalping create failed: " + JSON.stringify(created).slice(0, 150) };
+    return {
+      error: "globalping create failed: " + JSON.stringify(created).slice(0, 150),
+      subreq,
+    };
   }
 
   // 窗口 = 探针侧超时 + 收尾余量 = 25s。不再拍一个凭空的 25s，而是由两个可解释的量推出来：
   // 探针最多跑 GP_SSL_PROBE_TIMEOUT_SEC 秒，之后平台还要收尾，窗口必须比两者之和大，
   // 否则慢测量会在结果就绪前被判超时。
-  // 最坏 14 个子请求/站点（1 次发起 + 13 次轮询，即 25s 按 2s 走满）—— 与改动前逐一相同，
-  // 这里只是把窗口**变成可以被论证的**，并没有把它拉长。健康站点实测第 1 次轮询就 finished。
+  // 健康站点实测第 1 次轮询（2s）就 finished —— 所以"最坏 14 个子请求"只在异常站点上发生。
   const deadline = Date.now() + GP_SSL_PROBE_TIMEOUT_SEC * 1000 + GP_SSL_FINALIZE_GRACE_MS;
   while (Date.now() < deadline) {
     await new Promise((r) => setTimeout(r, 2000));
+    // 每次轮询前结算预算：花完了就停手并如实说明，别把额度偷偷花在预算之外。
+    if (maxSubreq !== null && subreq >= maxSubreq) {
+      return { error: "本轮子请求预算不足，证书检测顺延到下一轮", subreq };
+    }
+    subreq++;
     const d = await (
       await fetch(`https://api.globalping.io/v1/measurements/${created.id}`, { headers: H })
     ).json();
     // 响应体里没有 status（测量 id 失效、API 返回错误体）→ 立刻失败并带上原文，
     // 不要傻等到 deadline：那种情况下再怎么轮询都等不到 finished。
     if (!d || typeof d.status !== "string") {
-      return { error: "globalping 查询失败：" + JSON.stringify(d).slice(0, 120) };
+      return { error: "globalping 查询失败：" + JSON.stringify(d).slice(0, 120), subreq };
     }
     if (d.status !== "finished" && d.status !== "failed") continue;
 
@@ -523,7 +536,7 @@ export async function gpSslCheck(env, site) {
     const rr = r0.result || {};
     const tls = rr.tls;
     if (!tls) {
-      return { error: `无 TLS 信息（探测状态 ${rr.status || d.status}）` };
+      return { error: `无 TLS 信息（探测状态 ${rr.status || d.status}）`, subreq };
     }
     const daysLeft = tls.expiresAt
       ? Math.floor((new Date(tls.expiresAt).getTime() - Date.now()) / 86400000)
@@ -537,12 +550,14 @@ export async function gpSslCheck(env, site) {
       expires_at: tls.expiresAt || null,
       days_left: daysLeft,
       probe: `${r0.probe?.city || "?"}/${r0.probe?.asn || "?"}`,
+      subreq,
     };
   }
   return {
     error: `SSL 检测超时（探针 ${GP_SSL_PROBE_TIMEOUT_SEC}s + 收尾 ${
       GP_SSL_FINALIZE_GRACE_MS / 1000
     }s 内未返回结果）`,
+    subreq,
   };
 }
 

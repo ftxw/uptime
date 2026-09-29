@@ -288,8 +288,8 @@ function renderChart(series, hours) {
       aria-label="响应时间趋势图">
     <defs>
       <linearGradient id="areaGrad" x1="0" y1="0" x2="0" y2="1">
-        <stop offset="0%" stop-color="hsl(160 84% 39%)" stop-opacity="0.30"/>
-        <stop offset="100%" stop-color="hsl(160 84% 39%)" stop-opacity="0"/>
+        <stop offset="0%" style="stop-color:hsl(var(--primary));stop-opacity:.30"/>
+        <stop offset="100%" style="stop-color:hsl(var(--primary));stop-opacity:0"/>
       </linearGradient>
     </defs>
     ${grid}
@@ -485,8 +485,17 @@ function renderFailed(msg) {
 
 const params = new URLSearchParams(location.search);
 const SITE_ID = params.get("id") || "";
-let HOURS = Number(params.get("hours") || 24);
-if (![6, 24, 168, 720].includes(HOURS)) HOURS = 24;
+// 窗口小时数。取值与服务端 `/api/site` 的钳制（1–720）**保持一致**。
+// 早先这里把不在 [6,24,168,720] 里的数字一律折成 24，于是 `?hours=72` 这种
+// 分享出去的链接会被**静默改成 24 小时**展示，而地址栏里仍写着 72 —— 对不上，
+// 且前端不会回写 URL 去纠正。现在原样接受：下面的按钮只负责"跳常用档"，
+// 不是取值白名单（给了非按钮值时四个按钮都不高亮，用户仍能看出这是自定义窗口）。
+let HOURS = (() => {
+  const raw = params.get("hours");
+  const n = Number(raw);
+  if (raw === null || raw.trim() === "" || !Number.isFinite(n)) return 24;
+  return Math.min(720, Math.max(1, Math.trunc(n)));
+})();
 
 // 带版本号：缓存里含站点 URL，而 hide_url 改完就不该再让访客看到 ——
 // 换 key 让旧副本（url 还是明文的那份）一次作废，避免首帧抢先渲染出地址。

@@ -14,19 +14,19 @@
   --background: 220 20% 97%;
   --foreground: 220 20% 10%;
   --card: 0 0% 100%;
-  --card-foreground: 220 20% 10%;
   --popover: 0 0% 100%;
   --secondary: 220 14% 92%;
-  --secondary-foreground: 220 20% 10%;
   --muted: 220 14% 95%;
   --muted-foreground: 220 10% 46%;
   --accent: 220 14% 92%;
   --primary: 160 84% 39%;
   --primary-foreground: 0 0% 100%;
   --destructive: 0 72% 51%;
-  --destructive-foreground: 0 0% 100%;
   --success: 160 84% 39%;
   --warning: 38 92% 50%;
+  /* `--warning` 亮琥珀只适合当**背景/描边**；拿来当浅色底上的文字对比度只有 ~1.8:1，
+     基本读不清。所以文字色单独一个更暗的值（深色主题再换回亮色）。 */
+  --warning-text: 30 90% 34%;
   --border: 220 13% 89%;
   --input: 220 13% 89%;
   --ring: 160 84% 39%;
@@ -49,20 +49,18 @@
   --background: 224 20% 7%;
   --foreground: 210 20% 95%;
   --card: 224 18% 10%;
-  --card-foreground: 210 20% 95%;
   --popover: 224 18% 10%;
   --secondary: 220 14% 16%;
-  --secondary-foreground: 210 20% 95%;
   --muted: 220 14% 14%;
   --muted-foreground: 220 10% 55%;
   --accent: 220 14% 16%;
-  --destructive: 0 72% 51%;
-  --destructive-foreground: 0 0% 100%;
-  --success: 160 84% 39%;
-  --warning: 38 92% 50%;
+  /* 深底上亮琥珀是够用的，只有浅色主题需要那个更暗的文字色 */
+  --warning-text: 38 92% 58%;
   --border: 220 14% 18%;
   --input: 220 14% 18%;
-  --ring: 160 84% 39%;
+  /* ⚠️ 这里只列**真正与 :root 不同**的令牌。相同值的重复声明（曾经的
+     --destructive / --success / --warning / --ring / --*-foreground）
+     看着像"深色主题专门调过这些颜色"，实际没有任何效果，只会误导维护者。 */
 
   --glass-bg: 224 20% 14%;
   --glass-alpha: 0.55;
@@ -198,18 +196,6 @@ a { color: inherit; text-decoration: none; }
 .i-destructive { background: hsl(var(--destructive) / 0.14); color: hsl(var(--destructive)); }
 .i-muted { background: hsl(var(--muted)); color: hsl(var(--muted-foreground)); }
 
-/* ── 分组 ───────────────────────────────────────────────── */
-
-.group-head {
-  display: flex; align-items: center; gap: 8px;
-  margin: 0 0 10px; font-size: 13px; font-weight: 500;
-  color: hsl(var(--muted-foreground));
-}
-.group-head .count {
-  font-size: 12px; font-weight: 400; padding: 1px 7px;
-  border-radius: 999px; background: hsl(var(--muted));
-}
-
 /* ── 监控列表：分组一张卡，组内用分隔线（对齐参考项目的 Card + divide-y 结构）── */
 
 .mgroups { display: flex; flex-direction: column; gap: 16px; }
@@ -239,6 +225,11 @@ a { color: inherit; text-decoration: none; }
 .mrow-main { min-width: 0; flex: 1; }
 .mrow-name { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .mrow-name a {
+  /* min-width:0 不能省：`a` 是 flex item，默认 min-width:auto，
+     在 white-space:nowrap 下它的最小宽度就是整段文字宽度、**压不下去**，
+     于是 overflow:hidden + text-overflow:ellipsis 完全不触发 ——
+     长站点名会被父级的 overflow:hidden 硬切（没有省略号）。 */
+  min-width: 0;
   font-weight: 500;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
   transition: color .12s;
@@ -295,7 +286,7 @@ a { color: inherit; text-decoration: none; }
 .badge::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
 .b-up { background: hsl(var(--success) / 0.14); color: hsl(var(--success)); }
 .b-down { background: hsl(var(--destructive) / 0.14); color: hsl(var(--destructive)); }
-.b-degraded { background: hsl(var(--warning) / 0.18); color: hsl(var(--warning)); }
+.b-degraded { background: hsl(var(--warning) / 0.18); color: hsl(var(--warning-text)); }
 .b-unknown { background: hsl(var(--muted)); color: hsl(var(--muted-foreground)); }
 
 /* ── SSL 徽标 ───────────────────────────────────────────── */
@@ -306,9 +297,10 @@ a { color: inherit; text-decoration: none; }
   font-size: 11px; font-weight: 500; white-space: nowrap;
   background: hsl(var(--muted)); color: hsl(var(--muted-foreground));
 }
-.ssl svg { width: 11px; height: 11px; }
+/* ⚠️ 这里**没有** `.ssl svg` 规则：`.ssl` 的内容由 admin.js 的 sslCell() 生成，
+   是纯文本（`<span class="ssl ssl-ok">…</span>`），从来没有内嵌过 svg。 */
 .ssl-ok { background: hsl(var(--success) / 0.12); color: hsl(var(--success)); }
-.ssl-warn { background: hsl(var(--warning) / 0.18); color: hsl(var(--warning)); }
+.ssl-warn { background: hsl(var(--warning) / 0.18); color: hsl(var(--warning-text)); }
 .ssl-bad { background: hsl(var(--destructive) / 0.14); color: hsl(var(--destructive)); }
 
 /* ── 30 段可用率色条（复刻 uptime-bar.tsx）───────────────── */
@@ -433,15 +425,8 @@ dialog::backdrop { background: hsl(220 30% 10% / 0.45); }
   font-size: 13px; border: 1px solid transparent;
 }
 .alert-info { background: hsl(var(--primary) / 0.1); color: hsl(var(--primary)); border-color: hsl(var(--primary) / 0.25); }
-.alert-warn { background: hsl(var(--warning) / 0.12); color: hsl(var(--warning)); border-color: hsl(var(--warning) / 0.3); }
+.alert-warn { background: hsl(var(--warning) / 0.12); color: hsl(var(--warning-text)); border-color: hsl(var(--warning) / 0.3); }
 .alert-error { background: hsl(var(--destructive) / 0.1); color: hsl(var(--destructive)); border-color: hsl(var(--destructive) / 0.25); }
-
-/* 行内代码：用来在提示里引用环境变量名 / 命令 */
-.alert code {
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: .92em; padding: 1px 5px; border-radius: 4px;
-  background: hsl(var(--muted) / .8);
-}
 
 /* ── 顶部滑出提示（toast）─────────────────────────────────
    形态对齐 HaoNav 的「链接已复制」提示：顶部居中、**宽度随文案自适应**
@@ -804,6 +789,10 @@ dialog::backdrop { background: hsl(220 30% 10% / 0.45); }
   display: flex; flex-direction: column; gap: 7px;
   font-size: 12.5px; line-height: 1.55;
 }
+/* 行内代码：用来在提示里引用环境变量名 / 命令。
+   同一条规则同时服务「后台未配置密码说明页」与「提示气泡」两处，
+   写成 `code` 的通用样式会让文档正文里的行内代码也被套上底色。 */
+.alert code,
 .setup-card code {
   font-family: var(--font-mono); font-size: 12px;
   padding: 1px 5px; border-radius: 5px;

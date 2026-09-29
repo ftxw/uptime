@@ -229,8 +229,12 @@ function verifySchema(dbName) {
 
   fail(
     `「${dbName}」的结构与 schema.sql 不一致：\n  ${problems.join("\n  ")}\n\n` +
-      `本项目不做增量迁移（schema.sql 全部 IF NOT EXISTS，不会给旧表补列）。\n` +
-      `请换一个库名重新建库（D1_NAME=xxx npm run setup），或到控制台删除该库后重跑。`
+      `schema.sql 全部是 IF NOT EXISTS，不会给已存在的旧表补列。\n` +
+      `**首选：手工补列**（数据保留，通常一条 ALTER 就够）：\n` +
+      `  npx wrangler d1 execute ${dbName} --remote --command="ALTER TABLE <表> ADD COLUMN <列> <类型>"\n` +
+      `  补完重跑本脚本即可。新增字段时本地库也要补一次（--local 与 --remote 完全隔离）。\n` +
+      `只有结构差异大到补不动时，才考虑换库名重建 —— ⚠️ 那会**丢掉该库全部数据**：\n` +
+      `  D1_NAME=${dbName}-v2 npm run setup`
   );
 }
 

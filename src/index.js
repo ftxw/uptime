@@ -511,7 +511,12 @@ function normalizeSetting(k, v) {
     case "ssl_warn_days":
       return num(0, 90);
     case "subreq_budget":
-      return num(1, 45);
+      // ⚠️ 上限 35 而不是 45：这是「本轮出网子请求」的额度，而 Workers 免费层
+      //    每次调用硬上限是 50，且 **D1 往返也算子请求**（不在这里计数）。
+      //    一轮 cron 的 D1 往返实测 15~20 次（loadSettings / loadSites / collect /
+      //    dispatch / bumpState / saveSsl / bumpConfigVersion …），所以
+      //    35 + 20 = 55 已经到临界；设到 45 就是"配置合法但一定跑不通"。
+      return num(1, 35);
     case "check_keep_days":
       return num(1, 365);
     case "recent_limit":
@@ -612,10 +617,22 @@ function queryInt(raw, dflt, min, max) {
  * SQL 是参数化的，不存在注入风险；真正要拦的是**会拆掉 URL 结构**的字符
  * （/ ? # % 与控制字符、空白），其余（含中文）放行，避免把已有的中文 id 站点变成无法编辑。
  */
+/**
+ * 站点 ID 的合法字符集：`[A-Za-z0-9._-]`，1–64 字符。
+ *
+ * 为什么是**白名单**而不是黑名单：id 要进 URL（`/monitor?id=<id>`）。
+ * 黑名单（原来的"不含 / ? # % < > \ " 与空白"）看着够用，实则永远漏 ——
+ * 中文、全角符号、`&`、`+`、`=` 在 query 里都会被重新编码，
+ * 于是"后台里看到的 id"与"URL 里的 id"不是同一个字符串，排查时极易误判。
+ * 白名单同时消掉了 `..`/首尾点这类在路径语义上有歧义的值。
+ *
+ * ⚠️ 前端 `#f-id` 的 `pattern` 必须与这里**逐字符一致**：两处不同的字符集就是
+ *    "前端放行、后端 400"（或反过来）的第三种口径，用户只会觉得"这站点存不进去"。
+ */
+const SITE_ID_RE = /^[A-Za-z0-9._-]{1,64}$/;
+
 function validSiteId(id) {
-  if (typeof id !== "string") return false;
-  const s = id.trim();
-  return s.length > 0 && s.length <= 64 && !/[\s/?#%<>\\"]|[\x00-\x1f]/.test(s);
+  return typeof id === "string" && SITE_ID_RE.test(id.trim());
 }
 
 /** 只接受 http/https —— 阻断 javascript: / data: 等 scheme 落到 href 上被执行 */
@@ -956,7 +973,14 @@ async function dueSites(env, sites) {
   });
 }
 
-/** 阶段二：发起本轮测量（Globalping 两阶段 / CF 即时） */
+/**
+ * 阶段二：发起本轮测量（Globalping 两阶段 / CF 即时）
+ *
+ * `subreq_budget` 是**本轮所有出网子请求**的额度。这里只是它的第一个消费者：
+ * 消耗掉的量（返回值 `used`）会从 scheduled 传给 refreshSslStale 的额度里扣除，
+ * 使「探测 + 证书检测」合计不超过额度 —— 分成两份预算必然叠加超限。
+ * 额度不够时**跳过**（记进 `skipped`），而不是硬发出去把整轮 cron 打成失败。
+ */
 async function dispatch(env, sites) {
   const budget = Number((env && env.SUBREQ_BUDGET) || 30);
   const timeoutMs = Number((env && env.TIMEOUT_MS) || 8000);
@@ -1166,13 +1190,22 @@ async function persistManualTest(env, site, { source, probe, result }) {
 /**
  * 刷新过期/缺失的 SSL 信息。
  *
- * ⚠️ 额度与子请求都要小心：gpSslCheck 是「发起 + 轮询」的同步写法，
+ * ⚠️ 额度与**子请求**都要小心：gpSslCheck 是「发起 + 轮询」的同步写法，
  *    单站点最坏 14 个子请求（1 次发起 + 25s 窗口内每 2s 轮询一次），
- *    而 Workers 免费层每次调用上限 50。
- *    所以定时任务里每轮只处理 limit 个（默认 2 个），
- *    10 个站点大约半小时内轮完一遍 —— 对"证书每天查一次"完全够。
+ *    而 Workers 免费层每次调用上限 50 —— 超了是**整轮 cron 报错、当轮什么都不做**，
+ *    不会只丢这一站。
+ *    所以这里做两层限制：
+ *      ① `limit` —— 每轮最多处理几个站点（默认 2）；
+ *      ② `budget` —— 本轮**剩余**的子请求额度，由调用方按「总预算 − 探测已用」传入，
+ *         逐站点按实际消耗扣减（gpSslCheck 返回 `subreq`）。
+ *    只有第 ① 层时，SSL 的开销是"加在探测预算之外"的：30（探测）+ 28（2 站 SSL）
+ *    已经超过 50，站点一多必然炸，而且炸的是整轮。
  */
-async function refreshSslStale(env, sites, { force = false, maxAgeH = 24, limit = 2 } = {}) {
+async function refreshSslStale(
+  env,
+  sites,
+  { force = false, maxAgeH = 24, limit = 2, budget = null } = {}
+) {
   if (!sites.length || limit <= 0) return [];
   const d = await db(env);
 
@@ -1193,13 +1226,23 @@ async function refreshSslStale(env, sites, { force = false, maxAgeH = 24, limit 
   if (!stale.length) return []; // 全都新鲜 → 本次只有上面那 1 次查询，零额度消耗
 
   const done = [];
+  let spent = 0;
   for (const s of stale) {
+    // 预算结算：SSL 检测是同步轮询，花出去就收不回。额度不够就整站顺延到下一轮
+    // （cron 每分钟一轮，顺延的代价只是证书晚几分钟更新），
+    // 而不是让它在探测预算之外继续消耗。标记 `skipped` 以便调用方区分
+    // "写了行"与"跳过了"（只有写了行才需要失效边缘缓存）。
+    if (budget !== null && spent >= budget) {
+      done.push({ site: s.id, skipped: true, error: "本轮子请求预算不足，证书检测顺延" });
+      continue;
+    }
     let r;
     try {
-      r = await gpSslCheck(env, s);
+      r = await gpSslCheck(env, s, { maxSubreq: budget === null ? null : budget - spent });
     } catch (e) {
-      r = { error: String((e && e.message) || e) };
+      r = { error: String((e && e.message) || e), subreq: 0 };
     }
+    spent += Number(r.subreq || 0);
     await saveSsl(env, s.id, r);
     done.push({ site: s.id, ...r });
   }
@@ -2092,7 +2135,7 @@ export default {
             // ── 服务端校验：非法直接拒绝，不要静默写坏数据
             if (!validSiteId(id)) {
               return json(
-                { ok: false, error: `站点 ID 非法（需 1–64 字符，且不含 / ? # % 与空白）：${String(s.id).slice(0, 40)}` },
+                { ok: false, error: `站点 ID 非法（1–64 个字符，只能用字母、数字、点、下划线、连字符）：${String(s.id).slice(0, 40)}` },
                 400,
                 "no-store",
                 pretty
@@ -2196,10 +2239,10 @@ export default {
         return json({ ok: true, collect, dispatch: disp, persisted });
       }
 
-      // 单个后端的即时测试：?api=test&kind=cf|globalping&target=...&hint=|magic=
       // 单个后端的即时测试：?api=test&kind=cf|globalping&[site=<id>|target=...]
       //   带 site=<id> 时，结果会**写入 checks**（这样「测」出来的点会出现在
       //   详情页折线与「最近检查」里）；不带则纯调试、不落库。
+      //   ⚠️ 判定一律走 gpDecide / judge，与自动探测同一条链 —— 见下面 GP 分支的说明。
       if (api === "test") {
         const m2 = requirePost(request, pretty);
         if (m2) return m2;
@@ -2263,12 +2306,35 @@ export default {
           );
         }
         const results = finished?.results || [];
-        // 与 collectGlobalping 同口径：取成功结果里最快的那条为代表
-        const good = results.filter((r) => r.ok);
-        const best = good.sort((a, b) => (a.ttfb || 1e9) - (b.ttfb || 1e9))[0] || results[0];
-        // 多探测点（gp_limit>1）时用逗号连接 —— 落库与标签取自同一个值，
-        // 免得"提示里显示的"和"checks 表里存的"对不上
-        const probeLabel = good.map((r) => r.probe).join(",") || null;
+        // ⚠️ 判定必须走 gpDecide（多数表决），与自动探测**用同一条判定链**。
+        //    早先这里写的是"取成功结果里最快的那条"，于是同一个站点
+        //    「后台点『测』」与「等 cron」会得出不同结论（一个取中位数、一个取最快值），
+        //    手动测试作为排查手段就此失去参考价值 —— 它测的应当就是生产那条链。
+        //    纯调试（不带 site）时没有 expect_codes / keyword 可判，
+        //    用一个宽容的虚拟站点，只要求 HTTP 层跑通。
+        const dec = gpDecide(site || { expect_codes: "", keyword: null }, results);
+        if (dec.void) {
+          // 无结论（平票 / 探针全部是平台自身故障 / 一条结果都没收到）→ 明确报错且**不落库**。
+          // 与 broken 分支同一约定：把"没拿到结论"存成一条记录，等于凭空造出一个
+          // up 或 down，直接污染可用率。
+          const why =
+            dec.why === "tie"
+              ? "探针平票，无法形成多数派"
+              : dec.why === "all-internal"
+                ? "探针全部为 Globalping 平台自身故障"
+                : "未收到任何探针结果";
+          return json(
+            { ok: false, kind: "globalping", source, quota, results, error: `${why}，本次不记录` },
+            502,
+            "no-store",
+            pretty
+          );
+        }
+        const best = dec.pick;
+        // 票型标注规则与 collectGlobalping 一致：全票是常态（不标），分歧才标 `City/ASN (2/3)`
+        const probeLabel = dec.unanimous
+          ? best.probe || null
+          : `${best.probe || "?"} (${dec.okCount}/${dec.total})`;
         let persisted = null;
         if (site) {
           persisted = await persistManualTest(env, site, {
@@ -2281,6 +2347,8 @@ export default {
           ok: true, kind: "globalping", source, quota,
           // 与后台表格 / 前台同一口径的来源标签（见 origin.js）
           origin: formatOrigin(source, probeLabel),
+          // 判定结论与票型 —— 后台据此用"判定成功"而不是"传输成功"上色
+          verdict: { ok: dec.ok, reason: dec.reason ?? null, votes: `${dec.okCount}/${dec.total}` },
           results, persisted,
         });
       }
@@ -2332,17 +2400,21 @@ export default {
     const disp = await dispatch(env, due);
     const persisted = await persistCf(env, due, disp.cfResult);
 
-    // SSL 低频补充：每轮只处理少量站点，避免子请求超限（详见 refreshSslStale 注释）
+    // SSL 低频补充：每轮只处理少量站点，且**与探测共用同一份子请求预算** ——
+    // 两者的开销都计入免费层的 50 次上限，分开计数（探测用 30、SSL 再花 28）必然超。
     let ssl = [];
     let sslWrote = false;
+    const subreqBudget = Number((env && env.SUBREQ_BUDGET) || 30);
     try {
       ssl = await refreshSslStale(env, sites, {
         maxAgeH: 24,
         limit: Number((env && env.SSL_PER_TICK) || 2),
+        budget: Math.max(0, subreqBudget - disp.used),
       });
-      // refreshSslStale 对每个到期站点都会 saveSsl —— 即使探针报错也会落一行
-      // （error 有值、其余字段 null），所以"返回非空"即代表真的写了 SSL 行。
-      sslWrote = ssl.length > 0;
+      // refreshSslStale 对每个**真正处理了**的站点都会 saveSsl —— 即使探针报错也会落一行
+      // （error 有值、其余字段 null）。被预算跳过的站点标记了 skipped，什么都没写，
+      // 因此不能拿 ssl.length 当"写了行"的证据（那会白白多失效一次缓存）。
+      sslWrote = ssl.some((x) => !x.skipped);
     } catch (e) {
       // 整个函数抛错 = 一行都没写，sslWrote 保持 false（只用于日志展示）
       ssl = [{ error: String((e && e.message) || e) }];
@@ -2384,7 +2456,11 @@ export default {
         dispatched: disp.started,
         gpStarted: disp.gpStarted,
         skipped: disp.skipped,
-        subrequestsUsed: disp.used,
+        // 子请求：探测已用 / 本轮总预算。SSL 检测的花销从**同一份**预算里扣，
+        // 所以 `subreqUsed > subreqBudget` 永远不该出现；`subreqUsed` 贴着预算
+        // 也说明站点偏多，该考虑调低 `ssl_per_tick`（或调小 `subreq_budget`）。
+        subreqUsed: disp.used,
+        subreqBudget,
         persisted: persisted.persisted,
         alerts: persisted.alerts.length + collected.alerts.length,
         ssl,

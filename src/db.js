@@ -133,24 +133,25 @@ export async function insertChecks(env, rows) {
 }
 
 /**
- * state 的 upsert 语句 —— 一次写完「计数」与「最后一次结果快照」。
+ * state 的 upsert 语句 —— 一次写完「计数 / 告警标志」与「最后一次结果快照」。
  *
- * last_ok_ts 用 COALESCE(excluded.last_ok_ts, state.last_ok_ts) 是刻意的：
- * 传入 NULL 表示"本次没有成功"，应当**保留上一次成功的时间**而不是清空。
+ * ⚠️ `alerted` 由 bumpState 算好后传入，**不能**写成 `CASE WHEN fail >= ? THEN ...`：
+ *    阈值只在 bumpState 里比较，SQL 里再比一次会让"阈值改了怎么办"出现第二套答案。
  *
- * ⚠️ 这里**不再写 `last_alert_ts`**。它曾经由 sendAlerts 逐条 UPDATE 写入，但：
- *    ① 没有任何读者（不在任何响应里）；
- *    ② 每条告警一次 D1 往返，而告警发生在时间敏感路径上；
- *    ③ 每次检查都会被 STATE_UPSERT 重新置回 null，写了等于白写。
- *    列本身保留在 schema 里（避免动表结构），只是不再有人读写它。
+ * 早先这里还有 `last_ok_ts` 与 `last_alert_ts` 两列，都已从表里删掉：
+ *   last_ok_ts     —— 语义是"上一次成功的时刻"，但全项目没有任何读者；
+ *                     `last_ts`（最后一次检查）+ `last_ok`（是否成功）已能表达展示所需的一切。
+ *   last_alert_ts  —— 由 sendAlerts 逐条 UPDATE 写入，但 ① 无读者 ② 每条一次 D1 往返
+ *                     ③ 每次 STATE_UPSERT 都会把它置回 null，写了等于白写。
+ *                     它想表达的"是否已告警"现在由 `alerted` 正确承担。
  */
 const STATE_UPSERT =
-  `INSERT INTO state (site, consecutive_fail, last_ok_ts, last_checked_ts,
+  `INSERT INTO state (site, consecutive_fail, alerted, last_checked_ts,
      last_ok, last_status, last_ttfb_ms, last_total_ms, last_source, last_probe, last_ts, last_error)
    VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
    ON CONFLICT(site) DO UPDATE SET
      consecutive_fail = excluded.consecutive_fail,
-     last_ok_ts       = COALESCE(excluded.last_ok_ts, state.last_ok_ts),
+     alerted          = excluded.alerted,
      last_checked_ts  = excluded.last_checked_ts,
      last_ok          = excluded.last_ok,
      last_status      = excluded.last_status,
@@ -176,7 +177,7 @@ function lastResultFields(info, nowIso) {
 }
 
 /**
- * 更新连续失败计数 + 最后一次结果快照，返回需要告警的站点。
+ * 更新连续失败计数 / 告警标志 + 最后一次结果快照，返回需要告警的站点。
  *
  * ⚠️ 必须**批量**：若每站点各发一次 SELECT + UPSERT，一轮 N 个站点就是 2N 次 D1 往返，
  *    而 Workers 上每次往返都是真实的网络开销 —— 这是定时任务整体耗时的主要来源。
@@ -192,11 +193,11 @@ export async function bumpState(env, perSite) {
 
   const ph = ids.map(() => "?").join(",");
   const cur = await d
-    .prepare(`SELECT site, consecutive_fail FROM state WHERE site IN (${ph})`)
+    .prepare(`SELECT site, consecutive_fail, alerted FROM state WHERE site IN (${ph})`)
     .bind(...ids)
     .all();
-  const prevFail = {};
-  for (const r of cur.results || []) prevFail[r.site] = Number(r.consecutive_fail || 0);
+  const prev = {};
+  for (const r of cur.results || []) prev[r.site] = r;
 
   const nowIso = new Date().toISOString();
   const toAlert = [];
@@ -204,20 +205,30 @@ export async function bumpState(env, perSite) {
 
   for (const site of ids) {
     const info = perSite[site];
-    const before = prevFail[site] || 0;
+    const p = prev[site] || {};
+    const before = Number(p.consecutive_fail || 0);
+    const wasAlerted = Number(p.alerted || 0) === 1;
     const fail = info.ok ? 0 : before + 1;
+
+    // 告警判定只问两件事：「到阈值了吗」+「这次故障告过警了吗」——
+    // 与阈值本身怎么变无关，所以不再出现"调小阈值就永远不告警"的漏洞。
+    //   故障：达到阈值且尚未告过 → 发一次 down，置位
+    //   恢复：本次成功且此前告过 → 发一次 recovered，清位
+    // （旧写法是 `fail === info.threshold`，只在**跨越那一刻**成立。）
+    let alerted = wasAlerted;
+    if (info.ok) {
+      alerted = 0;
+      if (wasAlerted) toAlert.push({ site, kind: "recovered", failCount: before, info });
+    } else if (fail >= info.threshold) {
+      if (!wasAlerted) toAlert.push({ site, kind: "down", failCount: fail, info });
+      alerted = 1;
+    }
 
     batch.push(
       d
         .prepare(STATE_UPSERT)
-        .bind(site, fail, info.ok ? nowIso : null, nowIso, ...lastResultFields(info, nowIso))
+        .bind(site, fail, alerted, nowIso, ...lastResultFields(info, nowIso))
     );
-
-    if (info.ok && before >= info.threshold) {
-      toAlert.push({ site, kind: "recovered", failCount: before, info });
-    } else if (!info.ok && fail === info.threshold) {
-      toAlert.push({ site, kind: "down", failCount: fail, info });
-    }
   }
 
   await d.batch(batch);

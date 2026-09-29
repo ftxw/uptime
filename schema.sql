@@ -64,12 +64,18 @@ CREATE INDEX IF NOT EXISTS idx_checks_ok_ts_site ON checks(ok, ts, site);
 --    last_checked_ts  调度用：上次「自动探测」完成的时刻，决定下次是否到期
 --    last_ts          展示用：最后一次结果的时刻（**含**后台手动「测」）
 --    手动测试刻意不更新前者（否则会把自动调度往后推），但会更新后者以便图表能看到。
+--
+-- `alerted` 是「本次连续故障是否已经发过 down 告警」的标志位，存在的理由：
+--   告警判定若写成「consecutive_fail === fail_threshold」，就只在**跨越那一刻**成立 ——
+--   一旦用户在故障持续期间把阈值调小（5 → 2），已有的计数早已越过新阈值，
+--   从此**永远不会再触发**，站点会一直故障而不通知。
+--   用独立标志位表达「已告过警」后，判定变成「达到阈值 且 尚未告警」，
+--   与阈值怎么变都无关；恢复条件也同样只看这个标志，不再依赖计数回落到某个值。
 CREATE TABLE IF NOT EXISTS state (
   site             TEXT PRIMARY KEY,
   consecutive_fail INTEGER NOT NULL DEFAULT 0,
+  alerted          INTEGER NOT NULL DEFAULT 0,  -- 1 = 已就本次连续故障发过 down 告警
   last_checked_ts  TEXT,
-  last_ok_ts       TEXT,
-  last_alert_ts    TEXT,
   -- ↓ 最后一次探测结果的快照（含手动测试）
   last_ok          INTEGER,  -- 1 正常 / 0 故障
   last_status      INTEGER,
