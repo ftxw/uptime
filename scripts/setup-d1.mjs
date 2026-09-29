@@ -152,6 +152,12 @@ function colsFromBody(body) {
   return body
     .split(/\r?\n/)
     .map((l) => l.trim())
+    // ⚠️ `ALTER TABLE ... ADD COLUMN` 追加的列会**和上一行末尾挤在同一行**，
+    //    形如 `, hide_url INTEGER NOT NULL DEFAULT 0`（逗号在行首、前面没有换行）——
+    //    不剥掉这个前导逗号，`.split(/\s+/)[0]` 拿到的是 ","，
+    //    整列会被下面的 `/^\w+$/` 当成非法标识符丢掉 → **自检误报「缺列」**，
+    //    而报错文案又引导人去重建数据库（那是要丢数据的）。实测踩到过。
+    .map((l) => l.replace(/^,+\s*/, ""))
     .filter((l) => l && !l.startsWith("--"))
     .map((l) => l.split(/\s+/)[0])
     .filter((c) => /^\w+$/.test(c) && !/^(PRIMARY|UNIQUE|FOREIGN|CHECK|CONSTRAINT)$/i.test(c));
