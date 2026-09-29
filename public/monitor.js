@@ -12,6 +12,7 @@ const ICONS = {
   globe: '<circle cx="12" cy="12" r="10"/><path d="M2 12h20M12 2a15 15 0 0 1 0 20 15 15 0 0 1 0-20"/>',
   clock: '<circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/>',
   external: '<path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><path d="M15 3h6v6M10 14 21 3"/>',
+  lock: '<rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>',
   gauge: '<path d="M12 14 4 6"/><circle cx="12" cy="14" r="8"/>',
 };
 
@@ -86,11 +87,18 @@ function renderHead(d) {
       : "");
 
   const last = d.last || {};
+  // 隐藏地址的站点：副标题里不出现 URL（服务端本就不下发），
+  // 右上角「打开站点」整个撤掉 —— 访客既看不到地址，也没有入口点过去。
+  const hidden = s.hide_url === true;
   qs("#subtitle").textContent =
-    `${s.group_name} · ${s.url} · 最近检查 ${relTime(last.ts)}` +
+    `${s.group_name}${hidden ? "" : ` · ${s.url}`} · 最近检查 ${relTime(last.ts)}` +
     (d.consecutive_fail ? ` · 连续失败 ${d.consecutive_fail} 次` : "");
 
-  qs("#visit").href = s.url;
+  const visit = qs("#visit");
+  visit.hidden = hidden;
+  // 隐藏态连 href 都不留：留着 href 就等于把地址摆在源码和右键菜单里
+  if (hidden) visit.removeAttribute("href");
+  else visit.href = s.url;
   document.title = `${s.name} · 站点详情`;
 }
 
@@ -108,13 +116,19 @@ function renderCards(d) {
     sslTip = `${ssl.issuer || "?"} · ${ssl.protocol || "?"} · 到期 ${(ssl.expires_at || "").slice(0, 10)}`;
   }
 
-  const cards = [
-    {
-      ic: "globe",
-      k: "URL 地址",
-      v: `<a href="${escapeHtml(s.url)}" target="_blank" rel="noopener noreferrer"
+  // URL 卡片：隐藏地址时留在原位（保持 4 卡布局不变）但只写「已隐藏」——
+  // 不给链接、不给 title，任何地方都不再出现地址。
+  const urlCard = s.hide_url
+    ? { ic: "lock", k: "URL 地址", v: `<span class="muted">已隐藏</span>` }
+    : {
+        ic: "globe",
+        k: "URL 地址",
+        v: `<a href="${escapeHtml(s.url)}" target="_blank" rel="noopener noreferrer"
              title="${escapeHtml(s.url)}">${escapeHtml(s.url)}${svg("external")}</a>`,
-    },
+      };
+
+  const cards = [
+    urlCard,
     { ic: "clock", k: "检查间隔", v: fmtInterval(s.interval_min) },
     {
       ic: "shield",
@@ -137,7 +151,7 @@ function renderCards(d) {
         <span class="ic ${c.icCls || ""}">${svg(c.ic)}</span>
         <div style="min-width:0">
           <p class="k">${c.k}</p>
-          <p class="v"${c.ic === "globe" ? "" : ' style="font-family:var(--font-mono)"'}>${c.v}</p>
+          <p class="v"${c.ic === "globe" || c.ic === "lock" ? "" : ' style="font-family:var(--font-mono)"'}>${c.v}</p>
         </div>
       </div>`
     )
@@ -474,7 +488,10 @@ const SITE_ID = params.get("id") || "";
 let HOURS = Number(params.get("hours") || 24);
 if (![6, 24, 168, 720].includes(HOURS)) HOURS = 24;
 
-const cacheKey = () => `uptime:site:${SITE_ID}:${HOURS}`;
+// 带版本号：缓存里含站点 URL，而 hide_url 改完就不该再让访客看到 ——
+// 换 key 让旧副本（url 还是明文的那份）一次作废，避免首帧抢先渲染出地址。
+// 与 app.js 的 CACHE_KEY 同一处理，改缓存字段语义时两处一起 bump。
+const cacheKey = () => `uptime:site:v2:${SITE_ID}:${HOURS}`;
 
 function render(d) {
   if (!d || !d.ok) return;

@@ -136,6 +136,18 @@
         <span class="hint">路径会被保留 —— 填 /health 就检测 /health，不会退化成首页</span>
       </div>
 
+      <!-- 紧挨「监控地址」：它是那个字段的显示属性，不该让用户去别处找 -->
+      <div class="grid-2">
+        <div class="field">
+          <label for="f-hideurl">URL 显示</label>
+          <select id="f-hideurl">
+            <option value="0">显示 URL（默认）</option>
+            <option value="1">隐藏 URL</option>
+          </select>
+          <span class="hint">隐藏后服务端不再下发地址，前台也不渲染跳转按钮</span>
+        </div>
+      </div>
+
       <div class="grid-2">
         <div class="field">
           <label for="f-group">分类</label>

@@ -576,6 +576,17 @@ function clampInt(v, min, max, dflt) {
 }
 
 /**
+ * 0/1 开关列（默认关）：接受布尔、数字 1、字符串 "1"，其余一律 0。
+ *
+ * 不用 `clampInt` 代替：那个函数的默认值语义是"取不到就给 dflt"，
+ * 而这里"取到任何非法值"和"压根没传"都应当收敛到 0（关），不能因为
+ * 传了个 "yes" 就悄悄保持原值 —— 这是隐私开关，宁可关掉。
+ */
+function boolInt(v) {
+  return v === true || v === 1 || v === "1" ? 1 : 0;
+}
+
+/**
  * 解析 URL 查询参数里的整数（**不能用 clampInt 代替**）。
  *
  * ⚠️ 两个真实踩过的坑：
@@ -1427,7 +1438,7 @@ export default {
             d
               .prepare(
                 `SELECT s.id, s.name, s.url, s.group_name, s.probe_kind,
-                        s.fail_threshold, s.expect_codes, s.keyword, s.interval_min,
+                        s.fail_threshold, s.expect_codes, s.keyword, s.hide_url, s.interval_min,
                         COALESCE(st.consecutive_fail, 0) AS consecutive_fail,
                         st.last_ok, st.last_status, st.last_ttfb_ms AS last_ttfb,
                         st.last_source, st.last_probe, st.last_ts, st.last_error,
@@ -1525,7 +1536,13 @@ export default {
             (groups[g] = groups[g] || []).push({
               id: s.id,
               name: s.name,
-              url: s.url,
+              // ⚠️ 隐藏地址的站点**根本不下发 url**，而不是"下发了但前端不显示"：
+              //    这是公开接口（无需登录，还被边缘缓存 30s），
+              //    只在前端藏起来等于没藏 —— 右键查看源码、或直接请求 /api/overview
+              //    就能拿到地址。hide_url 单独回传，让前端能区分
+              //    「站点刻意隐藏地址」与「url 意外为空（那是 bug）」。
+              url: s.hide_url ? null : s.url,
+              hide_url: !!s.hide_url,
               probe_kind: resolveKind(s),
               cf_hint: cfHintOf(env),
               state,
@@ -1647,7 +1664,7 @@ export default {
                    )
                    SELECT s.id, s.name, s.url, s.group_name, s.probe_kind,
                           s.fail_threshold, s.interval_min, s.expect_codes, s.keyword,
-                          s.enabled, s.sort,
+                          s.hide_url, s.enabled, s.sort,
                           COALESCE(st.consecutive_fail, 0) AS consecutive_fail,
                           st.last_checked_ts,
                           l.ok AS last_ok, l.status AS last_status, l.ttfb_ms AS last_ttfb,
@@ -1844,7 +1861,9 @@ export default {
               site: {
                 id: meta.id,
                 name: meta.name,
-                url: meta.url,
+                // 与 /api/overview 同一口径：隐藏地址的站点不下发 url（见那边的注释）
+                url: meta.hide_url ? null : meta.url,
+                hide_url: !!meta.hide_url,
                 group_name: meta.group_name || UNGROUPED,
                 probe_kind: resolveKind(meta),
                 cf_hint: cfHintOf(env),
@@ -2051,12 +2070,13 @@ export default {
           const warnings = [];
           let upserted = 0; // 真实写入条数 —— 不是 list.length（空 id/url 的会被跳过）
           const stmt = d.prepare(
-            `INSERT INTO sites (id,name,url,group_name,expect_codes,keyword,probe_kind,fail_threshold,interval_min,enabled,sort,created_ts)
-                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+            `INSERT INTO sites (id,name,url,group_name,expect_codes,keyword,hide_url,probe_kind,fail_threshold,interval_min,enabled,sort,created_ts)
+                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
                  ON CONFLICT(id) DO UPDATE SET
                    name=excluded.name, url=excluded.url,
                    group_name=excluded.group_name,
                    expect_codes=excluded.expect_codes, keyword=excluded.keyword,
+                   hide_url=excluded.hide_url,
                    probe_kind=excluded.probe_kind, fail_threshold=excluded.fail_threshold,
                    interval_min=excluded.interval_min, enabled=excluded.enabled,
                    sort=excluded.sort`
@@ -2128,6 +2148,7 @@ export default {
                 String(s.group_name ?? UNGROUPED).trim().slice(0, 64) || UNGROUPED,
                 String(s.expect_codes ?? "").trim(),
                 keyword,
+                boolInt(s.hide_url),
                 kind,
                 // 阈值 1–20、间隔 1–1440 分钟（≤1 天）：防负数/超大值污染调度
                 clampInt(s.fail_threshold, 1, 20, 3),

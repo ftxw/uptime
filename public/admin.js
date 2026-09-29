@@ -429,7 +429,11 @@ async function renderRows() {
         s.enabled ? "" : ' <span class="muted" style="font-size:11px">已暂停</span>'
       }</div>
         </td>
-        <td><span class="mono" style="font-size:12px">${escapeHtml(s.url)}</span></td>
+        <td><span class="mono" style="font-size:12px">${escapeHtml(s.url)}</span>${
+        // 后台看到的永远是明文地址（否则没法编辑），所以额外标一个「已隐藏」——
+        // 不然前台不显示时，运营会以为是前端出了 bug
+        s.hide_url ? ' <span class="muted" style="font-size:11px">已隐藏</span>' : ""
+      }</td>
         <td class="muted" style="font-size:12px"${
           s.origin ? ` title="${escapeHtml(s.origin)}"` : ""
         }>${backendLabel(s)}<div style="font-size:11px;opacity:.65">${fmtInterval(
@@ -816,6 +820,9 @@ function openForm(site) {
   qs("#f-id").readOnly = Boolean(site);
   qs("#f-name").value = site?.name || "";
   qs("#f-url").value = site?.url || "";
+  // 无值回落「显示」—— 与数据库默认值 0 一致。select 只有两个选项，
+  // 这里直接赋值即可（不存在"选项里没有的值"这种情况，见 #s-limit 的教训）。
+  qs("#f-hideurl").value = site?.hide_url ? "1" : "0";
   // 新建时预填当前筛选的分类，少点一次
   fillGroupSelect(
     site?.group_name || (FILTER && FILTER !== UNGROUPED ? FILTER : UNGROUPED)
@@ -856,6 +863,7 @@ qs("#form").addEventListener("submit", async (e) => {
     probe_kind: qs("#f-kind").value || null,
     expect_codes: qs("#f-codes").value.trim(),
     keyword: qs("#f-keyword").value.trim() || null,
+    hide_url: qs("#f-hideurl").value === "1",
     fail_threshold: Number(qs("#f-threshold").value || 3),
     interval_min: Number(qs("#f-interval").value || 5),
     enabled: qs("#f-enabled").value === "1",

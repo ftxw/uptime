@@ -3,7 +3,10 @@
    布局对齐 ftxw/uptime-monitor：分组一张卡 + 组内分隔行 + 「响应时间 / SSL / 可用率」三列。 */
 
 const API = "/api/overview";
-const CACHE_KEY = "uptime:overview";
+// ⚠️ 带版本号：这份缓存里含**站点 URL**，而 hide_url 是"改完就不该再让访客看到"的东西 ——
+//    老缓存（改之前抓的、url 还是明文）会在首帧抢先渲染出来。换 key 让旧副本一次作废，
+//    代价只是老访客多等一次网络（新访客不受影响）。改缓存里的字段语义时就 bump 这里。
+const CACHE_KEY = "uptime:overview:v2";
 
 /* 分类：GROUPS 为接口返回的全部分组，FILTER 为空表示"全部" */
 let GROUPS = [];
@@ -19,6 +22,7 @@ const ICONS = {
   clock: '<circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/>',
   refresh: '<path d="M21 12a9 9 0 1 1-3-6.7L21 8"/><path d="M21 3v5h-5"/>',
   external: '<path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><path d="M15 3h6v6M10 14 21 3"/>',
+  lock: '<rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>',
 };
 
 const svg = (n, cls = "") =>
@@ -117,6 +121,17 @@ function monitorRow(m) {
     ? ` <span class="muted" title="降级原因">· ${escapeHtml(m.degrade_reason)}</span>`
     : "";
 
+  // 隐藏地址的站点：URL 位置显示「已隐藏」，**跳转按钮整个不渲染** ——
+  // 服务端已经不下发 url，前端这里连入口都不给，访客没有任何办法摸到地址。
+  const hidden = m.hide_url === true;
+  const urlCell = hidden
+    ? `<span class="ico muted" title="该站点未公开地址">${svg("lock")}已隐藏</span>`
+    : `<span class="ico url">${svg("globe")}${escapeHtml(m.url)}</span>`;
+  const openBtn = hidden
+    ? ""
+    : `<a class="btn btn-sm" href="${escapeHtml(m.url)}" target="_blank" rel="noopener noreferrer"
+         title="打开链接">${svg("external")}</a>`;
+
   return `<div class="mrow">
     <div class="mrow-main">
       <div class="mrow-name">
@@ -125,7 +140,7 @@ function monitorRow(m) {
         <span class="muted" style="font-size:12px">${escapeHtml(m.id)}</span>
       </div>
       <div class="mrow-sub">
-        <span class="ico url">${svg("globe")}${escapeHtml(m.url)}</span>
+        ${urlCell}
         <span class="ico">${svg("clock")}${fmtInterval(m.interval_min)}</span>
         <span class="ico muted" title="${escapeHtml(m.last_source || "")}">${escapeHtml(m.origin || "")}</span>
         <span class="muted">${relTime(m.last_ts)}${degrade}</span>
@@ -149,10 +164,7 @@ function monitorRow(m) {
       </div>
     </div>
 
-    <div class="mrow-act">
-      <a class="btn btn-sm" href="${escapeHtml(m.url)}" target="_blank" rel="noopener noreferrer"
-         title="打开链接">${svg("external")}</a>
-    </div>
+    <div class="mrow-act">${openBtn}</div>
   </div>`;
 }
 

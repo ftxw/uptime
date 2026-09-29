@@ -14,6 +14,10 @@ CREATE TABLE IF NOT EXISTS sites (
   -- 一个站点只解析出唯一后端，站点级放两份位置必然只有一份生效，是死配置。
   expect_codes   TEXT,                -- 逗号分隔，如 "200,301"；空 = 接受 2xx/3xx
   keyword        TEXT,                -- 正文关键字校验（防"200 但内容是错误页"）
+  -- 1 = 前台不公开地址：/api/overview 与 /api/site **不下发 url**（不是前端不渲染），
+  -- 也不渲染「打开站点」按钮 —— 访客既看不到地址，也没有入口可以点过去。
+  -- 适用于 API 端点、内部系统这类"能公开可用率、但地址不想外传"的站点。
+  hide_url       INTEGER NOT NULL DEFAULT 0,
   fail_threshold INTEGER NOT NULL DEFAULT 3,  -- 连续失败多少次才判故障/告警
   interval_min   INTEGER NOT NULL DEFAULT 5,  -- 期望检查间隔（分钟）
   enabled        INTEGER NOT NULL DEFAULT 1,
