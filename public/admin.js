@@ -1009,7 +1009,9 @@ function fillSettingsForm(s) {
   writeHint(s.cf_hint || "");
   qs("#s-timeout").value = s.timeout_ms || "";
   writeMagic(s.gp_magic || "");
-  qs("#s-limit").value = s.gp_limit || "";
+  // 只可能是 1 / 3 / 5（下面这个下拉就是取值的唯一定义处）→ 直接赋值。
+  // 不像 #f-interval 要动态补项：那个字段用户能填任意分钟数，这个不能
+  qs("#s-limit").value = s.gp_limit;
   qs("#s-gptimeout").value = s.gp_timeout_sec || "";
   writeSslMagic(s.gp_ssl_magic || "");
   qs("#s-per-tick").value = s.ssl_per_tick || "";

@@ -319,8 +319,17 @@
       <div class="grid-3">
         <div class="field">
           <label for="s-limit">GP 每次探测点数</label>
-          <input id="s-limit" type="number" min="1" max="10" step="2" placeholder="3">
-          <span class="hint">≥3 才启用多数表决；额度按点数计费</span>
+          <!-- 这里是「每次探测点数」取值的**唯一定义处**：选定即生效，代码侧不做换算或钳制。
+               以后要加档位（如 7、9）只在这里加一行 option 即可，别处无需改动。
+               为什么只给奇数：偶数点的多数表决会平票（2 点时 1:1），而平票的处理是
+               整次作废、不写检查记录 —— 等于一半次数白花额度还拿不到数据。
+               1 = 退回单点采样（旧行为，链路抖动会 100% 记成站点故障）。 -->
+          <select id="s-limit">
+            <option value="1">1 · 单点采样（不表决）</option>
+            <option value="3" selected>3 · 多数表决（推荐）</option>
+            <option value="5">5 · 多数表决（更稳）</option>
+          </select>
+          <span class="hint">额度按点数计费：选几就扣几次</span>
         </div>
         <div class="field">
           <label for="s-gptimeout">GP 探针超时（秒）</label>

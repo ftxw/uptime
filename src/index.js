@@ -522,10 +522,6 @@ function normalizeSetting(k, v) {
       return num(1, 100);
     case "utc_offset_min":
       return num(-720, 840);
-    case "gp_limit":
-      // 1 等于「单点采样」—— 链路抖动会被 100% 记成站点故障。
-      // 上限 10 是额度护栏：Globalping 的额度**按探针数计费**（实测 X-Request-Cost === limit）
-      return num(1, 10);
     case "gp_timeout_sec":
       // Globalping API 的硬约束：整数秒，5–30。越界它直接 422，
       // 所以在写入侧就拦下，别把非法值存进 meta 再让 cron 每轮去撞

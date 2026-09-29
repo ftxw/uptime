@@ -20,7 +20,7 @@ export const SETTING_META = {
   cf_hint:          { env: "CF_HINT",          def: "apac" },                  // CF 默认区域组
   gp_magic:         { env: "GP_MAGIC",         def: "CN+datacenter-network" }, // Globalping 位置筛选
   gp_ssl_magic:     { env: "GP_SSL_MAGIC",     def: "CN+datacenter-network" }, // SSL 检测的筛选（与站点解耦）
-  gp_limit:         { env: "GP_LIMIT",         def: "3" },                     // 每次测量的探测点数（**额度按此计费**）
+  gp_limit:         { env: "GP_LIMIT",         def: "3" },                     // 每次测量的探测点数（**额度按此计费**；三档 1/3/5，见后台下拉）
   gp_timeout_sec:   { env: "GP_TIMEOUT_SEC",   def: "15" },                    // 探针端墙钟超时（整数秒，5–30）
   gp_ip_version:    { env: "GP_IP_VERSION",    def: "4" },
   timeout_ms:       { env: "TIMEOUT_MS",       def: "8000" },
