@@ -362,13 +362,12 @@ a { color: inherit; text-decoration: none; }
 .btn-sm { height: 30px; padding: 0 10px; font-size: 12px; }
 .btn svg { width: 15px; height: 15px; }
 
-/* 后台：添加分类按钮用绿色边框（仅描边、不填充，区别于旁边的绿色实心「添加站点」） */
-#cat-add-toggle { border-color: hsl(var(--primary)); }
-
-/* 后台浅色模式下：「测 / 编辑」按钮默认玻璃边框是白色，在浅底上几乎不可见，
-   改成像素可见的灰色边框（深色模式维持原有白色边框，不覆盖）。 */
-html:not(.dark) .btn[data-act="proxy-test"],
-html:not(.dark) .btn[data-act="edit"] { border-color: hsl(var(--border)); }
+/* 浅色模式下：默认 .btn 的玻璃白边在浅底上几乎不可见，统一改成可见的「深色」描边。
+   彩色按钮（.btn-primary 绿色实心 / .btn-danger）保留自身边框，不覆盖。
+   深色模式维持原有白色玻璃边框，不动。 */
+html:not(.dark) .btn:not(.btn-primary):not(.btn-danger) {
+  border-color: hsl(var(--muted-foreground));
+}
 
 /* ── 表单 ───────────────────────────────────────────────── */
 
