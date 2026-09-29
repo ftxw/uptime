@@ -2222,13 +2222,29 @@ export default {
 
     // SSL 低频补充：每轮只处理少量站点，避免子请求超限（详见 refreshSslStale 注释）
     let ssl = [];
+    let sslWrote = false;
     try {
       ssl = await refreshSslStale(env, sites, {
         maxAgeH: 24,
         limit: Number((env && env.SSL_PER_TICK) || 2),
       });
+      // refreshSslStale 对每个到期站点都会 saveSsl —— 即使探针报错也会落一行
+      // （error 有值、其余字段 null），所以"返回非空"即代表真的写了 SSL 行。
+      sslWrote = ssl.length > 0;
     } catch (e) {
+      // 整个函数抛错 = 一行都没写，sslWrote 保持 false（只用于日志展示）
       ssl = [{ error: String((e && e.message) || e) }];
+    }
+
+    // ⚠️ 只要这一轮写了任何会进 overview / site 响应的数据（检查记录、SSL），
+    //    就必须递增 config_version —— 这两个接口的边缘缓存 key 里带着它。
+    //    手动「测」是 POST，会被 fetch 路径里"任何写操作都 bump"那条规则覆盖，
+    //    所以后台点一下、前台刷新立刻能看到新记录；而 cron 是**独立入口**，
+    //    不走那条规则 —— 于是自动探测写进去的记录被边缘缓存挡着，
+    //    前台**手动刷新也看不到**（最长到 TTL 30s），表现就是
+    //    "点测能看到、自动探测不及时"。这里补上，让两条路径对缓存的口径一致。
+    if (persisted.persisted > 0 || collected.collected > 0 || sslWrote) {
+      await bumpConfigVersion(env);
     }
 
     // 每天一次的过期明细清理（保留 N 天）。
