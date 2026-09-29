@@ -255,7 +255,7 @@ a { color: inherit; text-decoration: none; }
 .mrow-sub .url:hover { color: hsl(var(--primary)); text-decoration: underline; }
 
 .mrow-bar { width: 100%; }
-@media (min-width: 960px) { .mrow-bar { width: 12rem; flex-shrink: 0; } }
+@media (min-width: 960px) { .mrow-bar { width: 12rem; flex-shrink: 0; margin-right: 8px; } }
 
 /* 三列指标（响应时间 / SSL / 可用率）用网格 + 空格隔开（无竖线），
    对齐参考项目的「分列」布局；移动端同样三列并排。 */
@@ -266,7 +266,7 @@ a { color: inherit; text-decoration: none; }
   font-size: 13px;
   flex-shrink: 0;
 }
-@media (min-width: 960px) { .mrow-metrics { min-width: 13rem; } }
+@media (min-width: 960px) { .mrow-metrics { min-width: 15rem; } }
 
 .metric {
   display: flex; flex-direction: column; align-items: flex-start; min-width: 0;
