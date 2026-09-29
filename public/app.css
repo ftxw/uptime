@@ -725,6 +725,13 @@ dialog::backdrop { background: hsl(220 30% 10% / 0.45); }
 .cat-item.dragging { opacity: .4; }
 /* 插入位置指示：用对比色而非主色 —— 选中的项本身就是主色实心块，主色线在上面看不见 */
 .cat-item.drag-over { box-shadow: inset 0 2px 0 hsl(var(--foreground) / 0.5); }
+/* 站点表格拖拽：与左侧分类同一套反馈（抓手光标 / 拖起时变淡 / 目标行高亮）。
+   高亮刷在 td 上 —— 直接在 tr 上设 background 会被 td 自己的背景盖住。
+   用 ID 选择器压过 .table tr:hover td 的悬浮底色（/0.9 也比 /0.45 明显）。 */
+#rows tr[draggable="true"] { cursor: grab; }
+#rows tr[draggable="true"]:active { cursor: grabbing; }
+#rows tr.row-dragging { opacity: .4; }
+#rows tr.row-drag-over > td { background: hsl(var(--accent) / 0.9); }
 .cat-item:hover { background: hsl(var(--accent) / 0.8); }
 .cat-item.on {
   background: hsl(var(--primary)); color: hsl(var(--primary-foreground)); font-weight: 500;

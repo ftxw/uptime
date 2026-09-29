@@ -21,6 +21,7 @@ let SITES = [];   // 顺序 = 前台渲染顺序（分类 → sort → id）
 let CATS = [];
 let FILTER = "";  // "" = 全部
 let DRAG_CAT = null;     // 正在拖拽的分类名
+let DRAG_SITE = null;    // 正在拖拽的站点 id
 let AUTHED = false;
 let SETTINGS = null;     // /admin 一次性带回的设置，用于设置面板预填
 let SSL_MAP = {};        // /admin 一次性带回的证书结果（site → 记录）
@@ -380,9 +381,13 @@ async function renderRows() {
 
   const list = visibleSites();
   const title = FILTER || "全部";
+  // 拖拽排序只在**具体分类**视图下开放：「全部」视图里列表混着多个分类，而 sort
+  // 只在同一分类内比较 —— 跨分类拖拽改了 sort 也不改变它所在的位置，表现为
+  // 「拖了没反应」。与其让用户对着一个静默失败的手势猜，不如先要求选个分类。
+  const canDrag = Boolean(FILTER);
   qs("#sites-title").innerHTML = `站点 <span class="muted" style="font-weight:400;font-size:12px">${escapeHtml(
     title
-  )} · ${list.length} 个</span>`;
+  )} · ${list.length} 个 · ${canDrag ? "可拖拽排序" : "选择分类后可拖拽排序"}</span>`;
 
   if (!list.length) {
     qs("#rows").innerHTML = `<tr><td colspan="6" class="empty">${
@@ -416,7 +421,9 @@ async function renderRows() {
       const stTitle = s.degrade_reason ? ` title="${escapeHtml(s.degrade_reason)}"` : "";
       const g = groupOf(s);
 
-      return `<tr data-id="${escapeHtml(s.id)}" data-group="${escapeHtml(g)}">
+      return `<tr data-id="${escapeHtml(s.id)}" data-group="${escapeHtml(g)}"${
+        canDrag ? ' draggable="true"' : ""
+      }>
         <td>
           <div style="font-weight:500">${escapeHtml(s.name)}${
         s.enabled ? "" : ' <span class="muted" style="font-size:11px">已暂停</span>'
@@ -715,6 +722,87 @@ catList.addEventListener("drop", (e) => {
   saveCatOrder(names);
 });
 
+/* ── 站点列表拖拽排序 ───────────────────────────────────── */
+
+const rowsEl = qs("#rows");
+
+function clearRowDragUi() {
+  rowsEl
+    .querySelectorAll(".row-dragging, .row-drag-over")
+    .forEach((el) => el.classList.remove("row-dragging", "row-drag-over"));
+}
+
+/**
+ * 提交站点新顺序。
+ *
+ * 与分类的 reorder 同一约定（只传顺序、不传对象），但传的是**当前视图下全部站点的
+ * id**：sort 只在同一分类内比较，整组重排不会与别的分类撞位；反过来只传被移动的
+ * 那一条，服务端也无从判断它该落在哪里（一条记录谈不上"顺序"）。
+ *
+ * 成功与失败都重新拉取 —— 失败时列表会回到服务端的真实顺序，不会停在一个
+ * "本地看着已经变了、一刷新又变回去"的假状态。
+ */
+async function saveSiteOrder(ids) {
+  try {
+    const d = await post("/sites", { action: "reorder", ids });
+    if (!d.ok) throw new Error(d.error || "排序失败");
+    banner("站点顺序已保存", "info");
+  } catch (err) {
+    if (!isMasked(err)) banner("站点排序失败：" + err.message, "error");
+  }
+  await loadAll().catch(() => {});
+}
+
+rowsEl.addEventListener("dragstart", (e) => {
+  const tr = e.target.closest('tr[draggable="true"]');
+  if (!tr) return;
+  DRAG_SITE = tr.dataset.id;
+  try {
+    e.dataTransfer.effectAllowed = "move";
+    e.dataTransfer.setData("text/plain", DRAG_SITE);
+  } catch (err) {}
+  tr.classList.add("row-dragging");
+});
+
+rowsEl.addEventListener("dragend", () => {
+  DRAG_SITE = null;
+  clearRowDragUi();
+});
+
+rowsEl.addEventListener("dragover", (e) => {
+  if (!DRAG_SITE) return;
+  const tr = e.target.closest('tr[draggable="true"]');
+  if (!tr) return;
+  e.preventDefault(); // 不 preventDefault 就没有后续的 drop 事件
+  e.dataTransfer.dropEffect = "move";
+  rowsEl
+    .querySelectorAll(".row-drag-over")
+    .forEach((el) => el.classList.remove("row-drag-over"));
+  tr.classList.add("row-drag-over");
+});
+
+rowsEl.addEventListener("drop", (e) => {
+  if (!DRAG_SITE) return;
+  const tr = e.target.closest('tr[draggable="true"]');
+  if (!tr) return;
+  e.preventDefault();
+
+  const src = DRAG_SITE;
+  const target = tr.dataset.id;
+  DRAG_SITE = null;
+  clearRowDragUi();
+  if (!target || target === src) return;
+
+  // 取的是**拖拽前的 DOM 顺序**（拖动过程中没有实时挪行），所以先摘掉源、再插到目标位
+  const ids = [...rowsEl.querySelectorAll("tr[data-id]")].map((el) => el.dataset.id);
+  const si = ids.indexOf(src);
+  if (si < 0) return;
+  ids.splice(si, 1);
+  const di = ids.indexOf(target);
+  ids.splice(di < 0 ? ids.length : di, 0, src);
+  saveSiteOrder(ids);
+});
+
 /* ── 站点表单 ──────────────────────────────────────────── */
 
 const dlg = qs("#dlg");
@@ -738,7 +826,6 @@ function openForm(site) {
   qs("#f-keyword").value = site?.keyword || "";
   qs("#f-threshold").value = site?.fail_threshold ?? 3;
   fillIntervalSelect(site?.interval_min ?? 5);
-  qs("#f-sort").value = site?.sort ?? 0;
   qs("#f-enabled").value = String(site?.enabled ?? 1);
   syncKindUi();
   qs("#dlg-err").hidden = true;
@@ -771,10 +858,16 @@ qs("#form").addEventListener("submit", async (e) => {
     keyword: qs("#f-keyword").value.trim() || null,
     fail_threshold: Number(qs("#f-threshold").value || 3),
     interval_min: Number(qs("#f-interval").value || 5),
-    sort: Number(qs("#f-sort").value || 0),
     enabled: qs("#f-enabled").value === "1",
   };
   if (!body.id || !body.url) return;
+
+  // 「显示顺序」已从表单移除，排序统一由列表拖拽负责（见 saveSiteOrder）。
+  // 但**编辑时必须把原值带回去**：服务端把"没给 sort"的站点当作新建、排到队尾 ——
+  // 否则每改一次名字，站点就会被悄悄挪到列表最后。
+  // 新建时**刻意不带**这个字段，交给服务端分配队尾位置。
+  const prev = siteById(body.id);
+  if (prev) body.sort = Number(prev.sort) || 0;
 
   try {
     const d = await post("/sites", body);

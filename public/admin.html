@@ -169,7 +169,9 @@
         </div>
       </div>
 
-      <div class="grid-3">
+      <!-- 没有「显示顺序」输入框：顺序由列表拖拽决定（左侧选好分类后即可拖）。
+           手填数字既要求用户心算、又和分类内的相对位置两套口径并存（见 admin.js 的 saveSiteOrder） -->
+      <div class="grid-2">
         <div class="field">
           <label for="f-interval">监测间隔</label>
           <select id="f-interval">
@@ -180,11 +182,6 @@
             <option value="60">1 小时</option>
           </select>
           <span class="hint">每隔多久探测一次</span>
-        </div>
-        <div class="field">
-          <label for="f-sort">显示顺序（小的在前）</label>
-          <input id="f-sort" type="number" value="0">
-          <span class="hint">列表里拖拽排序会自动覆盖这里</span>
         </div>
         <div class="field">
           <label for="f-enabled">启用</label>

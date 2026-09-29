@@ -2021,6 +2021,32 @@ export default {
               pretty
             );
           }
+          // 站点排序：`{ action: "reorder", ids: [...] }` —— 只传顺序，按下标写 sort。
+          // 与分类的 reorder 同一约定（那边传 names），区别是这里用 UPDATE 而非 upsert：
+          // 分类是「目录」，可以凭空建出来；站点必须先存在 —— 传错的 id 应当静默无效，
+          // 绝不能因为一次排序请求凭空造出一个只有 id 的空站点。
+          if (!Array.isArray(parsed) && parsed.action === "reorder") {
+            const ids = Array.isArray(parsed.ids) ? parsed.ids.map(String).filter(Boolean) : [];
+            if (!ids.length) {
+              return json({ ok: false, error: "ids 不能为空" }, 400, "no-store", pretty);
+            }
+            // 上限只是挡畸形请求（正常一次就几十条，且 D1 batch 也不能无限长）
+            if (ids.length > 500) {
+              return json(
+                { ok: false, error: "一次最多重排 500 个站点" },
+                400,
+                "no-store",
+                pretty
+              );
+            }
+            await d.batch(
+              ids.map((id, i) =>
+                d.prepare("UPDATE sites SET sort = ? WHERE id = ?").bind(i + 1, id)
+              )
+            );
+            return json({ ok: true, action: "reorder", order: ids }, 200, "no-store", pretty);
+          }
+
           const list = Array.isArray(parsed) ? parsed : [parsed];
           const warnings = [];
           let upserted = 0; // 真实写入条数 —— 不是 list.length（空 id/url 的会被跳过）
@@ -2035,6 +2061,10 @@ export default {
                    interval_min=excluded.interval_min, enabled=excluded.enabled,
                    sort=excluded.sort`
           );
+          // 未指定 sort 的（= 新建站点）排到队尾：取一次全局最大值，循环里递增分配。
+          // 一次查询而不是每条查一次 —— Free 计划子请求预算很紧，且 D1 也计入。
+          // 编辑已有站点时前端会把原 sort 带回来，所以走不到这里，位置不会被打乱。
+          let nextSort = null;
           for (const s of list) {
             if (!s.id || !s.url) continue;
             const id = String(s.id).trim();
@@ -2075,6 +2105,21 @@ export default {
             if (kind === "globalping" && s.keyword) {
               warnings.push(`站点 ${id}：Globalping 后端不返回正文，「正文关键字」已忽略`);
             }
+            // 顺序要留给拖拽来定：没给 sort 就分配队尾，给了（编辑回带）就用原值。
+            // sort 只在**同一分类内**比较，所以全局取最大值不影响别的分类。
+            let sortValue;
+            if (s.sort === undefined || s.sort === null || s.sort === "") {
+              if (nextSort === null) {
+                const mx = await d
+                  .prepare("SELECT COALESCE(MAX(sort), 0) AS m FROM sites")
+                  .first();
+                nextSort = Number(mx?.m || 0);
+              }
+              sortValue = ++nextSort;
+            } else {
+              sortValue = clampInt(s.sort, 0, 100000, 0);
+            }
+
             await stmt
               .bind(
                 id,
@@ -2088,7 +2133,7 @@ export default {
                 clampInt(s.fail_threshold, 1, 20, 3),
                 clampInt(s.interval_min, 1, 1440, 5),
                 s.enabled === false ? 0 : 1,
-                clampInt(s.sort, 0, 100000, 0),
+                sortValue,
                 new Date().toISOString()
               )
               .run();
