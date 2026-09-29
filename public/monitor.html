@@ -60,9 +60,6 @@
     </div>
   </div>
 
-  <!-- 站点基本信息 4 卡（内容由下方骨架脚本先占位） -->
-  <section class="dcards" id="dcards"></section>
-
   <!-- 当前窗口的关键指标 -->
   <section class="stats" id="kpis"></section>
 
@@ -129,8 +126,9 @@
 <!-- 骨架屏：数据到达前先把每张卡的位置和尺寸搭出来（文字换成灰条）。
      不占位的实测代价：数据到达的那一帧整页高度 937px → 2168px、CLS 0.74，
      下面的卡片被整体顶下去一次 —— 观感就是"卡片被内容拖了一下"。
-     占位用的是与真实卡片**同一套 class**（.dcard/.stat/.lst-row/.inc-row + .sk 灰条），
+     占位用的是与真实卡片**同一套 class**（.stat/.lst-row/.inc-row + .sk 灰条），
      行高由真实字号决定，因此是逐像素等高的占位，不是"估个大概"。
+     （原先这里还给 4 张「站点信息卡」占位；那 4 张卡已整块移除，占位随之删掉。）
      同步脚本，跑在 defer 的 monitor.js 之前、也跑在首帧之前：
      有 localStorage 缓存时 monitor.js 会在首帧前就填好真实数据，骨架根本不会露脸。 -->
 <script>
@@ -150,25 +148,8 @@
     return '<div style="min-width:0">' + lines + "</div>";
   };
 
-  // 4 张站点信息卡：文案长度取真实数据的量级，灰条宽度才像成品
-  put("dcards", [
-    ["URL 地址", "http://example.com/health", ""],
-    ["检查间隔", "5 分钟", "font-family:var(--font-mono)"],
-    ["SSL 证书", "未检测", "font-family:var(--font-mono)"],
-    ["当前响应时间", "155 ms", "font-family:var(--font-mono)"]
-  ].map(function (c) {
-    return card(
-      '<span class="ic"></span>' +
-        body(
-          '<p class="k">' + sk(c[0]) + '</p><p class="v"' +
-            (c[2] ? ' style="' + c[2] + '"' : "") + ">" + sk(c[1]) + "</p>"
-        ),
-      "dcard"
-    );
-  }).join(""));
-
-  // 5 张指标卡
-  put("kpis", ["可用率", "平均响应", "P95 响应", "最快 / 最慢", "失败次数"].map(function (label) {
+  // 5 张指标卡（顺序与 renderKpis 完全一致：可用率 / SSL 证书 / 检查间隔 / 平均响应 / 失败次数）
+  put("kpis", ["可用率", "SSL 证书", "检查间隔", "平均响应", "失败次数"].map(function (label) {
     return card(
       '<div class="stat-icon i-muted"></div>' +
         body('<p class="stat-label">' + sk(label) + '</p><p class="stat-value">' + sk("000 ms") + "</p>"),

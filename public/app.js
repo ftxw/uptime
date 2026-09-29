@@ -120,16 +120,15 @@ function monitorRow(m) {
     ? ` <span class="muted" title="降级原因">· ${escapeHtml(m.degrade_reason)}</span>`
     : "";
 
-  // 隐藏地址的站点：URL 位置显示「已隐藏」，**跳转按钮整个不渲染** ——
-  // 服务端已经不下发 url，前端这里连入口都不给，访客没有任何办法摸到地址。
+  // URL 直接做成可点链接，放在「间隔时间」前面，点它就打开站点本身 ——
+  // 独立成列的「打开链接」按钮连同它占的那一列网格都撤掉了，目标地址即入口。
+  // 隐藏地址的站点：服务端本就不下发 url，这里**整段不渲染**（连「已隐藏」也不写）——
+  // 既然访客点不到、也没有入口，再挂一行说明只是噪音。
   const hidden = m.hide_url === true;
   const urlCell = hidden
-    ? `<span class="ico muted" title="该站点未公开地址">${svg("lock")}已隐藏</span>`
-    : `<span class="ico url">${svg("globe")}${escapeHtml(m.url)}</span>`;
-  const openBtn = hidden
     ? ""
-    : `<a class="btn btn-sm" href="${escapeHtml(m.url)}" target="_blank" rel="noopener noreferrer"
-         title="打开链接">${svg("external")}</a>`;
+    : `<a class="ico url" href="${escapeHtml(m.url)}" target="_blank" rel="noopener noreferrer"
+         title="打开 ${escapeHtml(m.url)}">${svg("globe")}${escapeHtml(m.url)}</a>`;
 
   return `<div class="mrow">
     <div class="mrow-main">
@@ -162,8 +161,6 @@ function monitorRow(m) {
         <span class="v">${m.uptime_24h != null ? m.uptime_24h.toFixed(1) + "%" : "--"}</span>
       </div>
     </div>
-
-    <div class="mrow-act">${openBtn}</div>
   </div>`;
 }
 

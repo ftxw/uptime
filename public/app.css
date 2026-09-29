@@ -241,7 +241,16 @@ a { color: inherit; text-decoration: none; }
 }
 .mrow-sub .ico { display: inline-flex; align-items: center; gap: 4px; min-width: 0; }
 .mrow-sub .ico svg { width: 12px; height: 12px; flex-shrink: 0; }
-.mrow-sub .url { font-family: var(--font-mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* URL 是可点链接（点开站点本身）。全局 `a` 是 color:inherit + 无下划线，
+   所以这里必须显式给出"可点"的信号：悬停变色 + 下划线。 */
+.mrow-sub .url {
+  max-width: 100%;
+  font-family: var(--font-mono);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  transition: color .12s;
+}
+.mrow-sub .url:hover { color: hsl(var(--primary)); text-decoration: underline; }
 
 .mrow-bar { width: 100%; }
 @media (min-width: 960px) { .mrow-bar { width: 12rem; flex-shrink: 0; } }
@@ -264,8 +273,6 @@ a { color: inherit; text-decoration: none; }
 .shield-ok { color: hsl(var(--success)); }
 .shield-bad { color: hsl(var(--destructive)); }
 .shield-unknown { color: hsl(var(--muted-foreground)); }
-
-.mrow-act { display: flex; align-items: center; gap: 4px; flex-shrink: 0; }
 
 /* 大号空状态 */
 .empty-lg {
@@ -548,27 +555,6 @@ dialog::backdrop { background: hsl(220 30% 10% / 0.45); }
 .back:hover { color: hsl(var(--foreground)); }
 .back svg { width: 14px; height: 14px; }
 
-/* 站点信息 4 卡 */
-.dcards { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
-@media (min-width: 900px) { .dcards { grid-template-columns: repeat(4, minmax(0, 1fr)); } }
-
-.dcard { display: flex; align-items: center; gap: 12px; padding: 14px 16px; min-width: 0; }
-.dcard .ic {
-  display: inline-flex; align-items: center; justify-content: center;
-  width: 36px; height: 36px; flex-shrink: 0;
-  border-radius: calc(var(--radius) - 2px);
-  background: hsl(var(--muted)); color: hsl(var(--muted-foreground));
-}
-.dcard .ic svg { width: 18px; height: 18px; }
-.dcard .k { margin: 0; font-size: 11px; color: hsl(var(--muted-foreground)); }
-.dcard .v {
-  margin: 0; font-size: 14px; font-weight: 500;
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-}
-.dcard .v a { display: inline-flex; align-items: center; gap: 4px; }
-.dcard .v a:hover { color: hsl(var(--primary)); }
-.dcard .v svg { width: 12px; height: 12px; flex-shrink: 0; }
-
 /* 区块头（卡片内的标题行） */
 .sec-head {
   display: flex; align-items: center; justify-content: space-between;
@@ -680,7 +666,6 @@ dialog::backdrop { background: hsl(220 30% 10% / 0.45); }
 
 @media (max-width: 760px) {
   .lst-row { flex-wrap: wrap; gap: 8px; }
-  .dcards { grid-template-columns: 1fr; }
 }
 
 /* ══════════════════════════════════════════════════════════════

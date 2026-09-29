@@ -5,15 +5,10 @@
 
 const ICONS = {
   activity: '<path d="M22 12h-4l-3 9L9 3l-3 9H2"/>',
-  up: '<path d="M12 19V5M5 12l7-7 7 7"/>',
-  down: '<path d="M12 5v14M19 12l-7 7-7-7"/>',
   shield: '<path d="M20 13c0 5-3.5 7.5-7.7 8.9a1 1 0 0 1-.6 0C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.2-2.7a1 1 0 0 1 1.6 0C14.5 3.8 17 5 19 5a1 1 0 0 1 1 1z"/>',
   alert: '<path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/><path d="M12 9v4M12 17h.01"/>',
-  globe: '<circle cx="12" cy="12" r="10"/><path d="M2 12h20M12 2a15 15 0 0 1 0 20 15 15 0 0 1 0-20"/>',
   clock: '<circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/>',
-  external: '<path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><path d="M15 3h6v6M10 14 21 3"/>',
   lock: '<rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>',
-  gauge: '<path d="M12 14 4 6"/><circle cx="12" cy="14" r="8"/>',
 };
 
 const svg = (n, cls = "") =>
@@ -102,72 +97,31 @@ function renderHead(d) {
   document.title = `${s.name} · 站点详情`;
 }
 
-function renderCards(d) {
-  const s = d.site;
-  const ssl = d.ssl;
-  const last = d.last || {};
-
-  let sslVal = "未检测";
-  let sslIconCls = "i-muted";
-  let sslTip = "证书尚未检测";
-  if (ssl && !ssl.error) {
-    sslVal = ssl.days_remaining != null ? `${ssl.days_remaining} 天` : ssl.valid ? "有效" : "无效";
-    sslIconCls = ssl.valid ? "i-success" : "i-destructive";
-    sslTip = `${ssl.issuer || "?"} · ${ssl.protocol || "?"} · 到期 ${(ssl.expires_at || "").slice(0, 10)}`;
-  }
-
-  // URL 卡片：隐藏地址时留在原位（保持 4 卡布局不变）但只写「已隐藏」——
-  // 不给链接、不给 title，任何地方都不再出现地址。
-  const urlCard = s.hide_url
-    ? { ic: "lock", k: "URL 地址", v: `<span class="muted">已隐藏</span>` }
-    : {
-        ic: "globe",
-        k: "URL 地址",
-        v: `<a href="${escapeHtml(s.url)}" target="_blank" rel="noopener noreferrer"
-             title="${escapeHtml(s.url)}">${escapeHtml(s.url)}${svg("external")}</a>`,
-      };
-
-  const cards = [
-    urlCard,
-    { ic: "clock", k: "检查间隔", v: fmtInterval(s.interval_min) },
-    {
-      ic: "shield",
-      icCls: sslIconCls,
-      k: "SSL 证书",
-      v: sslVal,
-      tip: sslTip,
-    },
-    {
-      ic: "gauge",
-      k: "当前响应时间",
-      v: last.ttfb != null ? `${last.ttfb} ms` : "--",
-      tip: last.error ? `最近错误：${last.error}` : "",
-    },
-  ];
-
-  qs("#dcards").innerHTML = cards
-    .map(
-      (c) => `<div class="card glass dcard"${c.tip ? ` title="${escapeHtml(c.tip)}"` : ""}>
-        <span class="ic ${c.icCls || ""}">${svg(c.ic)}</span>
-        <div style="min-width:0">
-          <p class="k">${c.k}</p>
-          <p class="v"${c.ic === "globe" || c.ic === "lock" ? "" : ' style="font-family:var(--font-mono)"'}>${c.v}</p>
-        </div>
-      </div>`
-    )
-    .join("");
-}
 
 function renderKpis(d) {
   const w = d.window || {};
   const l = d.latency || {};
+  const s = d.site || {};
+  const ssl = d.ssl;
   const fails = w.failures || 0;
+
+  // SSL 卡片：未检测 / 有效天数 / 无效 —— 与首页、后台的三态判定同口径
+  // （valid 由 stateOf 算好，已含「过期」与「未授权」两种情况）。
+  let sslVal = "未检测";
+  let sslCls = "i-muted";
+  if (ssl && !ssl.error) {
+    sslVal = ssl.days_remaining != null ? `${ssl.days_remaining} 天` : ssl.valid ? "有效" : "无效";
+    sslCls = ssl.valid ? "i-success" : "i-destructive";
+  } else if (ssl && ssl.error) {
+    sslVal = "检测失败";
+    sslCls = "i-destructive";
+  }
 
   const cards = [
     { label: "可用率", value: w.uptime != null ? w.uptime.toFixed(1) + "%" : "--", icon: "shield", cls: "i-primary" },
+    { label: "SSL 证书", value: sslVal, icon: "lock", cls: sslCls },
+    { label: "检查间隔", value: fmtInterval(s.interval_min), icon: "clock", cls: "i-muted" },
     { label: "平均响应", value: ms(l.avg), icon: "activity", cls: "i-success" },
-    { label: "P95 响应", value: ms(l.p95), icon: "up", cls: "i-primary" },
-    { label: "最快 / 最慢", value: `${l.min ?? "--"} / ${l.max ?? "--"} ms`, icon: "down", cls: "i-muted" },
     {
       label: "失败次数",
       value: fails,
@@ -510,7 +464,6 @@ function render(d) {
     if (b) b.textContent = d.settings.site_title;
   }
   renderHead(d);
-  renderCards(d);
   renderKpis(d);
   renderChart(d.series, HOURS);
   renderBars(d.bars);
