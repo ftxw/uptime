@@ -289,8 +289,9 @@
           <span class="hint">对所有用 cf 后端的站点生效</span>
         </div>
         <div class="field">
-          <label for="s-timeout">探测超时（ms）</label>
+          <label for="s-timeout">CF 探测超时（ms）</label>
           <input id="s-timeout" type="number" min="1000" max="30000" step="500" placeholder="8000">
+          <span class="hint">只对 cf 后端生效；也用作「响应偏慢」基线的一半</span>
         </div>
       </div>
 
@@ -313,10 +314,18 @@
           <input id="s-magic-custom" placeholder="CN+changsha+4837" hidden aria-label="自定义位置筛选">
           <span class="hint">对所有用 globalping 后端的站点生效</span>
         </div>
+      </div>
+
+      <div class="grid-3">
         <div class="field">
-          <label for="s-limit">每次探测点数</label>
-          <input id="s-limit" type="number" min="1" max="3" placeholder="1">
-          <span class="hint">每个探针算 1 次额度</span>
+          <label for="s-limit">GP 每次探测点数</label>
+          <input id="s-limit" type="number" min="1" max="10" step="2" placeholder="3">
+          <span class="hint">≥3 才启用多数表决；额度按点数计费</span>
+        </div>
+        <div class="field">
+          <label for="s-gptimeout">GP 探针超时（秒）</label>
+          <input id="s-gptimeout" type="number" min="5" max="30" step="1" placeholder="15">
+          <span class="hint">整数秒 5–30，只对 globalping 后端生效</span>
         </div>
       </div>
 

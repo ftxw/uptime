@@ -1010,6 +1010,7 @@ function fillSettingsForm(s) {
   qs("#s-timeout").value = s.timeout_ms || "";
   writeMagic(s.gp_magic || "");
   qs("#s-limit").value = s.gp_limit || "";
+  qs("#s-gptimeout").value = s.gp_timeout_sec || "";
   writeSslMagic(s.gp_ssl_magic || "");
   qs("#s-per-tick").value = s.ssl_per_tick || "";
   qs("#s-warn").value = s.ssl_warn_days || "";
@@ -1067,6 +1068,7 @@ qs("#setform").addEventListener("submit", async (e) => {
     timeout_ms: qs("#s-timeout").value.trim(),
     gp_magic: readMagic(),
     gp_limit: qs("#s-limit").value.trim(),
+    gp_timeout_sec: qs("#s-gptimeout").value.trim(),
     gp_ssl_magic: readSslMagic(),
     ssl_per_tick: qs("#s-per-tick").value.trim(),
     ssl_warn_days: qs("#s-warn").value.trim(),

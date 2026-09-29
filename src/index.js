@@ -30,6 +30,7 @@ import {
   zhError,
   gpCreate,
   gpCollect,
+  gpDecide,
   gpSslCheck,
 } from "./probe.js";
 import {
@@ -318,10 +319,32 @@ function originOf(site, lastSource, lastProbe, env) {
 }
 
 /**
+ * 「响应偏慢」判定的基线（毫秒）—— 按**产生这个 ttfb 的那次探测**用哪个后端来选。
+ *
+ * 为什么不能所有站点共用一个数：两条链路的时间尺度根本不同。
+ *   CF 直连走 Cloudflare 机房出口，超时 8s；
+ *   Globalping 走中国大陆家宽/云机房出口，跨境链路天然慢好几倍。
+ * 拿 8s 的一半（4s）去卡 GP 站点，会把大量健康站点长期标成"偏慢"——
+ * 实测国内到 Cloudflare 的静态资源 TTFB 基线就有 0.93s，而 GP 家宽跨境只会更高。
+ *
+ * 为什么用 last_source 而不是站点配的 probe_kind：降级路径会让一次 GP 站点
+ * 实际跑在 CF 边缘上（source = `cf:fallback-*`）。那次 ttfb 是 CF 出口测出来的，
+ * 就该用 CF 的尺子 —— **数据是谁产生的，就用谁的基线**。
+ */
+function slowBaseMs(env, lastSource) {
+  const s = String(lastSource || "");
+  if (s.startsWith("gp:")) {
+    const sec = Number((env && env.GP_TIMEOUT_SEC) || defOf("gp_timeout_sec"));
+    return (Number.isFinite(sec) && sec > 0 ? sec : 15) * 1000;
+  }
+  return Number((env && env.TIMEOUT_MS) || 8000);
+}
+
+/**
  * 三态判定：up / down / degraded（overview 与 site 详情共用，避免两处逻辑漂移）
  *
  * 降级规则对齐参考项目 ftxw/uptime-monitor 的 lib/checker.ts：
- *   证书无效 或 剩余 ≤ SSL_WARN_DAYS（默认 14）天 或 响应时间 > 超时上限的一半
+ *   证书无效 或 剩余 ≤ SSL_WARN_DAYS（默认 14）天 或 响应时间 > 该后端超时上限的一半
  * 注意 down 不参与降级判定 —— 故障比降级更严重。
  */
 function stateOf(s, env) {
@@ -346,7 +369,7 @@ function stateOf(s, env) {
   let degrade_reason = null;
 
   if (state !== "down") {
-    const timeoutMs = Number((env && env.TIMEOUT_MS) || 8000);
+    const baseMs = slowBaseMs(env, s.last_source);
     const warnDays = Number(env.SSL_WARN_DAYS);
     if (ssl && !ssl.error && ssl.valid === false) {
       state = "degraded";
@@ -359,7 +382,7 @@ function stateOf(s, env) {
     ) {
       state = "degraded";
       degrade_reason = `证书剩余 ${ssl.days_remaining} 天`;
-    } else if ((s.last_ttfb || 0) > timeoutMs * 0.5) {
+    } else if ((s.last_ttfb || 0) > baseMs * 0.5) {
       state = "degraded";
       degrade_reason = `响应偏慢 ${s.last_ttfb}ms`;
     }
@@ -500,7 +523,13 @@ function normalizeSetting(k, v) {
     case "utc_offset_min":
       return num(-720, 840);
     case "gp_limit":
+      // 1 等于「单点采样」—— 链路抖动会被 100% 记成站点故障。
+      // 上限 10 是额度护栏：Globalping 的额度**按探针数计费**（实测 X-Request-Cost === limit）
       return num(1, 10);
+    case "gp_timeout_sec":
+      // Globalping API 的硬约束：整数秒，5–30。越界它直接 422，
+      // 所以在写入侧就拦下，别把非法值存进 meta 再让 cron 每轮去撞
+      return num(5, 30);
     case "gp_ip_version":
       return v === "6" ? "6" : SETTING_META.gp_ip_version.def;
     case "default_theme":
@@ -808,28 +837,49 @@ async function collectGlobalping(env) {
 
     const site = byId[p.site];
     if (!site) continue;
-    const good = out.results.filter((r) => r.ok);
-    const probeLabel = good.map((r) => r.probe).join(",") || null;
-    const best =
-      good.sort((a, b) => (a.ttfb || 1e9) - (b.ttfb || 1e9))[0] || out.results[0];
-    const v = judge(site, best);
+
+    // ── 多探针多数表决（口径与理由见 probe.js 的 gpDecide）──
+    const dec = gpDecide(site, out.results);
+    if (dec.void) {
+      // 平票 / 全是平台自身故障 / 一条结果都没有 —— 三种情况都**没有结论**。
+      // 与上面的 broken 分支同一条约定：不写检查记录。
+      // 记成失败会凭空造出一次"故障"、把 consecutive_fail 推上去、攒够阈值就发告警；
+      // 而事实是我们对站点当时的可达性一无所知。pending 已删，下一轮会自动重发。
+      dropped.push({
+        site: p.site,
+        id: p.measurement_id,
+        why: "vote-" + dec.why,
+        ok_votes: dec.okCount ?? null,
+        total: dec.total ?? null,
+        platform_faults: dec.platformFaults ?? 0,
+      });
+      continue;
+    }
+
+    const r0 = dec.pick;
+    // 票型只在**非全票**时标注：全票是常态，标了只是噪音（会让每行都变长）；
+    // 而一旦出现分歧（如 2/3），这个数字恰是判断"链路在抖 vs 站点真挂了"的关键线索。
+    const probeLabel = dec.unanimous
+      ? r0.probe || null
+      : `${r0.probe || "?"} (${dec.okCount}/${dec.total})`;
+
     rows.push({
       ts: new Date().toISOString(),
       site: p.site,
       source: p.source,
       probe: probeLabel,
-      ok: v.ok,
-      status: best?.status ?? 0,
-      ttfb_ms: best?.ttfb ?? 0,
-      total_ms: best?.total ?? 0,
-      error: v.reason,
+      ok: dec.ok,
+      status: r0.status ?? 0,
+      ttfb_ms: r0.ttfb ?? 0,
+      total_ms: r0.total ?? 0,
+      error: dec.reason,
     });
     perSite[p.site] = {
-      ok: v.ok,
-      status: best?.status ?? 0,
-      ttfb: best?.ttfb ?? 0,
-      total: best?.total ?? 0,
-      reason: v.reason,
+      ok: dec.ok,
+      status: r0.status ?? 0,
+      ttfb: r0.ttfb ?? 0,
+      total: r0.total ?? 0,
+      reason: dec.reason,
       threshold: Number(site.fail_threshold || 3),
       source: p.source,
       probe: probeLabel,

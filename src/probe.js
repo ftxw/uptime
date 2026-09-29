@@ -179,9 +179,31 @@ export function judge(site, r) {
 }
 
 /**
+ * 探针端墙钟超时（整数秒）。
+ *
+ * ⚠️ 这是**给远端探针的规定**，不是"我们愿意等多久"。
+ *    Globalping 的探测跑在第三方机器上，我们本地没有任何句柄能中断它
+ *    —— 不像 CF 直连那条路可以用 AbortController 说掐就掐。
+ *    所以 `timeout_ms`（CF 用）与这个值**互不相通，也不该互相折算**：
+ *    把 8000ms 折成 8 秒传过来，只会让"本来第 9~14 秒才握得上手"的测量被提前判死，
+ *    实测中国家宽链路的失败**恰好在 15001ms** 被平台切断，压到 8s 就是主动制造失败。
+ *    反过来调大同样无用：抓到的失败是 `tls: null`（握手一个字节都没回来），
+ *    等 15s 和等 30s 是同一个结果，只是白占调度窗口。
+ *
+ * 取值必须落在 5–30（API 硬约束，越界直接 422），所以在读取侧就钳死。
+ */
+function gpTimeoutSec(env) {
+  const dflt = Number(defOf("gp_timeout_sec"));
+  const n = Number((env && env.GP_TIMEOUT_SEC) || dflt);
+  if (!Number.isFinite(n)) return dflt;
+  return Math.min(30, Math.max(5, Math.round(n)));
+}
+
+/**
  * Globalping：发起一次测量，返回 measurement id（不等待结果）
  * 真正的探测由 Globalping 的探针执行 —— 所以调度器在哪里完全不影响探测点位置。
- * ⚠️ 额度按「探测点个数」计费，limit 越小越省（默认 1）
+ * ⚠️ 额度按「探测点个数」计费（实测 X-Request-Cost === limit），limit 越小越省。
+ *    默认 3 是为了让「多数表决」成立，成本换准确率，可在后台改。
  */
 export async function gpCreate(env, site) {
   const token = env && env.GLOBALPING_TOKEN;
@@ -191,6 +213,7 @@ export async function gpCreate(env, site) {
   // 必然只有一个是活的，另一个是死配置。
   const magic = env.GP_MAGIC || defOf("gp_magic");
   const limit = Number(env.GP_LIMIT || defOf("gp_limit"));
+  const timeoutSec = gpTimeoutSec(env);
   const protocol = u.protocol === "http:" ? "HTTP" : "HTTPS";
   const port = u.port ? Number(u.port) : protocol === "HTTP" ? 80 : 443;
 
@@ -209,6 +232,8 @@ export async function gpCreate(env, site) {
       target: u.hostname, // ⚠️ 不能带 scheme
       locations: [{ magic }],
       limit,
+      // 顶层字段，不是 measurementOptions 的子键（那里 additionalProperties:false，错位 422）
+      timeout: timeoutSec,
       measurementOptions: {
         protocol,
         port,
@@ -257,14 +282,36 @@ export async function gpCreate(env, site) {
  * 为什么不能直接透传 `result.status`：它只会给 `"failed"` / `"offline"` 这类单词，
  * 落进 `checks.error` 就是一条 **`failed`** —— 排查时完全分不清是
  * 「探针超时」还是「站点真的挂了」，而这两件事的处理方式正相反。
- * （实测样例：家庭宽带筛选下约 1/3 的检查是 `failed` + `total_ms≈15001`，
- *   目标站点本身完全正常，是探针没在时限内跑完。）
+ *
+ * 真正的原因在 `result.rawOutput` 里，实测抓到过两种截然不同的失败：
+ *   `Request timed out during the TLS handshake.` —— DNS/TCP 都通，TLS 握手被概率性丢弃
+ *   `read ECONNRESET`                            —— 连接已被建立后被对端重置
+ * 所以这里做一次关键词翻译。**顺序有意义**：更具体的模式必须排在泛化的前面
+ * （`timed out during the TLS handshake` 含 `timed out`）。
  */
-function gpResultReason(rr) {
+const GP_RAW_ZH = [
+  ["timed out during the TLS handshake", "TLS 握手超时（链路丢包）"],
+  ["timed out during the TCP handshake", "TCP 握手超时"],
+  ["read ECONNRESET", "连接被重置"],
+  ["ECONNRESET", "连接被重置"],
+  ["ECONNREFUSED", "连接被拒绝"],
+  ["EHOSTUNREACH", "主机不可达"],
+  ["ENETUNREACH", "网络不可达"],
+  ["getaddrinfo", "域名解析失败"],
+  ["certificate", "证书校验失败"],
+  ["ETIMEDOUT", "连接超时"],
+  ["timed out", "探针等待超时"],
+];
+
+export function gpResultReason(rr) {
   const s = String((rr && rr.status) || "");
   if (s === "finished") return null;
+  const raw = String((rr && rr.rawOutput) || "").toLowerCase();
+  for (const [k, v] of GP_RAW_ZH) {
+    if (raw.includes(k.toLowerCase())) return v;
+  }
   if (s === "offline") return "探针离线";
-  if (s === "failed") return "探针未能在时限内完成测量（目标不可达或响应过慢）";
+  if (s === "failed") return "探针未能在时限内完成测量";
   return s || "未知状态";
 }
 
@@ -299,9 +346,73 @@ export async function gpCollect(env, pending) {
       bytes: 0,
       error: gpResultReason(rr),
       probe: `${p.city || "?"}/${p.asn || "?"}`,
+      // 平台自己的归因：target = 目标站 / resolver = 解析 / internal = 平台自身故障。
+      // 必须原样带出来 —— 表决时要靠它把"平台故障"从"站点故障"里摘出去。
+      failureSource: rr.failureSource || null,
     };
   });
   return { done: true, results, status: d.status };
+}
+
+/**
+ * 多探针多数表决 —— Globalping 结果的**唯一判定口径**。
+ *
+ * 为什么要表决，而不是像原来那样"挑一个最好的"：
+ *   GP 把测量派给哪台探针由平台决定，且对同一 magic 有**首选项粘性** ——
+ *   实测 3 轮里 Nanning/4837 三次都在，另外两席每轮都换。单点采样时，
+ *   那一台机器所在链路的一次抖动会被 100% 记成「站点失败」。
+ *   实测中国家宽筛选下单点失败率约 25%，配上 fail_threshold=3 就是
+ *   每天 4~5 次误告警，而目标站点本身完全正常。
+ *   多探针下失败是**不同步**的（同一次测量里实测出现过 2 成功 1 失败），
+ *   所以表决能把这种瞬时抖动过滤掉。
+ *
+ * 三条必须说清的规则：
+ *  ① `failureSource === "internal"` 的探针**不参与表决**：那是 Globalping 平台自己
+ *     出问题，它压根没测到站点。拿它投票等于把"我们没拿到数据"谎报成"站点挂了"
+ *     —— 与 gpCollect 的 broken 分支是同一条约定。
+ *  ② **平票即作废**（调用方不得写检查记录）：没有多数派就没有结论。宁可这一轮
+ *     没数据，也不能凭空造一个 up/down 出来；pending 已删，下一轮会自动重发。
+ *  ③ 代表值取多数派内的**中位数** —— 多探针的意义就是去掉"最好"与"最坏"两个
+ *     偶然值，中位数才是典型体验。取最快会让页面长期显得比实际更快。
+ *
+ * @returns {{void:true, why:string}} 无结论
+ *        | {{void:false, ok:boolean, pick:object, reason:string?, ...}} 有结论
+ */
+export function gpDecide(site, results) {
+  const all = Array.isArray(results) ? results : [];
+  if (!all.length) return { void: true, why: "no-results" };
+
+  const usable = all.filter((r) => r.failureSource !== "internal");
+  const platformFaults = all.length - usable.length;
+  if (!usable.length) return { void: true, why: "all-internal", platformFaults };
+
+  // 每条探针各自跑 judge：这样「HTTP 层通但状态码不在期望集合」（如 500）
+  // 也进入表决，而不是只看代表那条的状态码。
+  const votes = usable.map((r) => ({ r, v: judge(site, r) }));
+  const yes = votes.filter((x) => x.v.ok);
+  const no = votes.filter((x) => !x.v.ok);
+  const total = votes.length;
+
+  if (yes.length === no.length) {
+    return { void: true, why: "tie", platformFaults, okCount: yes.length, total };
+  }
+
+  const ok = yes.length > no.length;
+  const majority = ok ? yes : no;
+  const sorted = majority.slice().sort((a, b) => (a.r.ttfb || 0) - (b.r.ttfb || 0));
+  const pick = sorted[Math.floor((sorted.length - 1) / 2)];
+
+  return {
+    void: false,
+    ok,
+    pick: pick.r,
+    reason: pick.v.reason,
+    okCount: yes.length,
+    total,
+    platformFaults,
+    // 全票时不标注票型 —— 那是常态，标了只是噪音
+    unanimous: yes.length === total || no.length === total,
+  };
 }
 
 /* ─────────────────────────── SSL 检测 ─────────────────────────── */
