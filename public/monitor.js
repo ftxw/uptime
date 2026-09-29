@@ -119,8 +119,8 @@ function renderKpis(d) {
 
   const cards = [
     { label: "可用率", value: w.uptime != null ? w.uptime.toFixed(1) + "%" : "--", icon: "shield", cls: "i-primary" },
-    { label: "SSL 证书", value: sslVal, icon: "lock", cls: sslCls },
     { label: "检查间隔", value: fmtInterval(s.interval_min), icon: "clock", cls: "i-muted" },
+    { label: "SSL 证书", value: sslVal, icon: "lock", cls: sslCls },
     { label: "平均响应", value: ms(l.avg), icon: "activity", cls: "i-success" },
     {
       label: "失败次数",
