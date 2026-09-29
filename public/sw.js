@@ -5,7 +5,7 @@
 // ⚠️ 版本号由 scripts/bump-sw.mjs 在部署前按 public/ 内容哈希自动重写，**不要手改**。
 //    原先是人工 +1，漏一次就会出现「部署了新代码但界面没变」（缓存优先）。
 //    现在只要 public/ 下任一文件内容变了，哈希就变 → 缓存名变 → activate 清掉旧缓存。
-const VERSION = "v-e2399a9dccad";
+const VERSION = "v-f16c07c27112";
 const SHELL = `/shell-${VERSION}`;
 const PRECACHE = [
   "/",
@@ -23,8 +23,18 @@ self.addEventListener("install", (e) => {
     caches
       .open(SHELL)
       .then((c) =>
-        // 逐个 add：某个文件缺失不至于让整次安装失败
-        Promise.all(PRECACHE.map((u) => c.add(u).catch(() => null)))
+        Promise.all(
+          // ⚠️ 必须显式 `cache: "reload"`，不能用 c.add(u)：
+          //    add() 走的仍是浏览器 HTTP 缓存，而 /*.css 带 `max-age=300`
+          //    （见 public/_headers）—— 新 SW 会把**旧的 CSS** 当成新内容预缓存进来，
+          //    之后无论按多少次 F5 都刷不掉，只有硬刷才会绕过 HTTP 缓存。
+          //    实测（tmp/swf5.mjs）：连按 6 次普通刷新 CSS 都是旧的，硬刷才变。
+          PRECACHE.map((u) =>
+            fetch(u, { cache: "reload" })
+              .then((r) => (r && r.ok ? c.put(u, r) : null))
+              .catch(() => null)
+          )
+        )
       )
       .then(() => self.skipWaiting())
   );
@@ -32,10 +42,20 @@ self.addEventListener("install", (e) => {
 
 self.addEventListener("activate", (e) => {
   e.waitUntil(
-    caches
-      .keys()
-      .then((keys) => Promise.all(keys.filter((k) => k !== SHELL).map((k) => caches.delete(k))))
-      .then(() => self.clients.claim())
+    (async () => {
+      const keys = await caches.keys();
+      await Promise.all(keys.filter((k) => k !== SHELL).map((k) => caches.delete(k)));
+
+      // 接管已打开的页面。这一步同时是「发版后一次 F5 即新版」的关键：
+      // 本次导航是由**旧 SW** 应答的（新 SW 要等这次导航结束之后才装好并接管），
+      // 所以用户第一眼看到的必然还是旧页面；claim() 把控制权换成新 SW，
+      // 页面那边监听到 controllerchange 就地重载一次 —— 一次刷新即新版。
+      //
+      // ⚠️ 不要改回由 SW 侧调 clients.navigate()：实测（tmp/swf5.mjs）它被正常调用、
+      //    不抛错也不 reject，但**不会真的产生导航**，页面稳稳定格在旧版 —— 白费功夫。
+      //    重载交给页面自己（index / admin / monitor 三处的 controllerchange 监听）。
+      await self.clients.claim();
+    })()
   );
 });
 
@@ -51,13 +71,18 @@ self.addEventListener("activate", (e) => {
  *    PRECACHE 是按路径写入的，用绝对 URL 去 match 永远命中不了，
  *    结果就是每次都走网络、"秒开"失效（这是一个真实的踩坑）。
  *    离线且无缓存时才真的等网络。
+ *
+ * ⚠️ 后台那次 fetch 必须带 `cache: "no-cache"`：默认模式会**直接读浏览器 HTTP 缓存**，
+ *    于是"后台更新"只是把 HTTP 缓存里的旧副本又写回 SW 缓存（/*.css 有 5 分钟新鲜期，
+ *    这会让 CSS 的更新连按 F5 都刷不出来）。no-cache 会强制向服务器重校验：
+ *    内容没变就是一次 304（很小），变了才拿新内容。
  */
 async function shellFrom(path) {
   const c = await caches.open(SHELL);
   const hit = await c.match(path);
   if (hit) {
     // 命中就返回，同时后台刷新缓存（不阻塞本次响应）
-    fetch(path)
+    fetch(path, { cache: "no-cache" })
       .then((r) => {
         if (r && r.ok) c.put(path, r.clone());
       })
@@ -65,7 +90,7 @@ async function shellFrom(path) {
     return hit;
   }
   try {
-    const r = await fetch(path);
+    const r = await fetch(path, { cache: "no-cache" });
     if (r && r.ok) c.put(path, r.clone());
     return r;
   } catch (e) {
