@@ -6,7 +6,6 @@
 const ICONS = {
   activity: '<path d="M22 12h-4l-3 9L9 3l-3 9H2"/>',
   shield: '<path d="M20 13c0 5-3.5 7.5-7.7 8.9a1 1 0 0 1-.6 0C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.2-2.7a1 1 0 0 1 1.6 0C14.5 3.8 17 5 19 5a1 1 0 0 1 1 1z"/>',
-  alert: '<path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/><path d="M12 9v4M12 17h.01"/>',
   clock: '<circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/>',
   lock: '<rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>',
 };
@@ -103,7 +102,6 @@ function renderKpis(d) {
   const l = d.latency || {};
   const s = d.site || {};
   const ssl = d.ssl;
-  const fails = w.failures || 0;
 
   // SSL 卡片：未检测 / 有效天数 / 无效 —— 与首页、后台的三态判定同口径
   // （valid 由 stateOf 算好，已含「过期」与「未授权」两种情况）。
@@ -122,12 +120,6 @@ function renderKpis(d) {
     { label: "检查间隔", value: fmtInterval(s.interval_min), icon: "clock", cls: "i-muted" },
     { label: "SSL 证书", value: sslVal, icon: "lock", cls: sslCls },
     { label: "平均响应", value: ms(l.avg), icon: "activity", cls: "i-success" },
-    {
-      label: "失败次数",
-      value: fails,
-      icon: "alert",
-      cls: fails > 0 ? "i-destructive" : "i-muted",
-    },
   ];
 
   qs("#kpis").innerHTML = cards
