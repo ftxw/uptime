@@ -39,7 +39,7 @@
   </div>
 </header>
 
-<main class="wrap stack" id="main" style="padding-top:24px;visibility:hidden">
+<main class="wrap stack page-top" id="main" style="visibility:hidden">
 
   <div class="between page-head">
     <div>
@@ -311,7 +311,7 @@
           <label for="s-gp-token">Globalping Token</label>
           <!-- 「清除」是唯一能删掉已存 token 的入口：服务端的 clear_globalping_token
                分支一直存在，但前端从未发送过 —— 输入框留空只表示"不修改"。 -->
-          <div style="display:flex;gap:8px">
+          <div style="display:flex;gap:var(--sp-s)">
             <input id="s-gp-token" type="password" placeholder="留空 = 不修改" autocomplete="off" style="flex:1;min-width:0">
             <button class="btn" type="button" id="s-gp-token-clear">清除</button>
           </div>

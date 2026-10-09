@@ -36,7 +36,7 @@
   </div>
 </header>
 
-<main class="wrap stack" style="padding-top:20px">
+<main class="wrap stack page-top">
 
   <a class="back" href="/">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5M12 19l-7-7 7-7"/></svg>
@@ -175,7 +175,7 @@
   // 故障记录：占位一行。绝大多数站点此刻没有故障，真为空时卡片只会比占位矮约 10px
   put("incidents", '<div class="inc-row skel" aria-hidden="true">' + sk("已恢复", "badge") +
     '<div class="grow" style="min-width:0">' + sk("HTTP 500") +
-    '<div style="margin-top:3px">' + sk("2026-01-01 00:00:00 → 00:00:00 · 历时 1 分 0 秒") +
+    '<div style="margin-top:var(--sp-2xs)">' + sk("2026-01-01 00:00:00 → 00:00:00 · 历时 1 分 0 秒") +
     "</div></div></div>");
 })();
 </script>

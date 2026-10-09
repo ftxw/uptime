@@ -1,5 +1,8 @@
+<!-- 站点图标。⚠️ 这里只能写死色值：favicon 由浏览器当**图片**加载，拿不到页面
+     的 CSS 变量。fill 必须与 app.css 的 --primary（Yike 规范蓝 #2b5aed）一致 ——
+     改主色时记得回来同步这一处，否则浏览器标签页还是旧色。 -->
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
-  <rect width="32" height="32" rx="8" fill="#10b77f"/>
+  <rect width="32" height="32" rx="8" fill="#2b5aed"/>
   <path d="M27 16h-5l-3.5 9L11 7l-3.5 9H5" fill="none" stroke="#fff"
         stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
 </svg>

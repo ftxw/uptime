@@ -75,7 +75,7 @@ function renderHead(d) {
   qs("#title").innerHTML =
     `${escapeHtml(s.name)} <span class="badge b-${st}">${STATE_LABEL[st]}</span>` +
     (d.degrade_reason
-      ? ` <span class="muted" style="font-size:var(--text-sm);font-weight:400">· ${escapeHtml(
+      ? ` <span class="muted" style="font-size:var(--text-sm);font-weight:var(--fw-regular)">· ${escapeHtml(
           d.degrade_reason
         )}</span>`
       : "");
@@ -398,12 +398,12 @@ function renderIncidents(incidents) {
   el.innerHTML = list
     .map(
       (i) => `<div class="inc-row">
-      <span class="badge ${i.ongoing ? "b-down" : "b-degraded"}" style="margin-top:2px">${
+      <span class="badge ${i.ongoing ? "b-down" : "b-degraded"}" style="margin-top:var(--sp-3xs)">${
         i.ongoing ? "进行中" : "已恢复"
       }</span>
       <div class="grow" style="min-width:0">
         <div>${escapeHtml(i.error || "无错误详情")}</div>
-        <div class="muted" style="font-size:var(--text-xs);margin-top:3px">
+        <div class="muted" style="font-size:var(--text-xs);margin-top:var(--sp-2xs)">
           ${fmtFull(i.start)} → ${i.end ? fmtFull(i.end) : "持续中"} · 历时 ${fmtDur(
         i.duration_s
       )} · 约 ${i.checks_est} 次检查
