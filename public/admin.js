@@ -385,7 +385,7 @@ async function renderRows() {
   // 只在同一分类内比较 —— 跨分类拖拽改了 sort 也不改变它所在的位置，表现为
   // 「拖了没反应」。与其让用户对着一个静默失败的手势猜，不如先要求选个分类。
   const canDrag = Boolean(FILTER);
-  qs("#sites-title").innerHTML = `站点 <span class="muted" style="font-weight:400;font-size:12px">${escapeHtml(
+  qs("#sites-title").innerHTML = `站点 <span class="muted" style="font-weight:400;font-size:var(--text-xs)">${escapeHtml(
     title
   )} · ${list.length} 个 · ${canDrag ? "可拖拽排序" : "选择分类后可拖拽排序"}</span>`;
 
@@ -426,21 +426,21 @@ async function renderRows() {
       }>
         <td>
           <div style="font-weight:500">${escapeHtml(s.name)}${
-        s.enabled ? "" : ' <span class="muted" style="font-size:11px">已暂停</span>'
+        s.enabled ? "" : ' <span class="muted" style="font-size:var(--text-xs)">已暂停</span>'
       }</div>
         </td>
-        <td><span class="mono" style="font-size:12px">${escapeHtml(s.url)}</span>${
+        <td><span class="mono" style="font-size:var(--text-xs)">${escapeHtml(s.url)}</span>${
         // 后台看到的永远是明文地址（否则没法编辑），所以额外标一个「已隐藏」——
         // 不然前台不显示时，运营会以为是前端出了 bug
-        s.hide_url ? ' <span class="muted" style="font-size:11px">已隐藏</span>' : ""
+        s.hide_url ? ' <span class="muted" style="font-size:var(--text-xs)">已隐藏</span>' : ""
       }</td>
-        <td class="muted" style="font-size:12px"${
+        <td class="muted" style="font-size:var(--text-xs)"${
           s.origin ? ` title="${escapeHtml(s.origin)}"` : ""
-        }>${backendLabel(s)}<div style="font-size:11px;opacity:.65">${fmtInterval(
+        }>${backendLabel(s)}<div style="font-size:var(--text-xs);opacity:.65">${fmtInterval(
           s.interval_min
         )}</div></td>
         <td>${sslCell(sslMap[s.id])}</td>
-        <td><span class="badge ${cls}"${stTitle}>${st}</span><div class="muted" style="font-size:11px">${relTime(
+        <td><span class="badge ${cls}"${stTitle}>${st}</span><div class="muted" style="font-size:var(--text-xs)">${relTime(
         s.last_ts
       )}</div></td>
         <td style="text-align:right;white-space:nowrap">

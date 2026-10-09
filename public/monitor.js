@@ -75,7 +75,7 @@ function renderHead(d) {
   qs("#title").innerHTML =
     `${escapeHtml(s.name)} <span class="badge b-${st}">${STATE_LABEL[st]}</span>` +
     (d.degrade_reason
-      ? ` <span class="muted" style="font-size:13px;font-weight:400">· ${escapeHtml(
+      ? ` <span class="muted" style="font-size:var(--text-sm);font-weight:400">· ${escapeHtml(
           d.degrade_reason
         )}</span>`
       : "");
@@ -372,12 +372,12 @@ function renderRecent(recent) {
         <span class="mono" style="min-width:72px">${
           r.ttfb != null ? r.ttfb + " ms" : "--"
         }</span>
-        <span class="grow muted" style="font-size:12px" title="${escapeHtml(
+        <span class="grow muted" style="font-size:var(--text-xs)" title="${escapeHtml(
           // 失败行优先显示错误原因（比"在哪跑的"更要紧），但来源仍放进 title ——
           // 否则排查"这次是怎么失败的"时完全看不到是哪台跑的
           r.error ? `${r.error} · ${src}` : src
         )}">${escapeHtml(r.error || src)}</span>
-        <span class="mono muted" style="font-size:12px">${fmtFull(r.ts)}</span>
+        <span class="mono muted" style="font-size:var(--text-xs)">${fmtFull(r.ts)}</span>
       </div>`;
     })
     .join("");
@@ -392,7 +392,7 @@ function renderIncidents(incidents) {
     : "";
   if (!list.length) {
     el.innerHTML = `<div class="empty">暂无故障记录<br>
-      <span style="font-size:12px">连续失败达到阈值（判为真实故障）才会记录</span></div>`;
+      <span style="font-size:var(--text-xs)">连续失败达到阈值（判为真实故障）才会记录</span></div>`;
     return;
   }
   el.innerHTML = list
@@ -403,7 +403,7 @@ function renderIncidents(incidents) {
       }</span>
       <div class="grow" style="min-width:0">
         <div>${escapeHtml(i.error || "无错误详情")}</div>
-        <div class="muted" style="font-size:12px;margin-top:3px">
+        <div class="muted" style="font-size:var(--text-xs);margin-top:3px">
           ${fmtFull(i.start)} → ${i.end ? fmtFull(i.end) : "持续中"} · 历时 ${fmtDur(
         i.duration_s
       )} · 约 ${i.checks_est} 次检查

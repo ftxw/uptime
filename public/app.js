@@ -128,7 +128,7 @@ function monitorRow(m) {
       <div class="mrow-name">
         <a href="/monitor?id=${encodeURIComponent(m.id)}" title="查看详情${m.last_error ? " · " + escapeHtml(m.last_error) : ""}">${escapeHtml(m.name)}</a>
         <span class="badge b-${st}">${STATE_LABEL[st]}</span>
-        <span class="muted" style="font-size:12px">${escapeHtml(m.id)}</span>
+        <span class="muted" style="font-size:var(--text-xs)">${escapeHtml(m.id)}</span>
       </div>
       <div class="mrow-sub">
         ${urlCell}
