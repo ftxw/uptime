@@ -135,16 +135,18 @@
 
       <div class="field">
         <label for="f-url">监控地址（完整 URL）</label>
-        <input id="f-url" required type="url" placeholder="https://example.com/health">
+        <div class="input-row">
+          <input id="f-url" required type="url" placeholder="https://example.com/health">
+          <!-- 与地址框同一行：它是这个字段的显示开关，不该另起一行。
+               用 checkbox 而不是两个选项的 select —— 布尔量，
+               下拉会让人误以为还有第三种状态。 -->
+          <label class="check-row" for="f-hideurl">
+            <input id="f-hideurl" type="checkbox">
+            <span>URL隐藏</span>
+          </label>
+        </div>
         <span class="hint">路径会被保留 —— 填 /health 就检测 /health，不会退化成首页</span>
-        <!-- 勾选框紧跟在「监控地址」下面：它只是那个字段的显示属性，
-             用 checkbox 而不是两个选项的 select ——
-             「隐藏 URL」是个布尔开关，二选一的下拉会让人以为还有第三种状态。 -->
-        <label class="check-row" for="f-hideurl">
-          <input id="f-hideurl" type="checkbox">
-          <span>URL隐藏</span>
-        </label>
-        <span class="hint">勾选后服务端不再下发地址，前台也不渲染跳转按钮</span>
+        <span class="hint">「URL隐藏」只影响前台展示：前台不显示该站地址，也不给跳转入口；探测、证书与统计不受任何影响</span>
       </div>
 
       <div class="grid-2">
