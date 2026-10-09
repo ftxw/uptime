@@ -375,6 +375,22 @@ html:not(.dark) .btn:not(.btn-primary):not(.btn-danger) {
 .field > label { font-size: 12px; font-weight: 500; color: hsl(var(--muted-foreground)); }
 .field .hint { font-size: 11px; color: hsl(var(--muted-foreground)); }
 
+/* 勾选项（如「URL隐藏」）—— 必须写成 `.field > label.check-row`：
+   `.field > label` 是 (0,1,1)，单靠 `.check-row`(0,1,0) 压不住它的
+   12px / muted 色，勾选框标题会变成灰蒙蒙的小字。 */
+.field > label.check-row {
+  display: flex; align-items: center; gap: 7px;
+  font-size: 13px; font-weight: 400; color: hsl(var(--foreground));
+  cursor: pointer; user-select: none; margin-top: 2px;
+}
+/* 通配的 `input, select, textarea` 会给每个 input 塞上 width:100%; height:36px，
+   复选框不覆盖就会撑成一整行的方块。 */
+.field > label.check-row input[type="checkbox"] {
+  width: 16px; height: 16px; min-width: 16px; flex: none;
+  padding: 0; margin: 0; border-radius: 4px;
+  accent-color: hsl(var(--primary)); cursor: pointer;
+}
+
 input, select, textarea {
   width: 100%; font-family: inherit; font-size: 13px;
   height: 36px; padding: 0 10px;

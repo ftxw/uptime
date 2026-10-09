@@ -445,7 +445,6 @@ async function renderRows() {
       )}</div></td>
         <td style="text-align:right;white-space:nowrap">
           <button class="btn btn-sm" data-act="proxy-test" data-id="${escapeHtml(s.id)}">测</button>
-          <button class="btn btn-sm" data-act="ssl-test" data-id="${escapeHtml(s.id)}" title="重新检测该站点的 SSL 证书">证书</button>
           <button class="btn btn-sm" data-act="edit" data-id="${escapeHtml(s.id)}">编辑</button>
           <button class="btn btn-sm btn-danger" data-act="del" data-id="${escapeHtml(s.id)}">删除</button>
         </td>
@@ -829,9 +828,8 @@ function openForm(site) {
   qs("#f-id").readOnly = Boolean(site);
   qs("#f-name").value = site?.name || "";
   qs("#f-url").value = site?.url || "";
-  // 无值回落「显示」—— 与数据库默认值 0 一致。select 只有两个选项，
-  // 这里直接赋值即可（不存在"选项里没有的值"这种情况，见 #s-limit 的教训）。
-  qs("#f-hideurl").value = site?.hide_url ? "1" : "0";
+  // 勾选框 = 布尔开关，默认不勾（与数据库默认值 0 一致）
+  qs("#f-hideurl").checked = Boolean(site?.hide_url);
   // 新建时预填当前筛选的分类，少点一次
   fillGroupSelect(
     site?.group_name || (FILTER && FILTER !== UNGROUPED ? FILTER : UNGROUPED)
@@ -872,7 +870,7 @@ qs("#form").addEventListener("submit", async (e) => {
     probe_kind: qs("#f-kind").value || null,
     expect_codes: qs("#f-codes").value.trim(),
     keyword: qs("#f-keyword").value.trim() || null,
-    hide_url: qs("#f-hideurl").value === "1",
+    hide_url: qs("#f-hideurl").checked,
     fail_threshold: Number(qs("#f-threshold").value || 3),
     interval_min: Number(qs("#f-interval").value || 5),
     enabled: qs("#f-enabled").value === "1",
@@ -971,37 +969,6 @@ document.addEventListener("click", async (e) => {
       btn.disabled = false;
       btn.textContent = "测";
     }
-  }
-
-  // 重新检测证书（/api/ssl-check）。同步等待探针结果，正常几秒内返回。
-  // 失败时把服务端给出的**具体原因**原样带出来 —— 探针侧是「TLS 握手超时（链路丢包）」
-  // 还是「探针离线」，决定了下一步该调筛选还是直接重试，笼统的"失败"没有排查价值。
-  if (act === "ssl-test") {
-    btn.disabled = true;
-    const old = btn.textContent;
-    btn.textContent = "…";
-    try {
-      const d = await post("/ssl-check", { site: id });
-      if (!d.ok || d.ssl?.error) {
-        banner(`证书检测失败：${d.ssl?.error || d.error || "未知原因"}`, "error");
-      } else {
-        const days = d.ssl?.days_left;
-        banner(
-          `证书已更新 · ${d.ssl?.issuer || "颁发者未知"} · ${
-            days != null ? `剩余 ${days} 天` : "有效期未知"
-          }`,
-          "info"
-        );
-      }
-      // 无论成败都重渲染：失败会写下一行 error 记录（证书列随之变成「未知」），
-      // 成功则立刻显示新的剩余天数 —— 用户点这个按钮就是要看结果的。
-      await renderRows();
-    } catch (err) {
-      if (!isMasked(err)) banner("证书检测失败：" + err.message, "error");
-      btn.textContent = old;
-      btn.disabled = false;
-    }
-    return;
   }
 });
 
