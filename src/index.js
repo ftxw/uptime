@@ -210,7 +210,8 @@ async function buildAdminPayload(env) {
     // ⚠️ 只读已有证书结果，绝不在渲染路径上触发检测。
     //    SSL 检测走 Globalping，**单站点最坏 14 个子请求**、耗时数秒 —— 若放在这里，
     //    每次打开后台、每次轮询都会触发，既拖慢加载也白白消耗额度。
-    //    检测由 cron（每轮 SSL_PER_TICK 个）与用户手动点「刷新证书」负责。
+    //    检测由 cron（每轮 SSL_PER_TICK 个）与后台列表里每行的「证书」按钮
+    //    （POST /api/ssl-check）负责。
     d.prepare("SELECT * FROM ssl").all(),
   ]);
 
@@ -1204,21 +1205,28 @@ async function persistManualTest(env, site, { source, probe, result }) {
 async function refreshSslStale(
   env,
   sites,
-  { force = false, maxAgeH = 24, limit = 2, budget = null } = {}
+  { force = false, maxAgeH = 24, failRetryH = 1, limit = 2, budget = null } = {}
 ) {
   if (!sites.length || limit <= 0) return [];
   const d = await db(env);
 
   // ⚠️ 必须**一次**把新鲜度取回来再筛选：cron 每分钟跑一轮，
   //    而真正过期的通常只有少数几个 —— 逐站点 SELECT 会用 N 次往返换 2 个结果。
-  const { results } = await d.prepare("SELECT site, checked_ts FROM ssl").all();
-  const checkedTs = new Map((results || []).map((r) => [r.site, r.checked_ts]));
-  const cutoffMs = maxAgeH * 3600 * 1000;
+  //
+  // ⚠️ 这里连 `error` 一起取，因为**失败的结果必须比成功的更快重试**：
+  //    saveSsl 对失败也照样写 checked_ts，而下面的新鲜度判定原先不论成败一律按 24h 算 ——
+  //    于是探针一次偶发抖动就把该站点的证书状态冻结一整天，用户在后台看到的是
+  //    「SSL 一直显示检测失败/未检测」，而且没有任何入口能立刻重试。
+  //    现在：成功 → maxAgeH（证书不会天天换，24h 足够）；失败 → failRetryH（1h）。
+  const { results } = await d.prepare("SELECT site, checked_ts, error FROM ssl").all();
+  const sslRows = new Map((results || []).map((r) => [r.site, r]));
 
   const stale = [];
   for (const s of sites) {
-    const ts = checkedTs.get(s.id);
-    const fresh = ts && Date.now() - new Date(ts).getTime() < cutoffMs;
+    const row = sslRows.get(s.id);
+    const ageLimitH = row && row.error ? failRetryH : maxAgeH;
+    const fresh =
+      row && Date.now() - new Date(row.checked_ts).getTime() < ageLimitH * 3600 * 1000;
     if (fresh && !force) continue;
     stale.push(s);
     if (stale.length >= limit) break;
@@ -2353,6 +2361,37 @@ export default {
         });
       }
 
+      // 手动刷新单个站点的证书 —— cron 之外的第二条入口。
+      // 存在的理由：证书检测成功结果 24h 才复核、失败结果也要等 1h，用户想立刻
+      // 确认或纠正时没有任何手段。而 buildAdminPayload 的注释早就写了「由 cron 与
+      // 用户手动点『刷新证书』负责」—— 代码里却从来没有这个按钮，属于注释承诺了
+      // 一个不存在的功能，比不写注释更容易误导后来人。
+      if (api === "ssl-check") {
+        const m2 = requirePost(request, pretty);
+        if (m2) return m2;
+        const body = await request.json().catch(() => ({}));
+        const siteId = String(body.site || "");
+        if (!siteId) return json({ ok: false, error: "缺少 site" }, 400, "no-store", pretty);
+        const dSsl = await db(env);
+        const site = await dSsl.prepare("SELECT * FROM sites WHERE id = ?").bind(siteId).first();
+        if (!site) {
+          return json({ ok: false, error: `站点不存在：${siteId}` }, 404, "no-store", pretty);
+        }
+        // 手动刷新只针对一个站点，不受 SSL_PER_TICK（每轮几个站点）限制；
+        // 但仍要封顶 —— gpSslCheck 是同步轮询，异常站点最坏能花十几个子请求，
+        // 不封顶就可能把这一轮 cron 的探测预算顶穿（超了是整轮报错）。
+        let r;
+        try {
+          r = await gpSslCheck(env, site, { maxSubreq: 16 });
+        } catch (e) {
+          r = { error: String((e && e.message) || e), subreq: 0 };
+        }
+        await saveSsl(env, site.id, r);
+        // 证书进了 overview / site 的响应体，必须让边缘缓存的旧副本立刻失效
+        await bumpConfigVersion(env);
+        return json({ ok: !r.error, site: site.id, ssl: r }, 200, "no-store", pretty);
+      }
+
       // 未知接口一律 404 —— 返回 200 + 服务信息会让删掉的接口"看起来还在"，
       // 掩盖调用方的错误。
       return json(
@@ -2368,6 +2407,7 @@ export default {
             "GET/POST/DELETE /api/categories",
             "POST /api/sites（写）",
             "POST /api/run  手动跑一轮（调试）；POST /api/test  测单个后端（调试）",
+            "POST /api/ssl-check  手动刷新单个站点的证书",
           ],
         },
         404,
@@ -2408,6 +2448,9 @@ export default {
     try {
       ssl = await refreshSslStale(env, sites, {
         maxAgeH: 24,
+        // 失败的结果 1 小时就重试（成功仍 24h）—— 否则一次探针抖动会冻结一整天，
+        // 表现就是「SSL 信息一直取不到」。见 refreshSslStale 内的注释。
+        failRetryH: 1,
         limit: Number((env && env.SSL_PER_TICK) || 2),
         budget: Math.max(0, subreqBudget - disp.used),
       });

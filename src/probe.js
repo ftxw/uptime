@@ -440,6 +440,20 @@ const GP_SSL_PROBE_TIMEOUT_SEC = 10;
 const GP_SSL_FINALIZE_GRACE_MS = 15_000;
 
 /**
+ * SSL 检测派出的探针数。
+ *
+ * 为什么不能是 1：Globalping 对同一 (magic, target) 组合有**首选项粘性** ——
+ * 反复测量会被反复派给同一台机器。只要那台机器到目标的 TLS 握手链路本身有问题
+ * （跨境丢包、对端限速），该站点的证书检测就会**每天稳定失败一次**：
+ * 前台/后台长期显示「检测失败」，而该站点的可用率却完全正常（可用性探测 limit=3，
+ * 有另外两台兜底，所以看不出问题）—— 这是最难排查的一类现象。
+ *
+ * 代价只有 Globalping 的额度点数（按探针个数计费），**不增加子请求次数**：
+ * 无论派几台，都还是一次 POST 发起 + 若干次 GET 轮询，而证书每站点每天才查一次。
+ */
+const GP_SSL_LIMIT = 3;
+
+/**
  * 查一个站点的 SSL 证书。
  *
  * 为什么用 Globalping 而不是自己 fetch：
@@ -489,7 +503,8 @@ export async function gpSslCheck(env, site, { maxSubreq = null } = {}) {
         type: "http",
         target: u.hostname,
         locations: [{ magic }],
-        limit: 1,
+        // 多派几台：任意一台拿到证书即可（见 GP_SSL_LIMIT 注释）
+        limit: GP_SSL_LIMIT,
         // 顶层字段，不是 measurementOptions 的子键（见 GP_SSL_PROBE_TIMEOUT_SEC 注释）
         timeout: GP_SSL_PROBE_TIMEOUT_SEC,
         measurementOptions: {
@@ -532,12 +547,28 @@ export async function gpSslCheck(env, site, { maxSubreq = null } = {}) {
     }
     if (d.status !== "finished" && d.status !== "failed") continue;
 
-    const r0 = (d.results || [])[0] || {};
-    const rr = r0.result || {};
-    const tls = rr.tls;
-    if (!tls) {
-      return { error: `无 TLS 信息（探测状态 ${rr.status || d.status}）`, subreq };
+    const rows = (d.results || []).map((r) => ({ r, rr: r.result || {} }));
+    // 多探针下**任一台拿到证书即可** —— 挑第一个带 tls 的，而不是死盯 results[0]。
+    // 原来只读第 0 条：多探针时第一台失败就整站判失败，白白浪费了另外两台的容错。
+    const hit = rows.find((x) => x.rr.tls);
+    if (!hit) {
+      // 全都没拿到：把**人类可读**的原因带出去。gpResultReason 会把 rawOutput 翻成
+      // 「TLS 握手超时（链路丢包）」这类结论；不加这一步，库里只有一句
+      // 「无 TLS 信息（探测状态 failed）」，分不清是握手超时、连接被重置还是探针离线 ——
+      // 而这三者的处理方式（调筛选 / 换探针 / 重试）完全不同。
+      const first = rows[0] || { r: {}, rr: {} };
+      const why = gpResultReason(first.rr) || `探测状态 ${first.rr.status || d.status}`;
+      const p = first.r.probe || {};
+      const at = p.city || p.asn ? `${p.city || "?"}/${p.asn || "?"}` : "未知探针";
+      return {
+        error: `未取到证书（${why}；首个探针 ${at}${
+          rows.length > 1 ? `，共 ${rows.length} 台探针均未返回证书` : ""
+        }）`,
+        subreq,
+      };
     }
+    const r0 = hit.r;
+    const tls = hit.rr.tls;
     const daysLeft = tls.expiresAt
       ? Math.floor((new Date(tls.expiresAt).getTime() - Date.now()) / 86400000)
       : null;
