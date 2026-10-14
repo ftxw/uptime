@@ -1126,10 +1126,56 @@ function adaptCnResult(site, raw, label) {
  * 只有 match 才敢写「境内」；mismatch 与 unknown 都**不写**——
  * 前者是错的，后者是没查到，两者都不该被当成事实落库。
  */
+/**
+ * 把探测臂的**可验证结论**转成落库的落点标签。
+ *
+ * 为什么不是简单取 `ep.region`（平台自报）：
+ *   加速区域为「全球可用区（含大陆）」时，平台会**按调用方位置做地理路由**，
+ *   而调用方是 CF Worker（在境外）→ 请求被路由到境外地域 → 实测拿到
+ *   `region=ap-tokyo / egress=43.130.244.17`。自报值本身是**真的**，
+ *   只不过不是我们想要的那个 —— 所以必须连同 verdict 一起呈现，
+ *   否则界面显示「东京」却标成境内数据，比不显示更坏。
+ *
+ * 三态（`egressVerdict` 由探测臂实测出口 IP 归属得出，见 cn-probe 的 verdictOf）：
+ *   match     → `境内`          出口在境内，可作为大陆数据使用
+ *   mismatch  → `<城市>（境外）` 地域真实但出口在境外，**明确标出不可用**
+ *   unknown   → `境外?`         归属查不到；不猜城市，只标明存疑
+ *
+ * 城市名从 `ap-chengdu` 这类 id 映射来，取自官方可选地域列表。
+ */
 function cnWhereOf(ep) {
-  if (!ep || ep.egressVerdict === "match") return "境内";
-  return null;
+  if (!ep) return null;
+  const city = cnCityOf(ep.region);
+  if (ep.egressVerdict === "match") return "境内";
+  if (ep.egressVerdict === "mismatch") return city ? `${city}（境外）` : "境外";
+  // unknown / unchecked / 缺失：出口归属没验成，就不声称任何结论
+  return city ? `${city}?` : "境外?";
 }
+
+/** `ap-chengdu` → `成都`。未在官方列表里的 id 原样返回，避免丢信息。 */
+function cnCityOf(region) {
+  const id = String(region || "").trim().toLowerCase();
+  if (!id) return null;
+  return CN_REGION_CITY[id] || region;
+}
+
+/** 官方可选地域列表（Cloud Functions 多地域部署）。只收大陆 + 常用海外。 */
+const CN_REGION_CITY = {
+  "ap-guangzhou": "广州",
+  "ap-shanghai": "上海",
+  "ap-nanjing": "南京",
+  "ap-beijing": "北京",
+  "ap-chengdu": "成都",
+  "ap-singapore": "新加坡",
+  "ap-hongkong": "中国香港",
+  "ap-bangkok": "曼谷",
+  "ap-jakarta": "雅加达",
+  "ap-seoul": "首尔",
+  "ap-tokyo": "东京",
+  "eu-frankfurt": "法兰克福",
+  "na-ashburn": "弗吉尼亚",
+  "na-siliconvalley": "硅谷",
+};
 
 /**
  * 阶段二：发起本轮测量（Globalping 两阶段 / CF 即时 / cn 批量）
@@ -1406,9 +1452,10 @@ async function persistCf(env, sites, cfResult) {
       // 无结论（平票 / 一条可用结果都没有）→ 不写记录，与 GP 的 vote-* 分支同一条约定
       if (dec.void) continue;
       const r0 = dec.pick || {};
-      // 落点只存**实测出口归属**的结论「境内」/ null，绝不存平台自报的区域 ——
-      // 上一版存了自报的 ap-guangzhou，实际却被地理路由去了境外，一段时间里
-      // 把境外测量当境内数据用。详见 src/origin.js 顶部「为什么 cn 支不显示城市」。
+      // 落点存**带可信度标注的结论**（cnWhereOf 产出）：「境内」/「东京（境外）」/「成都?」。
+      // 不直接存平台自报的 region —— 它在地理路由下可能是境外地域（实测 ap-tokyo），
+      // 但也不能一律丢掉：那样界面看不出「探测臂跑错了地域」，排查会绕远路。
+      // 详见 src/origin.js 顶部「cn 支为什么要分三态」。
       const where = r0.probe || null;
       const src = "cn:";
       // 票型标注规则与 collectGlobalping 一致：全票是常态（不标），分歧才标 `境内 (2/3)`
