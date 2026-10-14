@@ -833,6 +833,78 @@ async function cnRequest(env, base, path, payload, hardMs) {
  * 单个端点失败**绝不能让整体失败**：记为端点级错误继续下一个，由调用方决定怎么表决。
  * @returns {{endpoints: Array<{base, region?, ok:boolean, results?, error?}>}}
  */
+/**
+ * 调探测臂的 `GET /api/ping` 做**接入自检**。
+ *
+ * 为什么需要：填完「端点 + 令牌」之后，原来没有任何办法确认接对没接对 ——
+ * 只能等 cron 日志里出现 `cnStarted`，而端点写错、令牌不匹配、地域配错
+ * 这三种最常见的问题在日志里长得几乎一样（都是「没数据」）。
+ * 这个函数把探测臂的自检结论原样带回后台，一眼就能分清。
+ *
+ * 复用 cnRequest 的「预览令牌」处理：base 带 query（?t=xxx）时先换 cookie 再打干净 URL。
+ */
+export async function cnPing(env, base, hardMs = 8000) {
+  const token = env && env.CN_TOKEN;
+  const headers = {
+    accept: "application/json",
+    ...(token ? { "x-probe-token": String(token) } : {}),
+  };
+
+  const cleanUrl = (ck) => {
+    const u = new URL(base);
+    u.pathname = "/api/ping";
+    if (ck) u.search = "";
+    return u.toString();
+  };
+  const once = async (ck) =>
+    cnFetch(
+      cleanUrl(ck),
+      { method: "GET", headers: ck ? { ...headers, cookie: ck } : headers, redirect: "manual" },
+      hardMs
+    );
+
+  let cookie = null;
+  if (cnHasQuery(base)) {
+    const got = await cnEnsureCookie(base, "/api/ping", hardMs);
+    if (got.fetched) cookie = got.cookie;
+  }
+
+  let res = await once(cookie);
+  // 带 cookie 时可能被 302 到干净 URL，跟一次（与 cnRequest 同一套约定）
+  if (cookie && res.status === 302) res = await once(null);
+
+  const text = await res.text();
+  let data = null;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    data = null;
+  }
+  return {
+    base,
+    httpStatus: res.status,
+    data,
+    // 非 JSON 或非 2xx 时把响应体带回去，否则后台只能看到一句「失败」
+    error: data ? null : String(text || "").slice(0, 200) || `HTTP ${res.status}`,
+  };
+}
+
+/**
+ * 批量对所有已配置端点做接入自检。**逐个端点独立成败**，一个挂了不影响其他。
+ */
+export async function cnPingAll(env, hardMs = 8000) {
+  const eps = cnEndpoints(env);
+  const out = [];
+  for (const base of eps) {
+    try {
+      out.push({ ok: true, ...(await cnPing(env, base, hardMs)) });
+    } catch (e) {
+      out.push({ ok: false, base, error: String((e && e.message) || e) });
+    }
+  }
+  return { endpoints: eps, results: out };
+}
+
 export async function cnProbe(env, sites, timeoutMs) {
   const eps = cnEndpoints(env);
   const dflt = Number(defOf("cn_timeout_ms"));
@@ -862,6 +934,11 @@ export async function cnProbe(env, sites, timeoutMs) {
       endpoints.push({
         base,
         region: data.region || null,
+        // 实测出口归属与判定结论 —— 这是**唯一可信**的"从哪打出去的"依据。
+        // 平台自报的 region 不可信：同时配了大陆与海外地域时平台会按调用方位置
+        // 做地理路由，CF 在境外 → 请求被路由到境外，自报就成了 ap-singapore。
+        egressVerdict: data.egressVerdict || null,
+        egress: data.egress || null,
         ok: true,
         results: data.results,
         wallMs: data.wallMs ?? null,

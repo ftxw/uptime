@@ -36,6 +36,7 @@ import {
   gpSslCheck,
   cnEndpoints,
   cnProbe,
+  cnPingAll,
   cnSsl,
 } from "./probe.js";
 import {
@@ -1096,7 +1097,16 @@ async function dueSites(env, sites) {
  *   · `probe` 设成端点返回的 region（如 ap-guangzhou）—— 它就是这条票的「落点」；
  *   · `failureSource` 恒 null：CN 没有 Globalping 那套平台自身故障归因。
  */
-function adaptCnResult(site, raw, region) {
+/**
+ * 把 cn 探测臂的单条结果转成与 GP 同一形状，好让 gpDecide 直接复用多数表决。
+ *
+ * @param label **落点标签**，必须是「境内」/「境外」/ null —— 由端点的实测出口归属
+ *   （`egressVerdict`）换算而来，**不是**探测臂自报的区域。
+ *   上一版传的是 `ep.region`（平台自报），而平台自报会因为地理路由而出错
+ *   （配了双地域时，CF 从境外调用就被路由到境外，自报变成 ap-singapore），
+ *   于是一段时间里把境外测量当境内数据用了。详见 src/origin.js 顶部说明。
+ */
+function adaptCnResult(site, raw, label) {
   return {
     url: raw.url || site.url,
     ok: raw.ok !== false,
@@ -1106,9 +1116,19 @@ function adaptCnResult(site, raw, region) {
     bytes: raw.bytes ?? 0,
     keywordHit: raw.keywordHit === undefined ? null : raw.keywordHit,
     error: raw.ok === false ? zhError(`${raw.errorCode || ""} ${raw.error || ""}`) : null,
-    probe: region,
+    probe: label,
     failureSource: null,
   };
+}
+
+/**
+ * 端点的实测出口归属 → 可验证的落点标签。
+ * 只有 match 才敢写「境内」；mismatch 与 unknown 都**不写**——
+ * 前者是错的，后者是没查到，两者都不该被当成事实落库。
+ */
+function cnWhereOf(ep) {
+  if (!ep || ep.egressVerdict === "match") return "境内";
+  return null;
 }
 
 /**
@@ -1345,7 +1365,7 @@ async function dispatch(env, sites) {
           for (const ep of okEps) {
             const raw = ep.results.find((r) => normalizeUrl(r.url || "") === key);
             if (!raw) continue;
-            adapted.push(adaptCnResult(s, raw, ep.region));
+            adapted.push(adaptCnResult(s, raw, cnWhereOf(ep)));
           }
           // gpDecide 返回 { void:true } = 没有任何可用结果 / 平票 → persistCf 不写记录
           cfResult[s.id] = { kind: "cn", dec: gpDecide(s, adapted) };
@@ -1353,7 +1373,14 @@ async function dispatch(env, sites) {
         started.push({
           cn: true,
           sites: cnSites.map((s) => s.id),
-          endpoints: okEps.map((e) => ({ base: e.base, region: e.region })),
+          // region 是平台自报（仅留作排查线索）；where 才是可写进数据的结论
+          endpoints: okEps.map((e) => ({
+            base: e.base,
+            region: e.region,
+            where: cnWhereOf(e),
+            egress: e.egress,
+            verdict: e.egressVerdict,
+          })),
         });
       }
     }
@@ -1379,12 +1406,17 @@ async function persistCf(env, sites, cfResult) {
       // 无结论（平票 / 一条可用结果都没有）→ 不写记录，与 GP 的 vote-* 分支同一条约定
       if (dec.void) continue;
       const r0 = dec.pick || {};
-      const region = r0.probe || null;
-      const src = `cn:${region || "unknown"}`;
-      // 票型标注规则与 collectGlobalping 一致：全票是常态（不标），分歧才标 `ap-guangzhou (2/3)`
+      // 落点只存**实测出口归属**的结论「境内」/ null，绝不存平台自报的区域 ——
+      // 上一版存了自报的 ap-guangzhou，实际却被地理路由去了境外，一段时间里
+      // 把境外测量当境内数据用。详见 src/origin.js 顶部「为什么 cn 支不显示城市」。
+      const where = r0.probe || null;
+      const src = "cn:";
+      // 票型标注规则与 collectGlobalping 一致：全票是常态（不标），分歧才标 `境内 (2/3)`
       const probeLabel = dec.unanimous
-        ? region
-        : `${region || "?"} (${dec.okCount}/${dec.total})`;
+        ? where
+        : where
+          ? `${where} (${dec.okCount}/${dec.total})`
+          : `? (${dec.okCount}/${dec.total})`;
       rows.push({
         ts: new Date().toISOString(),
         site: s.id,
@@ -1610,7 +1642,12 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     // 接口统一走 /api/<name>；静态资源占根路径，两者互不干扰。
-    const m = url.pathname.match(/^\/api\/([a-zA-Z_]+)\/?$/);
+    // ⚠️ 字符类里**必须包含 `-`**：原来只写 `[a-zA-Z_]+`，于是 `ssl-check` 与
+    //    `cn-verify` 这类带连字符的接口全都匹配不上，会一路落到末尾返回
+    //    「未知接口」—— `/api/ssl-check` 已经这样坏掉了很久（后台手动触发证书检测
+    //    一直报「未知接口」），只是没人注意。
+    //    要求首字符是字母：避免以 `-`/`_` 开头的路径被当成接口名。
+    const m = url.pathname.match(/^\/api\/([a-zA-Z][a-zA-Z0-9_-]*)\/?$/);
     const api = m ? m[1] : "";
     const pretty = url.searchParams.get("pretty") === "1";
 
@@ -2612,6 +2649,35 @@ export default {
         const disp = await dispatch(env, picked);
         const persisted = await persistCf(env, picked, disp.cfResult);
         return json({ ok: true, collect, dispatch: disp, persisted });
+      }
+
+      /**
+       * POST /api/cn-verify —— 探测臂**接入自检**（后台「设置 → 探测 → 验证」按钮）。
+       *
+       * 为什么需要：填完「端点 + 令牌」之后没有别的办法确认接对没接对，只能等 cron 日志。
+       * 而端点写错、令牌不匹配、地域配错这三种最常见的问题，在日志里长得几乎一样
+       * （都是「这轮没数据」）。这里把探测臂 `/api/ping` 的自检结论原样带回：
+       *   · egress.country  是**实测**的出网 IP 归属（判定依据）
+       *   · platformRegion  是平台自报（仅参考 —— 双地域配置时会因地理路由而说谎）
+       *   · egressVerdict   match / mismatch / unknown / unchecked
+       * 逐个端点独立返回，一个挂��不影响其他。
+       */
+      if (api === "cn-verify") {
+        const m3 = requirePost(request, pretty);
+        if (m3) return m3;
+        // 用**当前已保存**的设置，而不是表单里还没提交的值 —— 否则验的是"你以为配的"，
+        // 不是"系统实际在用的"。想验新值请先保存。
+        const r = await cnPingAll(env, 8000);
+        return json({
+          ok: true,
+          configured: r.endpoints.length,
+          // 一个端点都没配是最常见的原因，给一句能直接照做的提示
+          hint: r.endpoints.length
+            ? null
+            : "尚未配置探测臂端点：填「大陆探测臂端点」并保存后再点验证",
+          endpoints: r.endpoints,
+          results: r.results,
+        });
       }
 
       // 单个后端的即时测试：?api=test&kind=cf|globalping&[site=<id>|target=...]

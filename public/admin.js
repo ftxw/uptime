@@ -1225,6 +1225,56 @@ qs("#s-cn-token-clear").addEventListener("click", async () => {
   }
 });
 
+/**
+ * 「验证」—— 调探测臂的 /api/ping 做接入自检。
+ *
+ * 验的是**已保存**的设置，不是输入框里还没提交的值 —— 否则验的是"你以为配的"，
+ * 不是"系统实际在用的"。所以要先保存再点。
+ *
+ * 结论只看 egressVerdict（实测出网 IP 归属），platformRegion 仅作参考：
+ * 探测臂同时配了大陆与海外地域时，平台会按调用方位置做地理路由，
+ * 自报的城市会说谎 —— 上一版就因此把境外测量当境内数据用了很久。
+ */
+const VERDICT_TEXT = {
+  match: "出口在期望国家境内，可以正常用于国内站点探测",
+  mismatch: "出口不在期望国家 —— 测量数据不可用于国内站点，请检查部署地域",
+  unknown: "未能判定出口归属（探测臂查不到外部 IP 归属服务），无法证明出口在境内",
+  unchecked: "探测臂未配置期望国家，已跳过校验",
+};
+
+qs("#s-cn-verify").addEventListener("click", async () => {
+  const btn = qs("#s-cn-verify");
+  const out = qs("#s-cn-verify-out");
+  btn.disabled = true;
+  out.textContent = "验证中…";
+  try {
+    const r = await post("/cn-verify");
+    if (r.hint) {
+      out.textContent = r.hint;
+      banner(r.hint, "error");
+      return;
+    }
+    const lines = (r.results || []).map((x) => {
+      if (!x.ok) return `${x.base} → 请求失败：${x.error}`;
+      const d = x.data || {};
+      const where = d.egress ? `${d.egress.ip || "?"}（${d.egress.country || "归属未知"}）` : "?";
+      const verdict = d.egressVerdict || "unknown";
+      const notes = Array.isArray(d.notes) && d.notes.length ? ` — ${d.notes.join("；")}` : "";
+      return `${x.base} → ${VERDICT_TEXT[verdict] || verdict}｜出口 ${where}${notes}`;
+    });
+    out.textContent = lines.join("；") || "没有可验证的端点";
+    const bad = (r.results || []).some(
+      (x) => !x.ok || (x.data && x.data.egressVerdict && x.data.egressVerdict !== "match")
+    );
+    banner(bad ? "探测臂验证发现问题，请看下方提示" : "探测臂验证通过", bad ? "error" : "info");
+  } catch (err) {
+    out.textContent = "验证失败：" + err.message;
+    if (!isMasked(err)) banner("验证失败：" + err.message, "error");
+  } finally {
+    btn.disabled = false;
+  }
+});
+
 // 位置筛选类下拉选到「自定义…」时展开旁边的输入框（#s-magic 与 #s-sslmagic 同样处理）
 for (const [selId, customId] of [
   ["#s-magic", "#s-magic-custom"],

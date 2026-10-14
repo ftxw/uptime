@@ -2,7 +2,10 @@
   "name": "cn-probe",
   "private": true,
   "type": "module",
+  "description": "大陆探测臂：部署在 EdgeOne Makers 大陆地域，从境内出口执行探测",
   "scripts": {
-    "dev": "edgeone makers dev --skip-env-sync"
+    "dev": "edgeone makers dev --skip-env-sync",
+    "deploy": "edgeone makers deploy",
+    "env:token": "edgeone makers env set PROBE_TOKEN"
   }
 }

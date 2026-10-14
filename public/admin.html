@@ -365,9 +365,15 @@
         <div class="field">
           <label for="s-cn-probes">大陆探测臂端点</label>
           <!-- 逗号分隔可填多个：多地域端点会各自回报一份结果，后端据此做多数表决
-               （同一套表决逻辑，GP 的「多探针」与这里的「多地域」共用）。 -->
-          <input id="s-cn-probes" placeholder="https://xxx.edgeone.app/api/probe">
+               （同一套表决逻辑，GP 的「多探针」与这里的「多地域」共用）。
+               占位符只写域名即可：请求时会拼上 /api/ping 与 /api/ssl，
+               填了完整路径也会被覆盖，写全反而让人以为路径不能改。 -->
+          <div style="display:flex;gap:8px">
+            <input id="s-cn-probes" placeholder="https://xxx.edgeone.app">
+            <button class="btn" type="button" id="s-cn-verify">验证</button>
+          </div>
           <span class="hint">逗号分隔可填多个（多地域做多数表决）；留空 = 不启用</span>
+          <span class="hint" id="s-cn-verify-out"></span>
         </div>
         <div class="field">
           <label for="s-cn-token">探测臂令牌</label>

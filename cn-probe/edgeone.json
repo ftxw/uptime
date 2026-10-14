@@ -1,6 +1,7 @@
 {
   "cloudFunctions": {
-    "mainlandRegions": ["ap-guangzhou"],
-    "overseasRegions": ["ap-hongkong"]
+    "regions": {
+      "mainland": ["ap-guangzhou"]
+    }
   }
 }
