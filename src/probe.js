@@ -217,18 +217,50 @@ function gpTimeoutSec(env) {
 }
 
 /**
+ * 把位置筛选「放宽」一档：同一地理范围，但不限网络类型。
+ * 返回 null 表示"已经没有更宽的档位"（原筛选本来就��限网络类型）。
+ *
+ * Globalping 的 magic 语法是 `<位置>+<网络类型>`，去掉 `+<网络类型>` 后缀
+ * 就是"这个位置的全部探针"。以 CN 为例（数字来自后台设置项的说明）：
+ *   CN+datacenter-network → 40 个云机房探针
+ *   CN+eyeball-network    → 26 个家庭宽带探针
+ *   CN                    → 两者合计 66 个
+ *
+ * ✅ 仍然是**同一个国家、不跨区**，符合"只在相同地区换点位"的取舍原则，
+ *    而且探针池更大，`no_probes_found`（筛选过窄导致无可用探针）的概率更低。
+ *
+ * ⚠️ 刻意**不**把兜底做成"换网络类型"（云机房 → 家庭宽带）。近 30 天实测：
+ *      CN+datacenter-network  9218 次 / 99.7% / 平均总耗时 335ms
+ *      CN+eyeball-network       13 次 / 76.9% / 平均总耗时 1816ms / 最坏撞满 15s
+ *    拿 76.9% 的东西当兜底，等于"兜底比主力更差"，会凭空推高 consecutive_fail、
+ *    攒够阈值发假告警。放宽网络类型的收益远小于它引入的噪声。
+ */
+export function widenMagic(magic) {
+  const s = String(magic || "").trim();
+  if (!s) return null;
+  const i = s.indexOf("+");
+  if (i <= 0) return null; // 没有 + 后缀，或以 + 开头（非法）→ 无更宽的档位
+  const wide = s.slice(0, i).trim();
+  return wide && wide !== s ? wide : null;
+}
+
+/**
  * Globalping：发起一次测量，返回 measurement id（不等待结果）
  * 真正的探测由 Globalping 的探针执行 —— 所以调度器在哪里完全不影响探测点位置。
  * ⚠️ 额度按「探测点个数」计费（实测 X-Request-Cost === limit），limit 越小越省。
  *    默认 3 是为了让「多数表决」成立，成本换准确率，可在后台改。
+ *
+ * @param magicOverride 覆盖全局位置筛选。用于「同地区不同点位」的分层兜底：
+ *   正常传空走后台设置的 `GP_MAGIC`；放宽重试时传同国家不限网络类型的值。
+ *   不设成"站点级位置"，原因见下面 magic 那行注释。
  */
-export async function gpCreate(env, site) {
+export async function gpCreate(env, site, magicOverride) {
   const token = env && env.GLOBALPING_TOKEN;
   const u = new URL(normalizeUrl(site.url));
   // 位置筛选是**全局设置**（后台「设置 → 探测」）。
   // 不做成站点级的原因：一个站点只用一个后端，站点级的 CF 区域组/GP 筛选
   // 必然只有一个是活的，另一个是死配置。
-  const magic = env.GP_MAGIC || defOf("gp_magic");
+  const magic = magicOverride || env.GP_MAGIC || defOf("gp_magic");
   const limit = Number(env.GP_LIMIT || defOf("gp_limit"));
   const timeoutSec = gpTimeoutSec(env);
   const protocol = u.protocol === "http:" ? "HTTP" : "HTTPS";

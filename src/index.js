@@ -29,6 +29,7 @@ import {
   judge,
   normalizeUrl,
   zhError,
+  widenMagic,
   gpCreate,
   gpCollect,
   gpDecide,
@@ -788,16 +789,109 @@ async function sendAlerts(env, alerts) {
  * 调 CF 探测后端：按 hint 分组，一组一次 DO 调用
  * 用完即 kill —— DO 常驻内存会持续计 duration 费（免费额度 13,000 GB-s/天）
  */
+/**
+ * 带重试的 CF 探测。
+ *
+ * ## 为什么必须重试（依据实测数据，不是推测）
+ * 近 7 天 `cf:apac` 926 次里失败 11 次，**失败原因 100% 是「请求超时」**，
+ * 一次「连接被拒绝」或 TLS 错误都没有。而同样这些站点走 Globalping CN 云机房
+ * 是 99.5% / 102ms —— 说明目标可达且稳定，问题出在 CF 机房到大陆的跨境链路
+ * 概率性丢包。这类失败**下一次通常就过**，直接记成"站点故障"等于把链路抖动
+ * 误报成业务故障，还会推高 consecutive_fail、攒够阈值触发假告警。
+ *
+ * ## 重试策略（刻意保守）
+ * - **只重试失败的条目**，已成功的不重发：既省子请求，也不会把一次成功的慢值
+ *   覆盖成第二次的失败值。
+ * - **只重试 1 轮**。最坏 2 次调用 × 8s 超时 = 16s，离 Worker 的 50 子请求与
+ *   30s 墙钟都还有余量；多轮对概率性丢包没有额外收益，只是拖慢整轮 cron。
+ * - **DO 调用整体抛错时整批重试 1 次**；仍失败则抛带 `infrastructure` 标记的错误，
+ *   由调用方决定**不落库** —— 探测链路故障 ≠ 站点故障（与 cn 探测臂分支同一条约定）。
+ *
+ * ## ⚠️ 为什么 kill() 放在最外层 finally（实测踩过的坑）
+ * prober.js 用「在 blockConcurrencyWhile 里抛错」终止 DO 实例来省 duration 费。
+ * 最初沿用旧代码写法、把 kill() 放在每次 run() 之后，结果**紧接着的重试全部打在
+ * 已终止的 DO 上** —— 本地 `--test-scheduled` 实测日志是 `retried:0, retryFailed:true`，
+ * 重试形同虚设。现在改成：整轮（首次 + 重试）复用同一个 DO 实例，跑完只 kill 一次。
+ * 既让重试真正生效，也把 kill 次数从 2 次降回 1 次。
+ *
+ * ## 子请求预算
+ * 每次探测调用消耗 1 个 Worker 子请求；发生重试时该组最多额外 +1。
+ * 因为 `subreq_budget` 默认 30、每轮通常只有 1~2 组，这个增量在预算内；
+ * 日志里的 `retried` 字段会如实记录实际重试数，便于核对。
+ */
 async function probeViaCf(env, hint, list, timeoutMs) {
+  // 同一 hint → 同一个 DO → 同一个机房；整个重试过程复用它，最后统一 kill 一次
   const stub = env.PROBER.get(env.PROBER.idFromName(`prober-${hint}`), {
     locationHint: hint,
   });
-  let out = null;
+  const items = list.map((s) => ({ url: s.url, keyword: s.keyword || null }));
+  const shape = (out) => ({
+    colo: (out.egress && out.egress.colo) || hint,
+    egress: out.egress,
+  });
+
   try {
-    out = await stub.run(
-      list.map((s) => ({ url: s.url, keyword: s.keyword || null })),
-      timeoutMs
+    let first;
+    try {
+      first = await stub.run(items, timeoutMs);
+    } catch {
+      // 整批第一次就失败（DO 冷启动 / RPC 抖动）→ 在同一实例上再试一次
+      first = await stub.run(items, timeoutMs);
+    }
+    // 旧实现直接读 out.egress，DO 返回异常形状时会抛 TypeError，
+    // 而这个错误信息会被调用方当成"站点失败原因"写进 checks 表 —— 在这里挡掉。
+    if (!first || !Array.isArray(first.results)) {
+      throw new Error(`CF 探测(${hint}) 未返回结果`);
+    }
+
+    const need = [];
+    for (let i = 0; i < list.length; i++) {
+      const r = first.results[i];
+      if (!r || r.ok === false) need.push(i);
+    }
+    if (!need.length) {
+      return { ...shape(first), results: first.results, wall: first.wall, retried: 0 };
+    }
+
+    try {
+      const second = await stub.run(
+        need.map((i) => items[i]),
+        timeoutMs
+      );
+      const results = first.results.slice();
+      if (second && Array.isArray(second.results)) {
+        need.forEach((idx, j) => {
+          const rr = second.results[j];
+          // 只有重试真的拿回了结果才覆盖；重试缺结果就保留第一次的，
+          // 免得把一次真实采样变成空白。
+          if (rr) results[idx] = rr;
+        });
+      }
+      return {
+        ...shape(second || first),
+        results,
+        wall: (first.wall || 0) + ((second && second.wall) || 0),
+        retried: need.length,
+      };
+    } catch {
+      // 重试这批没跑通：保留第一次的结果 —— 其中的失败条目仍是真实结论，照常落库
+      // （那是"这一刻确实连不上"，不是"我们测不了"）。首次调用已经成功，说明 DO 本身可用，
+      // 所以这里不按基础设施故障处理，否则会白白丢掉一批有效数据。
+      return {
+        ...shape(first),
+        results: first.results,
+        wall: first.wall,
+        retried: 0,
+        retryFailed: true,
+      };
+    }
+  } catch (e) {
+    // 首次两次都失败 = 探测链路真的不可用。标记成基础设施故障，调用方据此不落库。
+    const err = new Error(
+      `CF 探测(${hint}) 重试后仍失败：${String((e && e.message) || e)}`
     );
+    err.infrastructure = true;
+    throw err;
   } finally {
     try {
       await stub.kill();
@@ -805,12 +899,6 @@ async function probeViaCf(env, hint, list, timeoutMs) {
       // kill 通过抛错终止实例，报错是预期行为
     }
   }
-  return {
-    colo: (out.egress && out.egress.colo) || hint,
-    egress: out.egress,
-    results: out.results,
-    wall: out.wall,
-  };
 }
 
 /**
@@ -1038,6 +1126,9 @@ async function dispatch(env, sites) {
   let used = 0;
   const started = [];
   const skipped = [];
+  // 探测基础设施故障（DO 重试后仍不可用）—— 只进日志，不写 checks 表。
+  // 正常情况下恒为空数组；非空说明探测链路本身出了问题，该看而不是当成站点故障。
+  const cfInfra = [];
 
   // 已挂起（仅 Globalping 两阶段会产生 pending）本轮不再重复发起
   const { results: pend } = await d.prepare("SELECT site FROM pending").all();
@@ -1073,44 +1164,99 @@ async function dispatch(env, sites) {
       try {
         const out = await probeViaCf(env, hint, list, timeoutMs);
         list.forEach((s, i) => {
-          cfResult[s.id] = { result: out.results[i], colo: out.colo, hint };
+          const r = out.results[i];
+          // DO 返回条数少于请求数时 r 会是 undefined，而 persistCf 会读 r.status ——
+          // 旧代码在这里不做判断，直接把 undefined 传下去会在落库时炸掉整轮 cron。
+          cfResult[s.id] = r
+            ? { result: r, colo: out.colo, hint }
+            : { error: "探测未返回结果", colo: out.colo, hint };
         });
-        started.push({ hint, sites: list.map((s) => s.id), colo: out.colo, wall: out.wall });
+        started.push({
+          hint,
+          sites: list.map((s) => s.id),
+          colo: out.colo,
+          wall: out.wall,
+          retried: out.retried || 0,
+          retryFailed: !!out.retryFailed,
+        });
       } catch (e) {
-        list.forEach((s) => {
-          cfResult[s.id] = { error: String((e && e.message) || e), hint };
+        // ⚠️ 不写站点失败记录：探测基础设施故障 ≠ 站点故障。
+        // 旧实现在这里给组内每个站点写一条 ok=0，会凭空推高 consecutive_fail，
+        // 攒够 fail_threshold 就发假告警 —— 与 cn 探测臂分支「我们没拿到数据 ≠
+        // 站点挂了」是同一条约定，这里补齐。故障详情进日志的 cfInfra，不进 checks 表。
+        cfInfra.push({
+          hint,
+          sites: list.map((s) => s.id),
+          error: String((e && e.message) || e),
         });
       }
     }
   }
 
-  // ── Globalping 后端：每站点 1 次 create
+  // ── Globalping 后端：每站点 1 次 create；失败时在 GP **内部**逐级降级 ──
+  //
+  // 分层依据（近 30 天线上实测，不是推测）：
+  //   CN+datacenter-network  9218 次 / 99.7% / 平均 93ms / 平均总耗时 335ms   ← 主力
+  //   CN+eyeball-network      13 次 / 76.9% / 平均总耗时 1816ms / 最坏撞满 15s ← 不可用作兜底
+  //
+  // 发起失败的主因是 **API 抖动** 与 **额度耗尽**，而换筛选只对 `no_probes_found`
+  // 有效 —— 所以顺序是「原样重试 → 同国家放宽网络类型 → 交回调用方」，
+  // 而不是一失败就换后端。跨后端降级（GP → CF）留到全部层级都失败之后才发生。
   const gpStarted = [];
   const gpFailed = [];
+  const gpPrimary = (env && env.GP_MAGIC) || defOf("gp_magic");
+  const gpWide = widenMagic(gpPrimary);
   for (const s of gpSites) {
-    if (used + 1 > budget) {
+    const tiers = [
+      { magic: gpPrimary, why: "primary" },
+      { magic: gpPrimary, why: "retry" },
+    ];
+    if (gpWide) tiers.push({ magic: gpWide, why: "wide" });
+
+    let done = false;
+    let budgetOut = false;
+    let lastErr = null;
+    for (const t of tiers) {
+      // 每次 create 消耗 1 个子请求，最多 3 次（主力 / 原样重试 / 放宽）
+      if (used + 1 > budget) {
+        budgetOut = true;
+        break;
+      }
+      used += 1;
+      try {
+        const { id, source, quota } = await gpCreate(env, s, t.magic);
+        await d
+          .prepare(
+            "INSERT OR REPLACE INTO pending (site, measurement_id, source, created_ts) VALUES (?,?,?,?)"
+          )
+          .bind(s.id, id, source, new Date().toISOString())
+          .run();
+        gpStarted.push({ site: s.id, id, source, quota, tier: t.why });
+        done = true;
+        break;
+      } catch (e) {
+        lastErr = e;
+        gpStarted.push({ site: s.id, tier: t.why, error: String((e && e.message) || e) });
+      }
+    }
+    if (done) continue;
+    // 预算耗尽与"确实发不出去"是两回事：前者只是这轮排不上，不该记成故障
+    if (budgetOut) {
       skipped.push(s.id);
       continue;
     }
-    used += 1;
-    try {
-      const { id, source, quota } = await gpCreate(env, s);
-      await d
-        .prepare(
-          "INSERT OR REPLACE INTO pending (site, measurement_id, source, created_ts) VALUES (?,?,?,?)"
-        )
-        .bind(s.id, id, source, new Date().toISOString())
-        .run();
-      gpStarted.push({ site: s.id, id, source, quota });
-    } catch (e) {
-      const msg = String((e && e.message) || e);
-      gpStarted.push({ site: s.id, error: msg });
-      gpFailed.push({ site: s, err: msg });
-    }
+    gpFailed.push({ site: s, err: String((lastErr && lastErr.message) || lastErr) });
   }
 
-  // ── 自动降级：Globalping 发起失败 → 改走 CF（按 hint 分组，省子请求）
-  // 典型失败：位置筛选过窄导致 no_probes_found、额度耗尽、API 抖动
+  // ── 最后一级降级：GP 内部三层（原样重试 → 同国家放宽 → 仍失败）都走不通 → 改走 CF ──
+  //
+  // ⚠️ 这是全流程**唯一一处跨后端降级**，方向上属于"从好退到差"：
+  //    GP 主力 99.7% / 93ms，CF 兜底 98.8% / 557ms。所以刻意放在最后 ——
+  //    只有 GP 完全不可用（API 挂了 / 额度耗尽）才走。
+  //    走这条路时 source 记成 `cf:fallback-*`，origin.js 据此渲染成
+  //    `CF:APAC（降级）`，数据来源在页面上永远可辨，不会被悄悄藏起来。
+  //    再失败则**不写任何检查记录**（见下面 catch 里的 cfInfra）：
+  //    我们测不了 ≠ 站点挂了。
   const fellBack = [];
   if (gpFailed.length) {
     const groups = {};
@@ -1127,16 +1273,25 @@ async function dispatch(env, sites) {
       try {
         const out = await probeViaCf(env, hint, list, timeoutMs);
         list.forEach((s, i) => {
-          cfResult[s.id] = { result: out.results[i], colo: out.colo, hint, fallback: true };
+          const r = out.results[i];
+          cfResult[s.id] = r
+            ? { result: r, colo: out.colo, hint, fallback: true }
+            : { error: "探测未返回结果", colo: out.colo, hint, fallback: true };
         });
-        fellBack.push({ hint, sites: list.map((s) => s.id), colo: out.colo });
+        fellBack.push({
+          hint,
+          sites: list.map((s) => s.id),
+          colo: out.colo,
+          retried: out.retried || 0,
+        });
       } catch (e) {
-        list.forEach((s) => {
-          cfResult[s.id] = {
-            error: String((e && e.message) || e),
-            hint,
-            fallback: true,
-          };
+        // 同上：GP 已经发起失败、CF 又整批不可用时，**两个后端都没拿到数据**。
+        // 此时写站点失败等于把"我们测不了"记成"站点挂了"，不写。
+        cfInfra.push({
+          hint,
+          sites: list.map((s) => s.id),
+          from: "gp-fallback",
+          error: String((e && e.message) || e),
         });
       }
     }
@@ -1177,7 +1332,8 @@ async function dispatch(env, sites) {
       // 端点级失败（一个端点都没连上）：**绝不当成站点失败**。
       // 与 collectGlobalping 的 broken / 平票分支同一条约定 —— 我们没拿到数据 ≠ 站点挂了。
       // 写失败会凭空推高 consecutive_fail，攒够阈值还会发告警。
-      // （顺带：CF 分支目前是「DO 调用抛错也写一条失败记录」，这是既有行为，本次**不动**它。）
+      // （CF 分支原先也有同样的毛病：DO 调用抛错会给组内每个站点写一条 ok=0。
+      //   已一并改成「只记日志、不写 checks」，见上面的 cfInfra。）
       if (!okEps.length) {
         cnDropped.push(...endpoints.map((e) => ({ base: e.base, error: e.error })));
       } else {
@@ -1203,7 +1359,7 @@ async function dispatch(env, sites) {
     }
   }
 
-  return { used, started, gpStarted, fellBack, skipped, cnDropped, cfResult };
+  return { used, started, gpStarted, fellBack, skipped, cnDropped, cfInfra, cfResult };
 }
 
 /** 把 CF 后端的即时结果落库并更新状态 */
@@ -2713,6 +2869,10 @@ export default {
         dispatched: disp.started,
         gpStarted: disp.gpStarted,
         skipped: disp.skipped,
+        // 探测基础设施故障（DO 重试后仍不可用）：该批站点本轮不产出检查记录。
+        // 正常恒为 []；非空说明探测链路本身有问题（DO 不可达 / RPC 持续失败），
+        // 而不是站点故障 —— 这是该排查的信号，不该变成一堆假告警。
+        cfInfra: disp.cfInfra,
         // 子请求：探测已用 / 本轮总预算。SSL 检测的花销从**同一份**预算里扣，
         // 所以 `subreqUsed > subreqBudget` 永远不该出现；`subreqUsed` 贴着预算
         // 也说明站点偏多，该考虑调低 `ssl_per_tick`（或调小 `subreq_budget`）。
