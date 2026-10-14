@@ -9,7 +9,7 @@ CREATE TABLE IF NOT EXISTS sites (
   name           TEXT NOT NULL,
   url            TEXT NOT NULL,
   group_name     TEXT,                -- 所属分类；NULL/空 = 未分组
-  probe_kind     TEXT,                -- 'cf' | 'globalping'；NULL = 继承全局默认
+  probe_kind     TEXT,                -- 'cf' | 'globalping' | 'cn'；NULL = 继承全局默认
   -- 位置（CF 区域组 / Globalping 筛选）是**全局设置**，不在这里。
   -- 一个站点只解析出唯一后端，站点级放两份位置必然只有一份生效，是死配置。
   expect_codes   TEXT,                -- 逗号分隔，如 "200,301"；空 = 接受 2xx/3xx

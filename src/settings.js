@@ -33,6 +33,9 @@ export const SETTING_META = {
   utc_offset_min:   { env: "UTC_OFFSET_MIN",   def: "480" },                   // 展示时区，480 = UTC+8
   alert_webhook:    { env: "ALERT_WEBHOOK",    def: "" },
   globalping_token: { env: "GLOBALPING_TOKEN", def: "" },                      // 后台只写、不放回滚
+  cn_probes:        { env: "CN_PROBES",        def: "" },                      // 大陆探测臂端点，逗号分隔；空 = 未启用
+  cn_token:         { env: "CN_TOKEN",         def: "" },                      // 探测臂令牌（只写不读，回显掩码）
+  cn_timeout_ms:    { env: "CN_TIMEOUT_MS",    def: "8000" },                  // 探测臂单条超时（与 CF 的 timeout_ms 独立）
 };
 
 /** 后台可改的全部设置项。/api/settings 的读写白名单与回显清单都从这里派生。 */

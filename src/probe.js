@@ -5,6 +5,7 @@
  *
  *   kind = 'cf'         → Cloudflare Durable Object + locationHint（粗粒度区域组）
  *   kind = 'globalping' → Globalping 探针网络（可细到 city / asn / 家庭宽带）
+ *   kind = 'cn'         → 自建大陆探测臂（EdgeOne Makers，出口在中国大陆）—— 境内打境内
  *   kind = 'auto'       → 配了 GLOBALPING_TOKEN 就走 globalping，否则回落 cf
  *
  * ⚠️ CF 侧位置能力的实测边界（2026-09-22 验证，11 个区域组全部命中且可复现）：
@@ -28,8 +29,24 @@ export const REGION_GROUPS = [
   "oc", "afr", "me",
 ];
 
+/**
+ * 补 scheme 的归一化。
+ *
+ * ⚠️ 正则**必须**保留 `://`，不能放宽成 `^[a-z][a-z0-9+.-]*:`。
+ *    否则 `localhost:8080` / `example.com:8443` 这类「主机:端口」会被误判成 scheme
+ *    而原样返回 —— 那是更常见、更不能坏的输入（探测内网/自建端口）。
+ *    保留 `://` 后，它依旧会被补成 `https://localhost:8080`，行为不变。
+ *
+ * 为什么要放宽到「任意 scheme」而不是只认 http(s)：
+ *    `ftp://x.com` 不匹配 `^https?://` → 被补成 `https://ftp://x.com`，
+ *    而 `new URL()` 能解析成功（host 变成 `ftp`、protocol 仍是 https），
+ *    于是白打一次 DNS 并报出误导性的 ENOTFOUND —— 把「参数写错」伪装成「网络故障」。
+ *    改为「只要带任意 scheme 就原样返回」，真伪交给后续的 protocol 校验去拒。
+ */
 export function normalizeUrl(u) {
-  return /^https?:\/\//i.test(u) ? u : `https://${u}`;
+  return /^[a-z][a-z0-9+.-]*:\/\//i.test(String(u ?? "").trim())
+    ? String(u ?? "").trim()
+    : `https://${String(u ?? "").trim()}`;
 }
 
 /**
@@ -591,4 +608,308 @@ export async function gpSslCheck(env, site, { maxSubreq = null } = {}) {
     subreq,
   };
 }
+
+/* ─────────────────────── 大陆探测臂（kind = 'cn'）─────────────────────── */
+
+/**
+ * 大陆探测臂是**另一个已部署的 EdgeOne Makers 项目**（跑在 ap-guangzhou，出口是腾讯云段），
+ * 通过 HTTPS 暴露 /api/probe、/api/ssl、/api/ping 三个接口。
+ *
+ * 它与 Globalping 的本质区别：
+ *   · 探测点是**我们自己的**，境内打境内，ttfb 才是站点性能而不是国际链路噪声；
+ *   · 批量接口 —— N 个站点一次调用就测完，CF 侧只花 1 个子请求
+ *     （Globalping 是每站点 2 个子请求），站点越多省得越多；
+ *   · 探测端**刻意不做判定**（results[].ok 只表示 HTTP 层跑通），判定口径唯一留在本仓库，
+ *     否则「后台手点测」与「自动探测」会用两套规则得出不同结论（同 gpCollect 的立场）。
+ *
+ * ⚠️ 端点鉴权有两种形态，代码必须同时支持：
+ *   ① 裸域名形态（绑了自定义域名的正式形态）：base 无 query，直接请求，无需 cookie。
+ *   ② 预览令牌形态（当前测试形态）：base 带 `?eo_token=&eo_time=`，直接请求会 401；
+ *      必须先请求一次抓 `Set-Cookie`，再带 `Cookie` 头请求**去掉 query 的干净 URL**。
+ *      eo_token 3 小时轮换一次，所以形态 ② 只用于打通链路，长期应换成绑域名（形态 ①）。
+ */
+
+/**
+ * 解析 `env.CN_PROBES`（逗号分隔）→ 去空、去重、去非法的 base URL 数组。
+ *
+ * 去重键**忽略 query**：同一个端点重新部署后 eo_token 会轮换，若按整串比较，
+ * 同一台机器会被当成两个端点探测两次（白花子请求 + 投票被重复计权）。
+ * 但 base 本身**保留 query** —— 那是预览令牌形态的鉴权入口，丢了就换不到 cookie。
+ */
+export function cnEndpoints(env) {
+  const raw = String((env && env.CN_PROBES) || "");
+  const seen = new Set();
+  const out = [];
+  for (const part of raw.split(",")) {
+    const s = part.trim();
+    if (!s) continue;
+    let u;
+    try {
+      u = new URL(s);
+    } catch {
+      continue; // 非法 URL 直接丢弃，不让它进探测列表
+    }
+    if (u.protocol !== "http:" && u.protocol !== "https:") continue;
+    // pathname 去掉尾部多余的 '/'，避免拼出 `//api/probe`；query 原样保留
+    const path = u.pathname.replace(/\/+$/, "");
+    const key = u.origin + path;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(u.origin + path + u.search);
+  }
+  return out;
+}
+
+/**
+ * 探测臂 cookie 缓存（模块级 Map，key = base）。
+ *
+ * 预览令牌形态下，每个 cold isolate 第一次请求都要先换一次 cookie；缓存直接按 base 存，
+ * 避免每轮 cron 都多打一次换 cookie 的请求。
+ * TTL 取 2.5h（令牌本身 3h）—— 留半小时余量，宁可早换，不要用过期令牌换 401。
+ */
+const CN_COOKIE_TTL_MS = 2.5 * 3600 * 1000;
+const cnCookieCache = new Map();
+
+/** base 是否带鉴权 query（预览令牌形态）—— 裸域名形态没有 query */
+function cnHasQuery(base) {
+  try {
+    return new URL(base).search !== "";
+  } catch {
+    return false;
+  }
+}
+
+/** 读 Set-Cookie。Workers 与 Node(undici) 都支持 getSetCookie()，回退到单值读取。 */
+function cnReadSetCookie(res) {
+  const h = res.headers;
+  if (typeof h.getSetCookie === "function") {
+    try {
+      return h.getSetCookie() || [];
+    } catch {
+      // 某些运行时 getSetCookie 会抛，退回单值读取
+    }
+  }
+  const raw = h.get("set-cookie");
+  return raw ? [raw] : [];
+}
+
+/** 单次带硬超时的 fetch —— 这层只防「端点整个卡死」拖垮整轮 cron */
+async function cnFetch(url, init, hardMs) {
+  const ac = new AbortController();
+  const timer = setTimeout(() => {
+    try {
+      ac.abort();
+    } catch {}
+  }, hardMs);
+  try {
+    return await fetch(url, { ...init, signal: ac.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * 预览令牌形态下换取 cookie（命中缓存则零请求）。
+ * @returns {{cookie: string|null, fetched: boolean}} fetched 用于子请求计数
+ */
+async function cnEnsureCookie(base, path, hardMs) {
+  const c = cnCookieCache.get(base);
+  if (c && c.exp > Date.now()) return { cookie: c.cookie, fetched: false };
+
+  const u = new URL(base);
+  u.pathname = path; // 保留 query（query 就是令牌入口）
+  const res = await cnFetch(u.toString(), { method: "GET", redirect: "manual" }, hardMs);
+  const cookies = cnReadSetCookie(res)
+    .map((s) => s.split(";")[0].trim())
+    .filter(Boolean);
+  if (!cookies.length) return { cookie: null, fetched: true };
+  const cookie = cookies.join("; ");
+  cnCookieCache.set(base, { cookie, exp: Date.now() + CN_COOKIE_TTL_MS });
+  return { cookie, fetched: true };
+}
+
+/**
+ * 对探测臂发起一次带鉴权的 POST，自动适配两种端点形态（见本节顶部说明）。
+ * @returns {{res: Response, data: any, text: string, subreq: number}}
+ */
+async function cnRequest(env, base, path, payload, hardMs) {
+  const token = env && env.CN_TOKEN;
+  const headers = {
+    "content-type": "application/json",
+    ...(token ? { "x-probe-token": String(token) } : {}),
+  };
+
+  let subreq = 0;
+  let cookie = null;
+  if (cnHasQuery(base)) {
+    const got = await cnEnsureCookie(base, path, hardMs);
+    if (got.fetched) subreq += 1; // 只有真的打了一次换 cookie 请求才计数
+    cookie = got.cookie;
+  }
+
+  const once = async (ck) => {
+    const u = new URL(base);
+    u.pathname = path;
+    // 有 cookie 就必须走**干净 URL**（带 query 会被再次 302）；
+    // 裸域名形态本来就没有 query，这里不动。
+    if (ck) u.search = "";
+    const res = await cnFetch(
+      u.toString(),
+      {
+        method: "POST",
+        headers: { ...headers, ...(ck ? { cookie: ck } : {}) },
+        body: JSON.stringify(payload),
+        // manual：预览令牌形态会返回 302 → Location 指向干净 URL，不跟随，自己按 cookie 重发
+        redirect: "manual",
+      },
+      hardMs
+    );
+    let text = "";
+    try {
+      text = await res.text();
+    } catch {}
+    let data = null;
+    if (text) {
+      try {
+        data = JSON.parse(text);
+      } catch {}
+    }
+    return { res, data, text };
+  };
+
+  let r = await once(cookie);
+  subreq += 1;
+  // cookie 过期/失效（401 或又被 302）→ 清缓存重换一次再试一次
+  if (cookie && (r.res.status === 401 || r.res.status === 302)) {
+    cnCookieCache.delete(base);
+    const got = await cnEnsureCookie(base, path, hardMs);
+    if (got.fetched) subreq += 1;
+    if (got.cookie) {
+      r = await once(got.cookie);
+      subreq += 1;
+    }
+  }
+  return { ...r, subreq };
+}
+
+/**
+ * 批量可用性探测：对**每个端点**发 **1 次** POST /api/probe（一次带上所有站点）。
+ *
+ * ⚠️ 是「每端点一次」，不是「每站点一次」—— 这是 CN 相对 Globalping 最大的成本优势：
+ *    GP 每站点 2 个子请求，CN 批量后 N 个站点只花 1 个。
+ *
+ * 单个端点失败**绝不能让整体失败**：记为端点级错误继续下一个，由调用方决定怎么表决。
+ * @returns {{endpoints: Array<{base, region?, ok:boolean, results?, error?}>}}
+ */
+export async function cnProbe(env, sites, timeoutMs) {
+  const eps = cnEndpoints(env);
+  const dflt = Number(defOf("cn_timeout_ms"));
+  const raw = Number((env && env.CN_TIMEOUT_MS) || timeoutMs || dflt);
+  const perMs = Number.isFinite(raw) && raw > 0 ? raw : dflt || 8000;
+  // 硬超时再叠 5s：探测臂已按 perMs 内部超时，这层只防「端点整个卡住」
+  const hardMs = perMs + 5000;
+
+  const items = sites.map((s) => ({
+    url: s.url,
+    ...(s.keyword ? { keyword: s.keyword } : {}),
+    timeoutMs: perMs,
+  }));
+
+  const endpoints = [];
+  for (const base of eps) {
+    try {
+      const { res, data, text, subreq } = await cnRequest(
+        env,
+        base,
+        "/api/probe",
+        { items },
+        hardMs
+      );
+      if (!res.ok) throw new Error(`HTTP ${res.status} ${String(text || "").slice(0, 120)}`);
+      if (!data || !Array.isArray(data.results)) throw new Error("响应缺少 results 数组");
+      endpoints.push({
+        base,
+        region: data.region || null,
+        ok: true,
+        results: data.results,
+        wallMs: data.wallMs ?? null,
+        subreq,
+      });
+    } catch (e) {
+      // 单个端点失败**绝不能**拖垮整轮 —— 记端点级错误，继续下一个
+      endpoints.push({ base, ok: false, error: String((e && e.message) || e) });
+    }
+  }
+  return { endpoints };
+}
+
+/** 把探测臂的 /api/ssl 单条结果转成 gpSslCheck 的同形结构（saveSsl 两边共用） */
+function cnSslShape(r, region) {
+  if (r.error) return { error: String(r.error) };
+  return {
+    // ⚠️ saveSsl / stateOf 认的是 1/0（`ssl_authorized === 1`），探测臂给的是布尔，这里转一次
+    authorized: r.authorized === true ? 1 : r.authorized === false ? 0 : null,
+    protocol: r.protocol ?? null,
+    issuer: r.issuer ?? null,
+    subject: r.subject ?? null,
+    key_type: r.key_type ?? null,
+    expires_at: r.expires_at ?? null,
+    days_left: typeof r.days_left === "number" ? r.days_left : null,
+    probe: region || null,
+  };
+}
+
+/**
+ * 批量查证书：对每个端点发 1 次 POST /api/ssl（一次带上所有站点）。
+ *
+ * ⚠️ 返回结构用 `byUrl` 映射而不是「像 gpSslCheck 那样返回单站结果」——
+ *    CN 是批量接口，一次调用覆盖多个站点，只能按 url 归集。
+ *    每条 value 的字段与 gpSslCheck 同形，调用方的 saveSsl 无需改动。
+ * 多端点时**取第一个成功返回的结果**（某个 url 已取到就不再被后续端点覆盖）。
+ *
+ * @returns {{byUrl: Object<string, object>, subreq: number}}
+ */
+export async function cnSsl(env, sites) {
+  const eps = cnEndpoints(env);
+  const dflt = Number(defOf("cn_timeout_ms"));
+  const perMs = Number.isFinite(dflt) && dflt > 0 ? dflt : 8000;
+  const hardMs = perMs + 5000;
+
+  const items = sites.map((s) => ({ url: normalizeUrl(s.url), timeoutMs: perMs }));
+  const byUrl = {};
+  let subreq = 0;
+  let lastErr = null;
+
+  for (const base of eps) {
+    if (items.every((it) => byUrl[it.url])) break; // 已全取到 → 不必再问后面的端点
+    try {
+      const { res, data, text, subreq: used } = await cnRequest(
+        env,
+        base,
+        "/api/ssl",
+        { items },
+        hardMs
+      );
+      subreq += used;
+      if (!res.ok) throw new Error(`HTTP ${res.status} ${String(text || "").slice(0, 120)}`);
+      if (!data || !Array.isArray(data.results)) throw new Error("响应缺少 results 数组");
+      for (const it of items) {
+        if (byUrl[it.url]) continue;
+        const r = data.results.find((x) => x.url === it.url);
+        if (!r) continue;
+        byUrl[it.url] = cnSslShape(r, data.region || null);
+      }
+    } catch (e) {
+      lastErr = String((e && e.message) || e);
+    }
+  }
+
+  // 一个端点都没成功 → 给每个站点一条可解释的错误（调用方照常 saveSsl，
+  // 与 gpSslCheck 失败时也返回 error 的行为一致：证书失败会按 failRetryH 更快重试）
+  if (!Object.keys(byUrl).length && lastErr) {
+    for (const it of items) byUrl[it.url] = { error: `证书检测失败：${lastErr}` };
+  }
+  return { byUrl, subreq };
+}
+
 

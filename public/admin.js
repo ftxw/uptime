@@ -331,12 +331,18 @@ function fillIntervalSelect(current) {
  * 实际一个字节都不看，用户以为配了保护、其实没有。这项能力没法补
  * （补就得自己 fetch 正文，也就失去了"从国内探针看"的意义），
  * 所以直接禁用输入并写明原因；保存时服务端也会把该值清掉。
+ *
+ * ⚠️ 只有 globalping 需要禁用：`cn`（大陆探测臂）跑在大陆云函数的 Node 运行时里，
+ *    能拿到完整响应正文，关键字校验**真实生效** —— 绝不能把这个限制错误地扩展过去。
  */
 function syncKindUi() {
-  const gp = qs("#f-kind").value === "globalping";
+  const kind = qs("#f-kind").value;
+  const gp = kind === "globalping";
   qs("#f-keyword").disabled = gp;
   qs("#f-keyword-hint").textContent = gp
     ? "Globalping 后端不返回正文，此项无法生效（保存时会清空）"
+    : kind === "cn"
+    ? "大陆探测臂返回正文，此项真实生效（防 200 假页面）"
     : "必须包含，防 200 假页面";
 }
 
@@ -371,9 +377,13 @@ function sslCell(ssl) {
  * 不再直接吐 `cf` / `globalping` 这种内部标识 —— 界面上统一叫 Cloudflare / Globalping，
  * 与「添加站点 → 探测后端」下拉里的写法一致（见 admin.html 的 #f-kind）。
  * ⚠️ 传进来的通常是 resolved_kind（服务端已归一化过），非法值一律按 Cloudflare 显示。
+ * ⚠️ `cn` 必须单独分支：漏了就会落到 `else` 被显示成 Cloudflare，
+ *    用户以为站点是走 CF 边缘测的，实际走的是大陆探测臂 —— 是"看错后端"的严重误导。
  */
 function backendLabel(s) {
-  return s.resolved_kind === "globalping" ? "Globalping" : "Cloudflare";
+  if (s.resolved_kind === "globalping") return "Globalping";
+  if (s.resolved_kind === "cn") return "大陆探测臂";
+  return "Cloudflare";
 }
 
 async function renderRows() {
@@ -834,8 +844,11 @@ function openForm(site) {
   fillGroupSelect(
     site?.group_name || (FILTER && FILTER !== UNGROUPED ? FILTER : UNGROUPED)
   );
-  // probe_kind 是必选项（表单里没有空选项）；服务端也会归一化，这里只做预设
-  qs("#f-kind").value = site?.probe_kind === "globalping" ? "globalping" : "cf";
+  // probe_kind 是必选项（表单里没有空选项）；服务端也会归一化，这里只做预设。
+  // ⚠️ 必须逐一列出合法值：漏掉 cn 会让编辑一个 cn 站点时下拉静默回落成 cf，
+  //    用户点一下「保存」就把后端改掉了（而且页面不报错）。
+  const kind = site?.probe_kind;
+  qs("#f-kind").value = kind === "globalping" ? "globalping" : kind === "cn" ? "cn" : "cf";
   qs("#f-codes").value = site?.expect_codes || "";
   qs("#f-keyword").value = site?.keyword || "";
   qs("#f-threshold").value = site?.fail_threshold ?? 3;
@@ -1151,6 +1164,15 @@ function fillSettingsForm(s) {
   qs("#s-gp-token-hint").textContent = s.has_globalping_token
     ? `已配置：${s.globalping_token_masked}（留空则保留）`
     : "未配置（额度 250 次/小时；配置后 500 次/小时）";
+  // 大陆探测臂：端点（逗号分隔字符串，原样回显）、超时、令牌掩码。
+  // ⚠️ 令牌与 Globalping 同款 —— 输入框永远清空，只把掩码写进 hint，
+  //    绝不把明文回填进 value（否则任何能打开设置的人都看得到令牌）。
+  qs("#s-cn-probes").value = s.cn_probes || "";
+  qs("#s-cn-timeout").value = s.cn_timeout_ms || "";
+  qs("#s-cn-token").value = "";
+  qs("#s-cn-token-hint").textContent = s.has_cn_token
+    ? `已配置：${s.cn_token_masked}（留空则保留）`
+    : "未配置（留空表示不使用令牌）";
 }
 
 qs("#settings-open").addEventListener("click", openSettings);
@@ -1172,6 +1194,29 @@ qs("#s-gp-token-clear").addEventListener("click", async () => {
     qs("#s-gp-token").value = "";
     qs("#s-gp-token-hint").textContent = "未配置（额度 250 次/小时；配置后 500 次/小时）";
     banner("Token 已清除", "info");
+    await loadAll();
+  } catch (err) {
+    if (!isMasked(err)) banner("清除失败：" + err.message, "error");
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+/**
+ * 「清除探测臂令牌」—— 删除已配置 cn_token 的唯一入口，与上面的 GP 清除同一套逻辑。
+ * 输入框留空只会走"保留旧值"（发 `__KEEP__`），没有这个按钮就永远撤不回配错的令牌。
+ * 破坏性操作，先确认一次。
+ */
+qs("#s-cn-token-clear").addEventListener("click", async () => {
+  if (!confirm("清除已保存的探测臂令牌？\n清除后大陆探测臂将以无令牌方式调用（若端点要求鉴权会失败）。")) return;
+  const btn = qs("#s-cn-token-clear");
+  btn.disabled = true;
+  try {
+    const r = await post("/settings", { clear_cn_token: true });
+    if (!r.ok) throw new Error(r.error || "清除失败");
+    qs("#s-cn-token").value = "";
+    qs("#s-cn-token-hint").textContent = "未配置（留空表示不使用令牌）";
+    banner("探测臂令牌已清除", "info");
     await loadAll();
   } catch (err) {
     if (!isMasked(err)) banner("清除失败：" + err.message, "error");
@@ -1232,6 +1277,11 @@ qs("#setform").addEventListener("submit", async (e) => {
     alert_webhook: qs("#s-webhook").value.trim(),
     // 留空 = 不修改已有 token（后端识别 __KEEP__）
     globalping_token: qs("#s-gp-token").value.trim() || "__KEEP__",
+    // 大陆探测臂：端点原样提交（后端负责按逗号切分）；超时原样提交；
+    // 令牌与 Globalping 同款 —— 留空 = 不修改（__KEEP__），只有「清除」能删。
+    cn_probes: qs("#s-cn-probes").value.trim(),
+    cn_timeout_ms: qs("#s-cn-timeout").value.trim(),
+    cn_token: qs("#s-cn-token").value.trim() || "__KEEP__",
   };
 
   try {

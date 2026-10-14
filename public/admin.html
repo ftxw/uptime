@@ -159,6 +159,9 @@
           <select id="f-kind">
             <option value="cf">Cloudflare</option>
             <option value="globalping">Globalping</option>
+            <!-- 大陆探测臂：出口在中国大陆机房（境内打境内），测国内站点拿到的延迟
+                 是真实的境内视角，比 cf（出口在香港/首尔）准得多。 -->
+            <option value="cn">大陆探测臂 · 境内视角</option>
           </select>
           <span class="hint">区域组 / 位置筛选在「设置 → 探测」里统一配置</span>
         </div>
@@ -355,6 +358,31 @@
           <label for="s-gptimeout">GP 探针超时（秒）</label>
           <input id="s-gptimeout" type="number" min="5" max="30" step="1" placeholder="15">
           <span class="hint">整数秒 5–30，只对 globalping 后端生效</span>
+        </div>
+      </div>
+
+      <div class="grid-3">
+        <div class="field">
+          <label for="s-cn-probes">大陆探测臂端点</label>
+          <!-- 逗号分隔可填多个：多地域端点会各自回报一份结果，后端据此做多数表决
+               （同一套表决逻辑，GP 的「多探针」与这里的「多地域」共用）。 -->
+          <input id="s-cn-probes" placeholder="https://xxx.edgeone.app/api/probe">
+          <span class="hint">逗号分隔可填多个（多地域做多数表决）；留空 = 不启用</span>
+        </div>
+        <div class="field">
+          <label for="s-cn-token">探测臂令牌</label>
+          <!-- 与 Globalping Token 同款：只写不读。输入框留空 = 不修改（发 __KEEP__），
+               已配置时只回显掩码；「清除」是删掉它的唯一入口。 -->
+          <div style="display:flex;gap:8px">
+            <input id="s-cn-token" type="password" placeholder="留空 = 不修改" autocomplete="off" style="flex:1;min-width:0">
+            <button class="btn" type="button" id="s-cn-token-clear">清除</button>
+          </div>
+          <span class="hint" id="s-cn-token-hint">未配置</span>
+        </div>
+        <div class="field">
+          <label for="s-cn-timeout">探测臂超时（ms）</label>
+          <input id="s-cn-timeout" type="number" min="1000" max="30000" step="500" placeholder="8000">
+          <span class="hint">只对 cn 后端生效，默认 8000（毫秒）</span>
         </div>
       </div>
 

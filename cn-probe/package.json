@@ -1,0 +1,8 @@
+{
+  "name": "cn-probe",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "edgeone makers dev --skip-env-sync"
+  }
+}

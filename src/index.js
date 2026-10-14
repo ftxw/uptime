@@ -2,11 +2,12 @@
  * uptime —— 站点监测编排层
  *
  * 核心设计：
- *   ① 探测后端可插拔（cf / globalping / auto），按站点配置选择，可自动降级
+ *   ① 探测后端可插拔（cf / globalping / cn / auto），按站点配置选择，可自动降级
  *   ② CF 探测走 Durable Object + locationHint（cron 也能锁区域）
  *   ③ Globalping 走「两阶段」：本轮发起测量、下一轮收取结果
  *      —— 因为 Workers 免费计划每次调用最多 50 个子请求，
  *         轮询等待几下就吃光了；两阶段把每站点压到 2 个子请求
+ *   ④ cn 大陆探测臂走**批量**接口：N 个站点一次调用测完，整批只花 1 个子请求
  */
 
 import {
@@ -32,6 +33,9 @@ import {
   gpCollect,
   gpDecide,
   gpSslCheck,
+  cnEndpoints,
+  cnProbe,
+  cnSsl,
 } from "./probe.js";
 import {
   constantTimeEqual,
@@ -254,6 +258,7 @@ async function buildAdminPayload(env) {
     categories: cats,
     ssl: sslMap,
     has_globalping_token: Boolean(env && env.GLOBALPING_TOKEN),
+    has_cn_token: Boolean(env && env.CN_TOKEN),
   };
 }
 
@@ -273,11 +278,12 @@ function shouldCleanup(rawSettings) {
 /**
  * 每个站点用哪个探测后端。
  *
- * 后端是**站点级必选项**（后台表单只给 cf / globalping 两个选项，没有 auto），
+ * 后端是**站点级必选项**（后台表单给 cf / globalping / cn 三个选项，没有 auto），
  * 所以这里不需要任何"全局默认"参与决策。空值只可能来自早期数据 ——
- * 一律回落到 cf：免费、无外部依赖、不消耗 Globalping 额度。
+ * 一律回落到 cf：免费、无外部依赖、不消耗外部额度。
  */
 function resolveKind(site) {
+  if (site.probe_kind === "cn") return "cn";
   return site.probe_kind === "globalping" ? "globalping" : "cf";
 }
 
@@ -311,12 +317,15 @@ function originOf(site, lastSource, lastProbe, env) {
   const real = formatOrigin(lastSource, lastProbe);
   if (real) return real;
   const kind = resolveKind(site);
-  return formatOrigin(
+  // 从未检查过的站点用配置推一个：`GP:CN` / `CF:APAC` / `CN`（大陆探测臂没有范围参数，
+  // 见 origin.js 的 `cn:` 分支），免得首页那一行留一块空白。
+  const src =
     kind === "globalping"
       ? `gp:${gpMagicOf(env) || defOf("gp_magic")}`
-      : `cf:${cfHintOf(env)}`,
-    null
-  );
+      : kind === "cn"
+        ? "cn:"
+        : `cf:${cfHintOf(env)}`;
+  return formatOrigin(src, null);
 }
 
 /**
@@ -338,6 +347,10 @@ function slowBaseMs(env, lastSource) {
     const sec = Number((env && env.GP_TIMEOUT_SEC) || defOf("gp_timeout_sec"));
     return (Number.isFinite(sec) && sec > 0 ? sec : 15) * 1000;
   }
+  // cn: 前缀**故意**走这里的默认分支（沿用 TIMEOUT_MS）：
+  // 大陆探测臂的 ttfb 在几十毫秒量级（实测 baidu 54ms / taobao 38ms / qq 50ms），
+  // 这个阈值实际上只在真超时才生效 —— 这是有意的，不要为它单独调小阈值去制造
+  // 「响应偏慢」误报。境内打境内的数据本来就不该按跨境链路的时间尺度去卡。
   return Number((env && env.TIMEOUT_MS) || 8000);
 }
 
@@ -507,6 +520,15 @@ function normalizeSetting(k, v) {
   switch (k) {
     case "timeout_ms":
       return num(1000, 30000);
+    case "cn_timeout_ms":
+      // 与 timeout_ms 同一区间：它是**探测臂内部**单条请求的超时（对齐 cn-probe 的
+      // clampTimeout），所以同样要拦非法值 —— 传个 "abc" 会让探测臂回落默认值，
+      // 表现为「设置里改了没生效」，比直接 400 更难排查。
+      return num(1000, 30000);
+    case "cn_probes":
+      // 端点列表：只做长度封顶（内容合法性由 cnEndpoints 逐条丢弃），
+      // 防止误粘一大段文本进 D1 并与其它设置一起被回显。
+      return String(v ?? "").slice(0, 500);
     case "ssl_per_tick":
       return num(0, 10);
     case "ssl_warn_days":
@@ -710,6 +732,7 @@ function effectiveSettingValue(env, raw, k) {
 /**
  * 设置的对外表示。token **永不回传明文**，只给掩码 + 是否存在。
  * /api/settings 与 /api/admin 共用，避免两处脱敏逻辑漂移（漏一处就是明文泄露）。
+ * ⚠️ 新增任何 *_token 项都必须在这里抹掉明文（cn_token 与 globalping_token 一视同仁）。
  */
 function publicSettings(env, raw) {
   const s = {};
@@ -717,6 +740,9 @@ function publicSettings(env, raw) {
   s.globalping_token = "";
   s.globalping_token_masked = maskToken(env.GLOBALPING_TOKEN);
   s.has_globalping_token = Boolean(env.GLOBALPING_TOKEN);
+  s.cn_token = "";
+  s.cn_token_masked = maskToken(env.CN_TOKEN);
+  s.has_cn_token = Boolean(env.CN_TOKEN);
   return s;
 }
 
@@ -975,7 +1001,30 @@ async function dueSites(env, sites) {
 }
 
 /**
- * 阶段二：发起本轮测量（Globalping 两阶段 / CF 即时）
+ * 把探测臂的一条 /api/probe 结果适配成 `judge()` / `gpDecide()` 认识的形状。
+ *
+ * 探测端**刻意不做判定**（`ok` 只表示 HTTP 层跑通），所以这里只做搬运：
+ *   · `error` 由 zhError 翻中文（探测臂原样带回 errorCode，如 ENOTFOUND）；
+ *   · `probe` 设成端点返回的 region（如 ap-guangzhou）—— 它就是这条票的「落点」；
+ *   · `failureSource` 恒 null：CN 没有 Globalping 那套平台自身故障归因。
+ */
+function adaptCnResult(site, raw, region) {
+  return {
+    url: raw.url || site.url,
+    ok: raw.ok !== false,
+    status: raw.status || 0,
+    ttfb: raw.ttfb ?? 0,
+    total: raw.total ?? 0,
+    bytes: raw.bytes ?? 0,
+    keywordHit: raw.keywordHit === undefined ? null : raw.keywordHit,
+    error: raw.ok === false ? zhError(`${raw.errorCode || ""} ${raw.error || ""}`) : null,
+    probe: region,
+    failureSource: null,
+  };
+}
+
+/**
+ * 阶段二：发起本轮测量（Globalping 两阶段 / CF 即时 / cn 批量）
  *
  * `subreq_budget` 是**本轮所有出网子请求**的额度。这里只是它的第一个消费者：
  * 消耗掉的量（返回值 `used`）会从 scheduled 传给 refreshSslStale 的额度里扣除，
@@ -990,16 +1039,21 @@ async function dispatch(env, sites) {
   const started = [];
   const skipped = [];
 
-  // 已挂起的站点本轮不再重复发起
+  // 已挂起（仅 Globalping 两阶段会产生 pending）本轮不再重复发起
   const { results: pend } = await d.prepare("SELECT site FROM pending").all();
   const pendingSet = new Set((pend || []).map((p) => p.site));
 
   // ── CF 后端：一个 DO 调用就能带一批，最省子请求
+  // ── cn 大陆探测臂：也是同步返回、批量接口，与 CF 一样不进 pending
   const cfSites = [];
   const gpSites = [];
+  const cnSites = [];
   for (const s of sites) {
     if (pendingSet.has(s.id)) continue;
-    (resolveKind(s) === "globalping" ? gpSites : cfSites).push(s);
+    const k = resolveKind(s);
+    if (k === "globalping") gpSites.push(s);
+    else if (k === "cn") cnSites.push(s);
+    else cfSites.push(s);
   }
 
   const cfResult = {};
@@ -1088,7 +1142,68 @@ async function dispatch(env, sites) {
     }
   }
 
-  return { used, started, gpStarted, fellBack, skipped, cfResult };
+  // ── cn 大陆探测臂：批量接口，N 个站点一次调用测完 ──
+  // 成本优势：Globalping 每站点 2 个子请求，CN 批量后 N 个站点只花 1 个（每个端点 1 个）。
+  const cnDropped = [];
+  if (cnSites.length) {
+    const eps = cnEndpoints(env);
+    if (!eps.length) {
+      // 没配端点 → 降级到 CF（与 Globalping 发起失败走**同一条降级路径、同一个标记**，
+      // 这样 origin.js 会把 source 渲染成 `CF:APAC（降级）`，而不是把降级藏起来）。
+      const hint = cfHintOf(env);
+      if (used + 1 > budget) {
+        skipped.push(...cnSites.map((s) => s.id));
+      } else {
+        used += 1;
+        try {
+          const out = await probeViaCf(env, hint, cnSites, timeoutMs);
+          cnSites.forEach((s, i) => {
+            cfResult[s.id] = { result: out.results[i], colo: out.colo, hint, fallback: true };
+          });
+          fellBack.push({ hint, sites: cnSites.map((s) => s.id), colo: out.colo, from: "cn" });
+        } catch (e) {
+          cnSites.forEach((s) => {
+            cfResult[s.id] = { error: String((e && e.message) || e), hint, fallback: true };
+          });
+        }
+      }
+    } else if (used + eps.length > budget) {
+      // 每端点算 1 个子请求（**不是**每站点 1 个 —— 这正是 CN 相比 GP 的成本优势）
+      skipped.push(...cnSites.map((s) => s.id));
+    } else {
+      used += eps.length;
+      const { endpoints } = await cnProbe(env, cnSites, timeoutMs);
+      const okEps = endpoints.filter((e) => e.ok && Array.isArray(e.results));
+      // 端点级失败（一个端点都没连上）：**绝不当成站点失败**。
+      // 与 collectGlobalping 的 broken / 平票分支同一条约定 —— 我们没拿到数据 ≠ 站点挂了。
+      // 写失败会凭空推高 consecutive_fail，攒够阈值还会发告警。
+      // （顺带：CF 分支目前是「DO 调用抛错也写一条失败记录」，这是既有行为，本次**不动**它。）
+      if (!okEps.length) {
+        cnDropped.push(...endpoints.map((e) => ({ base: e.base, error: e.error })));
+      } else {
+        for (const s of cnSites) {
+          const key = normalizeUrl(s.url);
+          // 每个端点给该站点产一条适配结果，再走 gpDecide 的「多数表决 + 多数派中位数」。
+          // 单端点时 gpDecide 自然退化为「1 票即结论」，不需要写两套逻辑。
+          const adapted = [];
+          for (const ep of okEps) {
+            const raw = ep.results.find((r) => normalizeUrl(r.url || "") === key);
+            if (!raw) continue;
+            adapted.push(adaptCnResult(s, raw, ep.region));
+          }
+          // gpDecide 返回 { void:true } = 没有任何可用结果 / 平票 → persistCf 不写记录
+          cfResult[s.id] = { kind: "cn", dec: gpDecide(s, adapted) };
+        }
+        started.push({
+          cn: true,
+          sites: cnSites.map((s) => s.id),
+          endpoints: okEps.map((e) => ({ base: e.base, region: e.region })),
+        });
+      }
+    }
+  }
+
+  return { used, started, gpStarted, fellBack, skipped, cnDropped, cfResult };
 }
 
 /** 把 CF 后端的即时结果落库并更新状态 */
@@ -1098,6 +1213,46 @@ async function persistCf(env, sites, cfResult) {
   for (const s of sites) {
     const hit = cfResult[s.id];
     if (!hit) continue;
+
+    // ── cn 大陆探测臂：判定已在 dispatch 里用 gpDecide 表决完毕 ──
+    // 这里只负责组装 source / probe 并落库。
+    // ⚠️ 端点级失败根本不进 cfResult（dispatch 里直接跳过），所以不会走到这里 ——
+    //    这正是刻意的：连不上探测臂 ≠ 站点挂了，写失败会凭空推高 consecutive_fail。
+    if (hit.kind === "cn") {
+      const dec = hit.dec || {};
+      // 无结论（平票 / 一条可用结果都没有）→ 不写记录，与 GP 的 vote-* 分支同一条约定
+      if (dec.void) continue;
+      const r0 = dec.pick || {};
+      const region = r0.probe || null;
+      const src = `cn:${region || "unknown"}`;
+      // 票型标注规则与 collectGlobalping 一致：全票是常态（不标），分歧才标 `ap-guangzhou (2/3)`
+      const probeLabel = dec.unanimous
+        ? region
+        : `${region || "?"} (${dec.okCount}/${dec.total})`;
+      rows.push({
+        ts: new Date().toISOString(),
+        site: s.id,
+        source: src,
+        probe: probeLabel,
+        ok: dec.ok,
+        status: r0.status ?? 0,
+        ttfb_ms: r0.ttfb ?? 0,
+        total_ms: r0.total ?? 0,
+        error: dec.reason,
+      });
+      perSite[s.id] = {
+        ok: dec.ok,
+        status: r0.status ?? 0,
+        ttfb: r0.ttfb ?? 0,
+        total: r0.total ?? 0,
+        reason: dec.reason,
+        threshold: Number(s.fail_threshold || 3),
+        source: src,
+        probe: probeLabel,
+      };
+      continue;
+    }
+
     if (hit.error) {
       const src0 = hit.fallback ? `cf:fallback-${hit.hint}` : `cf:${hit.hint}`;
       rows.push({
@@ -1201,6 +1356,10 @@ async function persistManualTest(env, site, { source, probe, result }) {
  *         逐站点按实际消耗扣减（gpSslCheck 返回 `subreq`）。
  *    只有第 ① 层时，SSL 的开销是"加在探测预算之外"的：30（探测）+ 28（2 站 SSL）
  *    已经超过 50，站点一多必然炸，而且炸的是整轮。
+ *
+ * 两条实现路径（见下方分支）：
+ *   · 配了 CN 端点 → cnSsl **一次批量**调用，整批只花 1 个子请求（预览令牌形态 2 个）；
+ *   · 没配 → 回到 gpSslCheck 的「每站点发起 + 轮询」老路径（回退能力保留）。
  */
 async function refreshSslStale(
   env,
@@ -1235,6 +1394,38 @@ async function refreshSslStale(
 
   const done = [];
   let spent = 0;
+
+  // ── cn 大陆探测臂：一次批量调用拿回**所有**站点的证书 ──
+  // 成本：整批只花 1 个 CF 子请求（预览令牌形态换 cookie 时 2 个），
+  // 而 gpSslCheck 是「每站点发起 + 轮询」，2 个站点最坏就吃掉十几个。
+  // 配了端点就走它；没配则保留下面的 gpSslCheck 路径（回退能力必须保留）。
+  const cnEps = cnEndpoints(env);
+  if (cnEps.length) {
+    // 预算是"花出去收不回"的：不够就整批顺延到下一轮（cron 每分钟一轮，代价只是晚几分钟）
+    if (budget !== null && spent >= budget) {
+      for (const s of stale) {
+        done.push({ site: s.id, skipped: true, error: "本轮子请求预算不足，证书检测顺延" });
+      }
+      return done;
+    }
+    let r;
+    try {
+      r = await cnSsl(env, stale);
+    } catch (e) {
+      r = { byUrl: {}, subreq: 0, error: String((e && e.message) || e) };
+    }
+    spent += Number(r.subreq || 0);
+    for (const s of stale) {
+      // cnSsl 按 url 归集；取不到该 url（端点成功但这个站点没结果）→ 退化为一条可解释的错误
+      const one = r.byUrl?.[normalizeUrl(s.url)] || {
+        error: r.error || "探测臂未返回该站点的证书",
+      };
+      await saveSsl(env, s.id, one);
+      done.push({ site: s.id, ...one });
+    }
+    return done;
+  }
+
   for (const s of stale) {
     // 预算结算：SSL 检测是同步轮询，花出去就收不回。额度不够就整站顺延到下一轮
     // （cron 每分钟一轮，顺延的代价只是证书晚几分钟更新），
@@ -1440,8 +1631,13 @@ export default {
           for (const k of SETTING_KEYS) {
             if (!(k in body)) continue;
             const v = body[k];
-            // token 传 __KEEP__ 或空 → 视为「不修改」，避免每次保存都把已配置的 token 清掉
-            if (k === "globalping_token" && (v === "__KEEP__" || v === null || v === undefined)) {
+            // token 传 __KEEP__ 或空 → 视为「不修改」，避免每次保存都把已配置的 token 清掉。
+            // ⚠️ 新增 token 项必须加入这一判断：漏掉的话表单每次保存都会把
+            //    `cn_token` 当成空串写回，令牌被静默清空（探测臂全线 401）。
+            if (
+              (k === "globalping_token" || k === "cn_token") &&
+              (v === "__KEEP__" || v === null || v === undefined)
+            ) {
               continue;
             }
             await saveSetting(env, k, normalizeSetting(k, String(v ?? "").trim()));
@@ -1451,6 +1647,10 @@ export default {
           if (body.clear_globalping_token) {
             await saveSetting(env, "globalping_token", "");
             saved.push("globalping_token:cleared");
+          }
+          if (body.clear_cn_token) {
+            await saveSetting(env, "cn_token", "");
+            saved.push("cn_token:cleared");
           }
 
           // 密码不在这里改 —— 它只来自环境变量 ADMIN_PASSWORD，
@@ -1917,6 +2117,9 @@ export default {
                 hide_url: !!meta.hide_url,
                 group_name: meta.group_name || UNGROUPED,
                 probe_kind: resolveKind(meta),
+                // 详情页页脚要显示「探测后端」，与服务端算好的同一口径（与 /api/overview 的 groups[].origin 同款）。
+                // 不在前端手拼 source/probe：三个前端各自拼接必然漂移，见 origin.js 模块注释。
+                origin: originOf(meta, meta.last_source, meta.last_probe, env),
                 cf_hint: cfHintOf(env),
                 gp_magic: gpMagicOf(env),
                 expect_codes: meta.expect_codes || null,
@@ -2166,11 +2369,19 @@ export default {
               );
             }
             const kind =
-              s.probe_kind === "globalping" ? "globalping" : s.probe_kind === "cf" ? "cf" : null;
+              s.probe_kind === "globalping"
+                ? "globalping"
+                : s.probe_kind === "cn"
+                  ? "cn"
+                  : s.probe_kind === "cf"
+                    ? "cf"
+                    : null;
             // Globalping 后端**不返回响应正文**，`gpCollect` 产出的结果里也没有
             // `keywordHit` 字段 —— 于是 judge() 的 `r.keywordHit === false` 永远不成立，
             // 关键字校验对 GP 站点是彻底的静默空转。存下来只会让人误以为它在生效，
             // 所以这里直接不落库，并回一条 warning 让前端提示用户。
+            // ⚠️ cn 后端**会**读正文并返回 keywordHit（见 cn-probe 的 probeOne），
+            //    所以它和 cf 一样允许关键字，不要一起塞进下面这条忽略规则。
             const keyword =
               kind === "globalping" || !s.keyword ? null : String(s.keyword).slice(0, 200);
             if (kind === "globalping" && s.keyword) {
@@ -2496,6 +2707,9 @@ export default {
         // 丢弃且未记检查记录的 pending（ttl / broken / throw）。正常恒为 []；
         // 非空说明 Globalping 那边有异常，且该站点本轮没有产出检查记录。
         gpDropped: collected.dropped,
+        // cn 端点级失败（一个端点都没连上探测臂，该批站点本轮不产出检查记录）。
+        // 正常恒为 []；非空说明大陆探测臂那边有问题（端点挂了 / 令牌过期 401）。
+        cnDropped: disp.cnDropped,
         dispatched: disp.started,
         gpStarted: disp.gpStarted,
         skipped: disp.skipped,
