@@ -2,6 +2,14 @@
 --
 -- 七张表：sites 站点配置 · checks 探测明细 · state 运行态 · pending 待收结果
 --        ssl 证书 · categories 分类 · meta 全局键值
+--
+-- ⚠️ 本文件是**结构的唯一真源**，但 Worker 运行时读不到它（schema.sql 不会被打进
+--    Worker 包）。`scripts/gen-schema.mjs` 会把它转成 `src/schema.js` 供代码 import，
+--    那份是生成物、不要手工改。改了本文件记得跑 `npm run schema`（deploy / dev 会自动跑）。
+--
+-- ↓ 这行是给脚本解析的：改了表结构就把它 +1，并在 src/migrations.js 里补一条增量迁移。
+--   全新库会直接按本文件的完整定义建表，只有**已有的旧库**才需要走迁移。
+-- schema-version: 1
 
 -- ── 监测目标 ──────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS sites (

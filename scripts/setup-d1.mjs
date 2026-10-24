@@ -224,11 +224,14 @@ function verifySchema(dbName) {
 
   fail(
     `「${dbName}」的结构与 schema.sql 不一致：\n  ${problems.join("\n  ")}\n\n` +
-      `schema.sql 全部是 IF NOT EXISTS，不会给已存在的旧表补列。\n` +
-      `**首选：手工补列**（数据保留，通常一条 ALTER 就够）：\n` +
+      `schema.sql 全是 IF NOT EXISTS，不会给已存在的表补列 —— 加字段要走迁移：\n` +
+      `  1. src/migrations.js 追加 { v: <新版本号>, stmts: ["ALTER TABLE <表> ADD COLUMN <列> <类型>"] }\n` +
+      `  2. schema.sql 顶部的 "-- schema-version:" 加 1（两处版本号必须一致）\n` +
+      `  3. 重跑本脚本\n` +
+      `部署后 Worker 下次请求会自动执行这条迁移；本地库同理（--local 与 --remote 完全隔离）。\n` +
+      `临时手工补一次也可以：\n` +
       `  npx wrangler d1 execute ${dbName} --remote --command="ALTER TABLE <表> ADD COLUMN <列> <类型>"\n` +
-      `  补完重跑本脚本即可。新增字段时本地库也要补一次（--local 与 --remote 完全隔离）。\n` +
-      `只有结构差异大到补不动时，才考虑换库名重建 —— ⚠️ 那会**丢掉该库全部数据**：\n` +
+      `⚠️ 换库名重建会**丢掉该库全部数据**，只作为最后手段：\n` +
       `  D1_NAME=${dbName}-v2 npm run setup`
   );
 }

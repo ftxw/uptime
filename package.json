@@ -4,8 +4,13 @@
   "private": true,
   "description": "站点可用性监控：Cloudflare Workers + D1 + Globalping",
   "scripts": {
+    "schema": "node scripts/gen-schema.mjs",
+    "check:schema": "node scripts/gen-schema.mjs --check",
+    "presetup": "node scripts/gen-schema.mjs",
     "setup": "node scripts/setup-d1.mjs production",
+    "predev": "node scripts/gen-schema.mjs",
     "dev": "node scripts/setup-d1.mjs local && wrangler dev",
+    "predeploy": "node scripts/gen-schema.mjs",
     "deploy": "node scripts/setup-d1.mjs production && wrangler deploy"
   },
   "devDependencies": {

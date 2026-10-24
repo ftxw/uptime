@@ -16,6 +16,11 @@ D1 数据库的**创建、绑定、建表都由 `scripts/setup-d1.mjs` 自动完
 不需要手工 `d1 create`、不需要复制 `database_id`、不需要单独跑建表。
 脚本是幂等的：库已存在就复用，多次执行不会产生副作用。
 
+**建表这一步连脚本都不需要**：Worker 在第一次请求时会自己检查库结构，缺表就按
+`schema.sql` 建好、把版本号写进 `meta`。所以不管你怎么部署（CLI、控制台连 GitHub、
+Dashboard 里贴代码、CI），**部署完打开页面就是能用的**，不会出现「部署成功但接口全报
+`no such table`」。详见 [库结构自举](#库结构自举为什么建表不靠命令)。
+
 **域名不由脚本绑定**，你在 Cloudflare 控制台自己绑（见第 1 步）。这样换域名不必改仓库、
 也不必重新部署。
 
@@ -98,9 +103,15 @@ npm run deploy
 
 全过程幂等，反复跑不会重复建库。
 
-> 第 4 步是必要的：`schema.sql` 全部是 `IF NOT EXISTS`，对「已存在但结构较旧」的表
-> **不会补列**。没有这道校验的话，改过表结构后部署照样通过，直到运行时才报
-> `no such column`。本项目不做增量迁移 —— 结构变了就换库名重建（见下）。
+> 第 3、4 步是**提前把问题暴露在部署阶段**，不是功能前提 —— 就算跳过它们，
+> Worker 第一次请求时也会自己把表建好（见下文「库结构自举」）。
+> 保留它们的价值在于：结构缺列这种事在部署日志里一行就能看到，
+> 而不是等到线上某个接口报 `no such column`。
+
+> 加字段怎么办：改 `schema.sql`，把顶部的 `-- schema-version:` 加 1，
+> 并在 `src/migrations.js` 里补一条 `ALTER TABLE ... ADD COLUMN`。
+> 新库直接按完整定义建；已经跑了一段时间的旧库靠那条迁移自动补列，
+> 不需要重建、不会丢数据。详见 [改表结构](#改表结构)。
 
 > ⚠️ **`wrangler.toml` 里的 `database_id` 不要提交**：第 2 步写回去的是**本机账号的实际
 > uuid**，只对当前账号有效。跑完 `setup` / `deploy` 后 `git status` 里 `wrangler.toml` 会
@@ -129,8 +140,12 @@ npm run deploy
 
 4. 保存即触发首次部署；此后**每次 `git push` 到 `main` 都会自动部署**
 
-> ⚠️ Deploy command 要填 `npm run deploy`，**不要**填 `npx wrangler deploy`——
-> 前者会先跑 D1 准备脚本，后者会跳过，新环境上会因为没有 `database_id` 而失败。
+> ⚠️ 推荐填 `npm run deploy`：它会先建库、把 `database_id` 写回配置。**全新环境**上
+> 少了这一步，`wrangler deploy` 会因为绑定指向空 uuid 而失败。
+>
+> 已经手工建好库、`database_id` 也填过的话，填 `npx wrangler deploy` 同样能跑起来 ——
+> **建表不依赖这条命令**，Worker 首次请求会自己补（见「库结构自举」）。
+> 区别只在暴露时机：缺列这类结构问题会在运行时才报错，而不是在部署日志里停下来。
 >
 > 生产分支默认 `main`。不同则在 Settings → Builds 改 *Production branch*。
 > CI 环境由 Cloudflare 自动注入 `CLOUDFLARE_API_TOKEN` / `CLOUDFLARE_ACCOUNT_ID`，不需要配密钥。
@@ -139,7 +154,11 @@ npm run deploy
 
 访问 `https://<你的域名>/admin` 登录后台，密码就是第 2 步设的 `ADMIN_PASSWORD`
 （30 天免登录，Cookie 为 `HttpOnly + SameSite=Lax + Secure`）。
-没设过那个变量的话，这个页面只会显示「后台已停用」与设置步骤 —— 照上面的步骤补上再刷新即可。
+
+**第一次打开时库是空的，页面会顺手把它建好** —— 不需要预先跑任何命令。
+这一步（最多十几条 DDL）只在首次请求发生一次，之后再也不会执行。
+
+没设过密码变量的话，这个页面只会显示「后台已停用」与设置步骤 —— 照上面的步骤补上再刷新即可。
 
 > **忘了密码**：直接重设环境变量即可 ——
 > ```bash
@@ -229,7 +248,7 @@ npx wrangler secret put GLOBALPING_TOKEN
 
 | 方法 | 路径 | 权限 | 说明 |
 |---|---|---|---|
-| GET | `/api/health` | 公开 | **部署自检**：D1 绑定是否生效、7 张表缺哪张、密码配没配。排障先看这个 |
+| GET | `/api/health` | 公开 | **部署自检**：D1 绑定是否生效、7 张表缺哪张、密码配没配、本次是否自动补了结构。排障先看这个 |
 | GET | `/api/overview` | 公开 | 统计 + 分组 + 30 天色条 + SSL，边缘缓存 30s。⚠️ 站点勾了「隐藏 URL」时，该条目的 `url` 为 `null` |
 | GET | `/api/site?id=&hours=&recent=` | 公开 | 详情页：窗口统计 + 延迟序列 + 最近检查 + 故障记录（同上，`url` 可能为 `null`） |
 | GET | `/api/admin` | 登录 | 站点 + 状态 + 分类 + 证书 + 设置（**一次拿全**） |
@@ -251,13 +270,28 @@ Token 类设置**只写不读**——读取接口只返回掩码（`glp_****ghij
 curl -s https://<你的域名>/api/health?pretty=1
 ```
 
-健康时返回 `ok: true` 与 7 张表名；不健康时 `ok: false` 并有 `hint` 说明下一步。三种典型返回：
+健康时返回 `ok: true` 与 7 张表名；不健康时 `ok: false` 并有 `hint` 说明下一步。
+
+`/api/health` 同时也是**自愈入口**：它在读取状态之前会先让库结构就位，
+所以库是空的时候打开它，表会被直接建好。返回里 `schema.auto_applied` 会说明这次做了什么：
+
+| `schema.auto_applied` | 含义 |
+|---|---|
+| `none` | 结构本来就是最新的（绝大多数时候） |
+| `created` | 这个库原本一张表都没有，本次建好了（`from_version: -1`） |
+| `repaired` | 库已存在但缺表/结构旧，本次补齐了（`from_version` 是补之前的版本） |
+| `failed` | 自动补结构失败，原因见 `schema.error` |
+
+典型返回与处理：
 
 | 返回 | 含义 | 处理 |
 |---|---|---|
-| `db_bound: false` | `env.DB` 不存在，D1 绑定没生效 | `npm run deploy`（会自动建库并把 `database_id` 写回 `wrangler.toml`） |
-| `missing_tables: [...]` 非空 | 库在，但表没建 | 同上；或手工 `npx wrangler d1 execute uptime-db --remote --file=schema.sql` |
+| `db_bound: false` | `env.DB` 不存在，D1 绑定没生效 | `npm run setup`（建库并把 `database_id` 写回 `wrangler.toml`）；然后重新部署 |
+| `missing_tables: [...]` 非空 | 库连通但表建不出来 | 看 `schema.error`：常见是 D1 写额度耗尽或库被删 |
 | `ok: true` 但 `password_set: false` | 部署完整，只是没设密码 | `npx wrangler secret put ADMIN_PASSWORD`（**类型要选 Secret**） |
+
+> 表结构与代码不一致（`no such column`）不在自愈范围内 —— 自动建表只会**建缺的表**，
+> 不会改已有的表。这类问题看 [改表结构](#改表结构)。
 
 > 所有 5xx 现在都会返回 JSON（`{ok:false, error, hint?}`），不会再出现
 > 「空格 500」——异常逃出 Worker 时浏览器只显示 `Failed to load resource: 500 ()`，
@@ -269,26 +303,133 @@ curl -s https://<你的域名>/api/health?pretty=1
 
 ```
 src/
-  index.js    路由（鉴权、接口、cron 调度）
-  db.js       数据层：所有 SQL 集中在此
-  probe.js    Globalping 发起 / 收取 / 判定（含证书提取）
-  origin.js   「探测来源」标签的唯一拼装处（GP:CN · Beijing/9808）
-  settings.js 运行参数元信息：唯一默认值来源 + 合法值校验
-  auth.js     常量时间比较 + HMAC 签名会话（密码只比环境变量，不存哈希）
+  index.js      路由（鉴权、接口、cron 调度）
+  db.js         数据层：所有 SQL 集中在此 + 库结构自举（ensureSchema）
+  schema.js     ⚠️ 生成物：schema.sql 转出的建表语句数组，不要手改
+  migrations.js 增量迁移：给已有的旧库补列（新库用不到）
+  probe.js      Globalping 发起 / 收取 / 判定（含证书提取）
+  origin.js     「探测来源」标签的唯一拼装处（GP:CN · Beijing/9808）
+  settings.js   运行参数元信息：唯一默认值来源 + 合法值校验
+  auth.js       常量时间比较 + HMAC 签名会话（密码只比环境变量，不存哈希）
 public/
   index.html / app.js        前台总览
   monitor.html / monitor.js  站点详情（图表为原生 SVG，无图表库）
   admin.html / admin.js      后台
   app.css                    样式
 scripts/
-  setup-d1.mjs  自动准备 D1：建库 + 写绑定 + 建表（幂等）；目标 production / local
-schema.sql      建表语句（全部 IF NOT EXISTS，可重复执行）
-wrangler.toml   只有绑定配置（D1 / 静态资源），**不含域名**；运行参数一律在后台「设置」里改
+  setup-d1.mjs   自动准备 D1：建库 + 写绑定 + 建表（幂等）；目标 production / local
+  gen-schema.mjs schema.sql → src/schema.js（`--check` 只校验不写）
+schema.sql        建表语句的**唯一真源**（全部 IF NOT EXISTS，可重复执行）
+wrangler.toml     只有绑定配置（D1 / 静态资源），**不含域名**；运行参数一律在后台「设置」里改
 ```
 
 数据表：`sites` `checks` `state` `pending` `ssl` `categories` `meta`
 索引：`checks` 上三个 —— `(site, ts DESC)` 主力查询、`(ts DESC)` 清理与全局统计、
 `(ok, ts, site)` 专供「取一段时间内的失败」（失败是稀疏的，这样只读失败行）
+
+---
+
+## 库结构自举（为什么建表不靠命令）
+
+**Worker 在第一次请求时自己检查库结构，缺表就按 `schema.sql` 建好。**
+不需要任何人先跑 `npm run deploy`。
+
+### 为什么必须这样
+
+建表原先只发生在 `npm run deploy` 里的 `scripts/setup-d1.mjs`。问题在于
+**部署路径有好几条，只有一条会执行那个脚本**：
+
+| 部署方式 | 会不会跑 setup-d1.mjs | 旧行为 |
+|---|---|---|
+| 本地 `npm run deploy` | ✅ | 正常 |
+| 控制台连 GitHub 自动构建，Deploy command 填 `npm run deploy` | ✅ | 正常 |
+| 同上，但填的是 `npx wrangler deploy` | ❌ | **部署成功、接口全报 `no such table: meta`** |
+| CI / 脚本里直接 `wrangler deploy` | ❌ | 同上 |
+| Dashboard 里直接改代码 | ❌ | 同上 |
+
+失败时的现象很误导人：Worker 部署成功、静态页面能打开，但每个接口都是
+`500`，日志里只有一句 `no such table: meta` —— 而「怎么建表」这件事
+在界面上没有任何入口。
+
+### 怎么做的
+
+```
+请求进来
+  → ensureSchema(env)
+      读 meta.schema_v
+        · 已是最新版本  → 直接返回（每个 isolate 只多 1 次单行读）
+        · 版本更旧/没有 → 跑 schema.js 里的全部 CREATE ... IF NOT EXISTS
+                        → 跑 migrations.js 里「比库里版本新」的那些 ALTER
+                        → 把版本号写回 meta
+  → 之后才是设置加载与认证闸门
+```
+
+三个关键点：
+
+- **幂等**：所有建表语句都是 `IF NOT EXISTS`；迁移里重复补列的错误被识别并吞掉。
+- **只跑一次**：缓存按 **D1 绑定对象**记（`WeakMap`），同一库只查一次版本号；
+  并发请求共享同一个 Promise，不会并发建表。
+- **失败不缓存**：D1 抖动、额度暂时耗尽这类问题下一刻可能就好了，
+  缓存住失败会让这个 isolate 的余生都返回同一个错误。
+
+### 代价
+
+| 项 | 量 |
+|---|---|
+| 正常状态下每个 isolate 生命周期 | **多 1 次 D1 读**（最多 1 行） |
+| 库为空/结构旧时 | 一次性的 10 条 DDL + 1 条版本写入，之后不再发生 |
+| Worker CPU | 不变 —— DDL 在 D1 侧执行，等 I/O 不计入那 10ms 上限 |
+
+### 一个坑：`schema.sql` 要变成 JS 才进得了包
+
+Worker 的包由 wrangler 打包，**运行期没有文件系统**，读不到 `schema.sql`。
+想让代码直接用那份 SQL，直觉是配 Wrangler 的 module rule 把它当文本导入：
+
+```toml
+[[rules]]
+type = "Text"
+globs = ["**/*.sql"]
+```
+
+**实测这条路走不通**：构建不报错，但产物里反而多出一个独立的 `schema.sql` 文件，
+`import` 进来的是 `undefined` —— 静默失败，比报错更难发现。
+
+所以改成生成：`scripts/gen-schema.mjs` 把 `schema.sql` 解析成语句数组写进
+`src/schema.js`（生成物，提交进仓库）。`schema.sql` 仍是唯一真源，
+`npm run deploy` / `npm run dev` 会自动重新生成；`npm run check:schema`
+用来确认两边没漂移。
+
+> 生成物要提交，是因为云平台上直接 `wrangler deploy` 时**只会用仓库里的文件**，
+> 不会跑生成脚本。这也是为什么改完 `schema.sql` 必须 `npm run schema` 再提交。
+
+---
+
+## 改表结构
+
+`schema.sql` 里的建表语句全是 `IF NOT EXISTS`，对「表已存在但少一列」**什么都不做**。
+所以加字段要走迁移，不能只改 `schema.sql`（那只对新建的库有效）：
+
+1. 改 `schema.sql`，把顶部的 `-- schema-version:` 加 1
+2. 在 `src/migrations.js` 里追加一条：
+
+   ```js
+   export const MIGRATIONS = [
+     { v: 2, stmts: ["ALTER TABLE sites ADD COLUMN note TEXT"] },
+   ];
+   ```
+
+3. `npm run schema` 重新生成 `src/schema.js`，连同上面两处一起提交
+
+之后：**新库**直接按完整定义建表，跳过迁移；**旧库**先补缺失的表/索引，
+再跑「比库里版本新」的迁移，然后写回新版本号。不重建库、不丢数据。
+
+三条约束：
+
+- 迁移语句必须幂等。重复补列会报 `duplicate column name`，这一条被吞掉；
+  其它错误照常抛出，不会伪装成成功。
+- 只写 `ADD COLUMN` 这类安全操作。SQLite 删列/改类型要重建整张表，
+  不适合在请求路径上自动做 —— 那种变更应当人工处理。
+- 加 `NOT NULL` 列时必须同时给 `DEFAULT`，否则已有行没法填充。
 
 ---
 
@@ -365,6 +506,10 @@ npm run dev
 | `npm run dev` | 本地起服务（先给本机 D1 副本建表） |
 | `npm run deploy` | 准备生产库 + 部署 |
 | `npm run setup` | 只准备数据库，不部署 |
+| `npm run schema` | 改完 `schema.sql` 后重新生成 `src/schema.js` |
+| `npm run check:schema` | 校验 `src/schema.js` 与 `schema.sql` 是否同步（CI 可用） |
+
+> `dev` / `setup` / `deploy` 都会自动先跑 `npm run schema`，正常流程里不用单独执行。
 
 其它常用：
 

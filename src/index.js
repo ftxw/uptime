@@ -28,7 +28,9 @@ import {
   BATCH_CHUNK,
   chunk,
   UNGROUPED,
+  ensureSchema,
 } from "./db.js";
+import { SCHEMA_STMTS, SCHEMA_VERSION } from "./schema.js";
 import {
   judge,
   normalizeUrl,
@@ -99,7 +101,7 @@ function dbErrorHint(msg) {
   if (/D1\s*绑定缺失/.test(m))
     return "wrangler.toml 的 [[d1_databases]] 没随部署生效（database_id 为空串时 wrangler 会跳过绑定）。跑 npm run deploy 会自动建库并写回 database_id。";
   if (/no such table/i.test(m))
-    return "D1 里还没有建表。跑一次 npm run deploy（会建表并校验结构），或手工执行 npx wrangler d1 execute <库名> --remote --file=schema.sql。";
+    return "D1 里没有表，且 Worker 的自动建表也没成功（正常情况下第一次请求就会自己补上结构）。先打开 /api/health?pretty=1 看 db_bound 与 missing_tables：绑定缺失会显示 db_bound:false；绑定正常却仍缺表，多半是 D1 写额度用尽或库已被删除。手工兜底：npx wrangler d1 execute <库名> --remote --file=schema.sql。";
   if (/no such column/i.test(m))
     return "D1 表结构与 schema.sql 不一致（缺列）。schema.sql 全是 IF NOT EXISTS，不会给旧表补列：按提示 ALTER TABLE 补列，或换库名重建（会丢数据）。";
   if (/no such (function|module)/i.test(m)) return "SQLite 版本能力不足，检查 wrangler.toml 的 compatibility_date。";
@@ -107,11 +109,15 @@ function dbErrorHint(msg) {
 }
 
 /**
- * 部署自检要核对的表。**故意写死而不是解析 schema.sql** —— schema.sql 不会被打进
- * Worker 包，运行期拿不到；写死一份清单，换来的是"缺哪张表"能被直接点名。
- * 新增表时两处一起改（schema.sql + 这里），漏改的后果只是自检少报一张，不影响业务。
+ * 部署自检要核对的表。
+ *
+ * 从 `SCHEMA_STMTS` 直接推导，而不是再手工维护一份清单 —— 原来写死七个表名时，
+ * 加表要改两处（schema.sql + 这里），漏改的后果是自检少报一张表，
+ * 于是「库缺表」这件事反而被自检漏掉了。现在只有 schema.sql 一个真源。
  */
-const EXPECTED_TABLES = ["sites", "checks", "state", "pending", "ssl", "categories", "meta"];
+const EXPECTED_TABLES = SCHEMA_STMTS.map(
+  (s) => (s.match(/^CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)/i) || [])[1]
+).filter(Boolean);
 
 /** dbErrorHint 的响应体片段（映射不到时返回空对象，不塞 null） */
 const hintOf = (e) => {
@@ -130,14 +136,42 @@ const hintOf = (e) => {
  *
  * 只暴露"哪张表在不在""密码配没配"这类结构信息，不含站点、地址、token。
  */
-async function buildHealth(env, pwdConfigured, pretty) {
+async function buildHealth(env, pwdConfigured, pretty, schema) {
   const out = {
     ok: true,
     db_bound: Boolean(env && env.DB),
+    db_ready: false,
     password_set: Boolean(pwdConfigured),
+    schema: {
+      expected_version: SCHEMA_VERSION,
+      // 本次请求里自动补结构的结果：
+      //   none      本来就已经是最新结构（正常状态，绝大多数时候看到的就是它）
+      //   created   这个库原本一张表都没有，本次把它建起来了
+      //   repaired  库已存在（旧库/缺表），本次补齐了结构与迁移
+      //   failed    自动建表失败，原因见 schema.error
+      auto_applied:
+        schema && schema.ok
+          ? !schema.migrated
+            ? "none"
+            : schema.from < 0
+              ? "created"
+              : "repaired"
+          : "failed",
+    },
     tables: [],
     missing_tables: [],
   };
+
+  if (schema && schema.ok && schema.migrated) {
+    out.schema.statements = schema.statements;
+    // -1 = 全新库，0 = 旧库无版本标记，N = 从 N 升上来
+    out.schema.from_version = schema.from;
+  }
+  if (schema && !schema.ok) {
+    out.schema.error = schema.error;
+    const h = dbErrorHint(schema.error);
+    if (h) out.schema.hint = h;
+  }
 
   if (!out.db_bound) {
     out.ok = false;
@@ -154,7 +188,8 @@ async function buildHealth(env, pwdConfigured, pretty) {
     );
     out.tables = EXPECTED_TABLES.filter((t) => have.has(t));
     out.missing_tables = EXPECTED_TABLES.filter((t) => !have.has(t));
-    if (out.missing_tables.length) {
+    out.db_ready = out.missing_tables.length === 0;
+    if (!out.db_ready) {
       out.ok = false;
       out.hint = dbErrorHint("no such table");
     }
@@ -1131,9 +1166,41 @@ export default {
     const api = m ? m[1] : "";
     const pretty = url.searchParams.get("pretty") === "1";
 
+    /* ── 库结构自举：不等任何人跑命令 ──────────────────────────────────
+       放在**所有分支之前**，包括 /api/health —— 因为「库没建表」是最常见的
+       首次部署故障，而自检恰恰是最该在这种时候修好问题、而不是只报告问题的地方。
+
+       为什么必须在运行时做：建表原先只发生在 `npm run deploy` 里的
+       `scripts/setup-d1.mjs`。但凡部署方式不是「本地跑那条命令」（Cloudflare
+       控制台连 GitHub 自动构建、CI、Dashboard 里改代码），建表就被跳过了 ——
+       Worker 部署成功、页面能打开，而每个接口都回 `no such table: meta`。
+       部署路径有好几条，只有 Worker 自己补能覆盖全部。
+
+       幂等且只跑一次：isolate 内用 Promise 缓存，库侧用 meta.schema_v 版本号。
+       正常状态下每个 isolate 只多一次单行 D1 读。 */
+    let schemaState;
+    try {
+      schemaState = { ok: true, ...(await ensureSchema(env)) };
+    } catch (e) {
+      schemaState = { ok: false, error: String((e && e.message) || e) };
+    }
+
     // 部署自检必须**先于**设置加载与认证闸门：库没建表时 loadSettings 会先抛异常，
     // 那时任何分支都到不了，自检也就失去意义。它只读 sqlite_master，不碰业务表。
-    if (api === "health") return await buildHealth(env, env.ADMIN_PASSWORD, pretty);
+    if (api === "health") {
+      return await buildHealth(env, env.ADMIN_PASSWORD, pretty, schemaState);
+    }
+
+    // 结构没就位就没什么可做的：在这里一次性返回结构化错误，
+    // 比让下游每个查询各自抛一次、最后被兜底成一句「加载失败」清楚得多。
+    if (!schemaState.ok) {
+      return json(
+        { ok: false, error: schemaState.error, ...hintOf({ message: schemaState.error }) },
+        500,
+        "no-store",
+        pretty
+      );
+    }
 
     /* ── 站点设置 + 认证闸门 ──────────────────────────────────────────
        设置存 D1 且优先级高于环境变量；合并回 env 后，下游所有 `env.XXX` 读取
@@ -2274,6 +2341,12 @@ export default {
         return fallback;
       }
     };
+
+    // ⚠️ 必须**先**建表/补结构，再读设置。
+    //    cron 是完全独立的入口：部署完之后若还没有任何人访问过站点，
+    //    第一个跑到这里的可能就是定时任务 —— 此时库可能一张表都没有。
+    //    失败不中断：后面的 stage 各自会记一次错，日志里能看出这一轮发生了什么。
+    await stage("ensureSchema", () => ensureSchema(env), null);
 
     // ⚠️ 必须先合并后台设置再往下走。
     //    fetch 路径有 `env = await effectiveEnv(...)`，但 cron 是独立入口 ——

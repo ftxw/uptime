@@ -5,6 +5,9 @@
  *      ③ 便于单独审视每条查询是否走索引。
  */
 
+import { SCHEMA_STMTS, SCHEMA_VERSION } from "./schema.js";
+import { MIGRATIONS } from "./migrations.js";
+
 /**
  * 「未分组」的唯一真源。
  *
@@ -127,14 +130,144 @@ export async function cleanupOldChecks(env, keepDays = 30) {
  *    **绑定没生效**（`wrangler.toml` 的 `[[d1_databases]]` 没部署上去、
  *    或 `database_id` 还是空串被 wrangler 跳过了）。
  */
+/** D1 绑定缺失的统一文案 —— 两个入口（db / ensureSchema）共用，避免措辞漂移 */
+const D1_MISSING =
+  "D1 绑定缺失：env.DB 不存在。检查 wrangler.toml 的 [[d1_databases]] 是否已随本次部署生效" +
+  "（database_id 为空串时 wrangler 会跳过该绑定）。";
+
 export async function db(env) {
-  if (!env || !env.DB) {
-    throw new Error(
-      "D1 绑定缺失：env.DB 不存在。检查 wrangler.toml 的 [[d1_databases]] 是否已随本次部署生效" +
-        "（database_id 为空串时 wrangler 会跳过该绑定）。"
-    );
-  }
+  if (!env || !env.DB) throw new Error(D1_MISSING);
   return env.DB;
+}
+
+/* ── 库结构自举 ──────────────────────────────────────────────────────── */
+
+/** meta 表里记录结构版本的键 */
+const SCHEMA_KEY = "schema_v";
+
+/**
+ * 就绪标记：**按 D1 绑定**记，不按模块记。
+ *
+ * 值存 **Promise** 而不是布尔：同一个 isolate 里并发的请求会同时走到这里，
+ * 存布尔的话它们会各建一次表（十几条 DDL × N，纯属浪费，还会白吃 D1 写额度）。
+ * 存 Promise 让后来者直接 await 同一个在建过程。
+ *
+ * 键是 DB 绑定对象而不是一个全局布尔：绑定不同就是不同的库，
+ * 共用一个布尔会让「后一个库」误以为「前一个库」已经建好了 ——
+ * 那正好是本次要根治的故障，不能自己再埋一个。
+ */
+const schemaReady = new WeakMap();
+
+/**
+ * 确保库结构就位 —— 在第一次真正用到库之前调用。
+ *
+ * 为什么必须在**运行时**做，而不是只在部署脚本里做：
+ *   `npm run deploy` 确实会建表（scripts/setup-d1.mjs），但那只覆盖「本地手动部署」
+ *   这一条路径。把仓库连到 Cloudflare 控制台（Workers Builds）时，跑的是
+ *   `npm install && wrangler deploy`，**那个脚本根本不会被执行** —— 于是 Worker
+ *   部署成功、页面能打开，但每个接口都报 `no such table: meta`。
+ *   部署方式有很多种（CLI / 控制台连线 / Dashboard 里贴代码 / CI），
+ *   只有「Worker 自己补上」能覆盖全部。
+ *
+ * 代价（实测口径，不是估算）：
+ *   每个 isolate 生命周期内多 **1 次 D1 读**（最多 1 行）。真正的建表只在库缺结构时
+ *   发生一次，建完把版本号写进 meta，之后所有 isolate 都走快路径。
+ *   DDL 本身在 D1 侧执行，不计入 Worker 的 CPU 时间（那 10ms 限制卡的是 JS 计算，
+ *   不是等待 I/O），所以不会因为建表把请求顶到 CPU 上限。
+ *
+ * @returns {Promise<{version:number, migrated:boolean, statements:number, from:number}>}
+ *          `from` 是动作**之前**的版本：-1 表示这个库原本连表都没有（全新库），
+ *          0 表示库已存在但没有版本标记（改造前的旧库）。自检靠它区分
+ *          「建了一个新库」和「给已有的库补了结构」。
+ */
+export function ensureSchema(env) {
+  const d = env && env.DB;
+  // 先判空再进 WeakMap：undefined 不能当键（会抛 TypeError，把一句可读的
+  // 「绑定缺失」变成一脸懵的运行时错误）。
+  if (!d) return Promise.reject(new Error(D1_MISSING));
+
+  const hit = schemaReady.get(d);
+  if (hit) return hit;
+
+  const p = applySchema(env);
+  schemaReady.set(d, p);
+
+  // 失败不缓存：D1 抖动、额度暂时耗尽这类问题下一刻可能就好了，
+  // 而缓存住失败会让这个 isolate 的余生都返回同一个错误（直到被回收）。
+  p.catch(() => {
+    if (schemaReady.get(d) === p) schemaReady.delete(d);
+  });
+
+  return p;
+}
+
+async function applySchema(env) {
+  const d = await db(env);
+  const have = await readSchemaVersion(d);
+
+  // 快路径：结构已是当前版本，什么都不做。
+  // 用 >= 而不是 ===：代码回滚到旧版本时，不该把库的版本号往回写 ——
+  // 否则下次再升级会重跑一遍所有迁移（靠幂等兜着能对，但没必要）。
+  if (have >= SCHEMA_VERSION) {
+    return { version: have, migrated: false, statements: 0, from: have };
+  }
+
+  // ① 全量 DDL。全部 IF NOT EXISTS，所以对「七张表都在、只缺一张」的旧库同样安全。
+  let statements = 0;
+  for (const stmt of SCHEMA_STMTS) {
+    await d.prepare(stmt).run();
+    statements++;
+  }
+
+  // ② 增量迁移。have === -1 表示连 meta 表都没有 = 全新库，
+  //    此时全量 DDL 已经建出最新结构，再跑迁移只会白撞 duplicate column。
+  if (have >= 0) {
+    for (const m of MIGRATIONS) {
+      if (m.v <= have) continue;
+      for (const stmt of m.stmts) {
+        try {
+          await d.prepare(stmt).run();
+        } catch (e) {
+          // 这一列已经补过了 —— 幂等，吞掉。其它错误必须原样抛出，
+          // 否则「迁移失败」会被伪装成「迁移成功」，下次启动继续踩同一个坑。
+          if (!/duplicate column name|already exists/i.test(String((e && e.message) || e))) {
+            throw e;
+          }
+        }
+        statements++;
+      }
+    }
+  }
+
+  await d
+    .prepare(
+      "INSERT INTO meta (key, value) VALUES (?, ?) " +
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+    )
+    .bind(SCHEMA_KEY, String(SCHEMA_VERSION))
+    .run();
+
+  return { version: SCHEMA_VERSION, migrated: true, statements, from: have };
+}
+
+/**
+ * 读库里的结构版本。
+ *
+ *   -1  连 meta 表都不存在 → 全新库（要按 schema.sql 完整建）
+ *    0  meta 在、但没有版本键 → 本次改造之前就存在的旧库（要跑迁移）
+ *    N  上次自举写入的版本号
+ *
+ * 三者必须区分开：全新库跑迁移会白撞 duplicate column，旧库跳过迁移则会缺列。
+ */
+async function readSchemaVersion(d) {
+  try {
+    const r = await d.prepare("SELECT value FROM meta WHERE key = ?").bind(SCHEMA_KEY).first();
+    const n = Number(r?.value);
+    return Number.isFinite(n) ? n : 0;
+  } catch {
+    // 查询失败即当作文档不存在。若真是 D1 故障，紧接着的建表会抛出更具体的错误。
+    return -1;
+  }
 }
 
 export async function loadSettings(env) {
