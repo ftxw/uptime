@@ -28,13 +28,11 @@ function isIpAddress(hostname) {
 }
 
 /**
- * 判定一次探测是否算"正常"
- * 规则：状态码 ∈ expect_codes（为空则接受 200-399）；有关键字则必须命中
+ * 判定一次探测是否算"正常"：状态码 ∈ expect_codes（为空则接受 200-399）。
  *
- * 注意：这里只判断 up / down 两态。第三态 **degraded（降级）** 在 /api/overview 里
- * 结合 SSL 与响应时间实时算出 —— 因为 SSL 是每天一查的数据，不该塞进 5 分钟一次的检查行里。
+ * 只判断 up / down 两态。第三态 **degraded（降级）** 由 index.js 的 stateOf 结合证书
+ * 与响应时间实时算出 —— 它依赖 SSL（随探测顺带采）与慢阈值，都不属于「这一次请求通不通」。
  * 降级规则：证书无效 或 剩余 ≤ ssl_warn_days 天 或 响应时间 > 超时上限的一半。
- * （阈值本身是后台「设置 → 探测」里的「证书降级阈值」，这里是默认 14 天的口径说明。）
  */
 export function judge(site, r) {
   if (!r || r.ok === false) return { ok: false, reason: r?.error || "请求失败" };
@@ -71,7 +69,8 @@ function gpTimeoutSec(env) {
  * Globalping：发起一次测量，返回 measurement id（不等待结果）
  * 真正的探测由 Globalping 的探针执行 —— 所以调度器在哪里完全不影响探测点位置。
  * ⚠️ 额度按「探测点个数」计费（实测 X-Request-Cost === limit），limit 越小越省。
- *    默认 3 是为了让「多数表决」成立，成本换准确率，可在后台改。
+ *    默认 3 是为了有多张票互相兜底（任一成功即视为可达，全灭才判故障），
+ *    成本换准确率，可在后台改。
  */
 export async function gpCreate(env, site) {
   const token = env && env.GLOBALPING_TOKEN;
@@ -88,8 +87,12 @@ export async function gpCreate(env, site) {
   const port = u.port ? Number(u.port) : protocol === "HTTP" ? 80 : 443;
 
   // ipVersion 只在 target 是域名时传 —— Globalping 只允许域名场景设置它（因为它控制 DNS 解析）
-  const ipVersion = String((env && env.GP_IP_VERSION) ?? "4");
-  const ipOpt = isIpAddress(u.hostname) || !ipVersion ? {} : { ipVersion: Number(ipVersion) };
+  //
+  // ⚠️ 必须在读取侧归一化成 4 / 6，不能直接 `Number(...)`：
+  //    和 magic / limit 一样，这一项也可能是**环境变量**写进来的（绕过后台的
+  //    normalizeSetting）。`GP_IP_VERSION=ipv4` 会得到 NaN，JSON 序列化成 null，
+  //    Globalping 直接 422 —— 表现是「所有站点一起探测失败」，而站点本身完全正常。
+  const ipOpt = isIpAddress(u.hostname) ? {} : { ipVersion: String(env?.GP_IP_VERSION) === "6" ? 6 : 4 };
 
   const res = await fetch("https://api.globalping.io/v1/measurements", {
     method: "POST",
@@ -237,12 +240,10 @@ export async function gpCollect(env, pending) {
     const rr = r.result || {};
     const t = rr.timings || {};
     return {
-      url: `https://${d.target || ""}/`,
       ok: rr.status === "finished",
       status: rr.statusCode || 0,
       ttfb: t.firstByte ?? 0,
       total: t.total ?? 0,
-      bytes: 0,
       error: gpResultReason(rr),
       probe: `${p.city || "?"}/${p.asn || "?"}`,
       // 平台自己的归因：target = 目标站 / resolver = 解析 / internal = 平台自身故障。
@@ -256,25 +257,33 @@ export async function gpCollect(env, pending) {
 }
 
 /**
- * 多探针多数表决 —— Globalping 结果的**唯一判定口径**。
+ * 多探针判定 —— Globalping 结果的**唯一判定口径**。
  *
- * 为什么要表决，而不是像原来那样"挑一个最好的"：
- *   GP 把测量派给哪台探针由平台决定，且对同一 magic 有**首选项粘性** ——
- *   实测 3 轮里 Nanning/4837 三次都在，另外两席每轮都换。单点采样时，
- *   那一台机器所在链路的一次抖动会被 100% 记成「站点失败」。
- *   实测中国家宽筛选下单点失败率约 25%，配上 fail_threshold=3 就是
- *   每天 4~5 次误告警，而目标站点本身完全正常。
- *   多探针下失败是**不同步**的（同一次测量里实测出现过 2 成功 1 失败），
- *   所以表决能把这种瞬时抖动过滤掉。
+ * 核心规则：**只要有一台探针成功，站点就是可达的**；只有所有探针都失败才判故障。
+ * 这不是「少数服从多数」—— 投票要回答的是「大多数用户能访问吗」，而我们要回答的是
+ * 「站点是不是挂了」。用多数表决回答后者，会把「2 台探针同时赶上链路抖动」错报成故障。
  *
- * 三条必须说清的规则：
- *  ① `failureSource === "internal"` 的探针**不参与表决**：那是 Globalping 平台自己
- *     出问题，它压根没测到站点。拿它投票等于把"我们没拿到数据"谎报成"站点挂了"
+ * 为什么放弃多数表决（实测口径）：
+ *   中国家宽筛选下单点失败率约 25%，3 台探针各自独立抖动。若用「≥2 失败即判故障」，
+ *   单轮误判率 = 3×0.25²×0.75 + 0.25³ ≈ 15.6%，配上 fail_threshold=3 仍约每天 1 次误报。
+ *   而「全灭才判故障」的单轮误判率只有 0.25³ ≈ 1.56%，低一个数量级。
+ *   站点真挂时 3 台会同时失败，检出能力一点没丢 —— 多数表决在这两者之间做了错误的取舍。
+ *   （对照：UptimeRobot 单区域模式同样是「主引擎 + 2 个远程地点全失败才 Down」；
+ *     Better Stack 用 3/4 = 75%，是因为它自有探针在优质机房，单点失败率远低于 25%。）
+ *
+ * 四条必须说清的规则：
+ *  ① `failureSource === "internal"` 的探针**不参与判定**：那是 Globalping 平台自己
+ *     出问题，它压根没测到站点。拿它当失败票等于把"我们没拿到数据"谎报成"站点挂了"
  *     —— 与 gpCollect 的 broken 分支是同一条约定。
- *  ② **平票即作废**（调用方不得写检查记录）：没有多数派就没有结论。宁可这一轮
- *     没数据，也不能凭空造一个 up/down 出来；pending 已删，下一轮会自动重发。
- *  ③ 代表值取多数派内的**中位数** —— 多探针的意义就是去掉"最好"与"最坏"两个
- *     偶然值，中位数才是典型体验。取最快会让页面长期显得比实际更快。
+ *  ② **全失败时要求至少 2 票，但「单点采样」除外**：本来派了多台、却因平台故障只剩 1 票
+ *     可用时，那 1 票失败就判死等于退回单点采样，而单台探针自己的链路问题恰恰是最常见的
+ *     假故障来源 —— 这种情况**作废**（不写检查记录），下一轮自动重发。
+ *     但后台把「探测点数」设成 1 时，1 票就是用户选定的采样方式，必须**如实判失败**：
+ *     否则这个配置下每轮都作废，`consecutive_fail` 永远是 0，站点挂了也不会变红。
+ *  ③ 代表值取**成功票内的中位数**：失败票的 ttfb 是 0，混进来会把响应时间拉垮。
+ *     多探针的意义是去掉"最好"与"最坏"两个偶然值，取最快会让页面长期显得比实际更快。
+ *  ④ 不推断"部分不可达"：1/3 成功仍记 up。想追这个信号就看详情页的票型标注
+ *     （`City/ASN (1/3)`）—— 它只在出现分歧时才写，全通是常态不标。
  *
  * @returns {{void:true, why:string}} 无结论
  *        | {{void:false, ok:boolean, pick:object, reason:string?, ...}} 有结论
@@ -288,19 +297,25 @@ export function gpDecide(site, results) {
   if (!usable.length) return { void: true, why: "all-internal", platformFaults };
 
   // 每条探针各自跑 judge：这样「HTTP 层通但状态码不在期望集合」（如 500）
-  // 也进入表决，而不是只看代表那条的状态码。
+  // 也参与判定，而不是只看代表那条的状态码。
   const votes = usable.map((r) => ({ r, v: judge(site, r) }));
   const yes = votes.filter((x) => x.v.ok);
   const no = votes.filter((x) => !x.v.ok);
   const total = votes.length;
 
-  if (yes.length === no.length) {
-    return { void: true, why: "tie", platformFaults, okCount: yes.length, total };
+  // 一票成功即视为可达 —— 见上方规则说明。
+  const ok = yes.length > 0;
+
+  // 全失败、有效票又只有 1 张时不下结论 —— 但仅当**本来派了不止一台**
+  // （`all.length` 是原始结果数，含被 internal 摘掉的那些）。
+  // 探测点数 = 1 时 all.length 也是 1，那是用户选定的采样方式，必须如实判失败，
+  // 否则该配置下故障永远检测不出来（见规则 ②）。
+  if (!ok && total < 2 && all.length >= 2) {
+    return { void: true, why: "single-fail", platformFaults, okCount: 0, total };
   }
 
-  const ok = yes.length > no.length;
-  const majority = ok ? yes : no;
-  const sorted = majority.slice().sort((a, b) => (a.r.ttfb || 0) - (b.r.ttfb || 0));
+  const pool = ok ? yes : no;
+  const sorted = pool.slice().sort((a, b) => (a.r.ttfb || 0) - (b.r.ttfb || 0));
   const pick = sorted[Math.floor((sorted.length - 1) / 2)];
 
   return {
@@ -311,7 +326,8 @@ export function gpDecide(site, results) {
     okCount: yes.length,
     total,
     platformFaults,
-    // 全票时不标注票型 —— 那是常态，标了只是噪音
+    // 全成功 / 全失败才算「票型一致」。全失败时调用方仍会标票型（`(0/3)` 有用：
+    // 它把"3 台都挂了"和"只剩 2 台有效、都挂了"区分开），所以这里只对成功有意义。
     unanimous: yes.length === total || no.length === total,
   };
 }

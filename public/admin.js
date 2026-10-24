@@ -879,7 +879,10 @@ document.addEventListener("click", async (e) => {
   if (act === "edit") return openForm(site);
 
   if (act === "del") {
-    if (!confirm(`确定删除「${site?.name || id}」？`)) return;
+    // 文案要点明「历史数据一起删」：服务端是级联删除（sites / checks / ssl / state / pending），
+    // 而"删除站点"听起来像是只删掉一个条目。
+    if (!confirm(`确定删除「${site?.name || id}」？\n该站点的探测明细、证书与状态会一并删除，不可撤销。`))
+      return;
     try {
       const d = await del(`/sites?id=${encodeURIComponent(id)}`);
       banner(d.ok ? "已删除" : "删除失败：" + d.error, d.ok ? "info" : "error");
@@ -918,9 +921,12 @@ document.addEventListener("click", async (e) => {
       //   气泡却是绿色，读起来自相矛盾。
       //   verdict 由 /api/test 按 gpDecide / judge 给出（与自动探测同一口径）。
       const judged = d.verdict ? d.verdict.ok : d.persisted ? d.persisted.ok : res.ok;
+      // 第三个字段是「这次测试实际等结果等了多久」（服务端 elapsed_ms）。
+      // ⚠️ 别再写成 d.roundTripMs —— 那个字段服务端从来没返回过，于是这一格
+      //    永远显示 "—"，看起来像"测不出耗时"，实际是取错了名字。
       banner(
         `${site.name} · HTTP ${res.status ?? "—"} · ${res.ttfb ?? "—"}ms · ${where} · ${
-          d.roundTripMs ?? "—"
+          d.elapsed_ms ?? "—"
         }ms${mark}`,
         judged ? "info" : "error"
       );
@@ -941,8 +947,15 @@ qs("#checkall").addEventListener("click", async () => {
   try {
     // 同理必须是 POST —— 手动跑一轮会真实发起探测并写库
     const d = await post("/run", {});
-    const n = (d.persisted?.persisted || 0) + (d.collect?.collected || 0);
-    banner(`已执行一轮检查 · 落库 ${n} 条`, "info");
+    // 两阶段调度的语义：这一轮能拿到的只有**上一轮发起**的结果，
+    // 本轮刚发出去的测量要等下一轮 cron 才收得回来。所以两个数字分开报：
+    //   collected 收回来并落库的条数（本轮真正写进去的）
+    //   started   本轮发起的测量数（结果下一轮才出）
+    // 原来只报 collected、并且还去读一个不存在的 d.persisted（恒 0），
+    // 于是第一次点「立即全部检查」看到的总是「落库 0 条」，像是没生效。
+    const collected = d.collect?.collected || 0;
+    const started = (d.dispatch?.gpStarted || []).filter((x) => x.id).length;
+    banner(`已执行一轮 · 落库 ${collected} 条 · 发起 ${started} 个（结果下一轮出）`, "info");
     await renderRows();
   } catch (e) {
     if (!isMasked(e)) banner("执行失败：" + e.message, "error");

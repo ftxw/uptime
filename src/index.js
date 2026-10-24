@@ -20,7 +20,9 @@ import {
   bumpState,
   buildCategories,
   cleanupOldChecks,
+  cleanupOrphans,
   saveSsl,
+  saveSslBatch,
   upsertLastResult,
   deleteBySites,
   sslDaysLeftSql,
@@ -298,17 +300,21 @@ async function withEdgeCache(request, ctx, ttl, producer, keyUrl) {
   });
 }
 
-/** 读当前配置版本 —— 用于拼 overview / site 详情的缓存 key */
-async function configVersion(env) {
-  try {
-    const d = await db(env);
-    const r = await d
-      .prepare("SELECT value FROM meta WHERE key = 'config_version'")
-      .first();
-    return r && r.value ? String(r.value) : "0";
-  } catch {
-    return "0";
-  }
+/**
+ * 读当前配置版本 —— 用于拼 overview / site 详情的缓存 key。
+ *
+ * ⚠️ 从**已经读到的设置**里取，不再单独查一次 D1。
+ *    版本号就存在 meta 表里，而 `loadSettings()` 在请求开头已经把整张 meta 读进内存
+ *    （`SELECT key, value FROM meta`）—— 原来这里再发一条
+ *    `SELECT value FROM meta WHERE key='config_version'`，等于每个读请求多一次
+ *    跨国往返，换回一个已经在手里的字符串。
+ *
+ *    时序上也安全：`bumpConfigVersion` 在路由分发前执行，而本函数只用于
+ *    读接口的缓存 key；写接口的响应本来就不进缓存（no-store）。
+ */
+function configVersionOf(rawSettings) {
+  const v = rawSettings && rawSettings.config_version;
+  return v ? String(v) : "0";
 }
 
 /**
@@ -354,7 +360,8 @@ async function buildAdminPayload(env) {
     d
       .prepare(
         `SELECT site, last_ok AS ok, last_status AS status, last_ttfb_ms AS ttfb_ms,
-                last_source AS source, last_probe AS probe, last_ts AS ts
+                last_source AS source, last_probe AS probe, last_ts AS ts,
+                consecutive_fail
          FROM state`
       )
       .all(),
@@ -384,6 +391,10 @@ async function buildAdminPayload(env) {
       // 详情页三个前端共用同一口径，避免各自拼串导致同一次检查有三种写法。
       origin: originOf(s, lastMap[s.id]?.source, lastMap[s.id]?.probe, env),
       last_ts: lastMap[s.id]?.ts ?? null,
+      // 「确认中」要按连续失败次数判定（见 stateOf），后台表格与前台首页必须同一口径。
+      // 这一列在 state 表里，不在 sites 表 —— 不加就会让后台永远算不出 pending，
+      // 于是首页是黄、后台是红，同一时刻两个页面说两套话。
+      consecutive_fail: lastMap[s.id]?.consecutive_fail ?? 0,
       // stateOf() 读的是 ssl_* 前缀的**扁平**字段（与 overview 的 SQL 别名同形），
       // 这里把 ssl 表的列重命名摊平后再交给它，避免后台自算一套三态逻辑。
       ssl_checked_ts: ssl?.checked_ts ?? null,
@@ -453,10 +464,10 @@ function slowBaseMs(env) {
 }
 
 /**
- * 三态判定：up / down / degraded（overview 与 site 详情共用，避免两处逻辑漂移）
+ * 三态判定：up / down / degraded（overview、site 详情、后台列表三处共用，避免逻辑漂移）
  *
  * 降级规则对齐参考项目 ftxw/uptime-monitor 的 lib/checker.ts：
- *   证书无效 或 剩余 ≤ SSL_WARN_DAYS（默认 14）天 或 响应时间 > 该后端超时上限的一半
+ *   证书无效 或 剩余 ≤ SSL_WARN_DAYS（默认 14）天 或 响应时间 > 探针超时上限的一半
  * 注意 down 不参与降级判定 —— 故障比降级更严重。
  */
 function stateOf(s, env) {
@@ -480,7 +491,30 @@ function stateOf(s, env) {
   let state = s.last_ok === 1 ? "up" : s.last_ok === 0 ? "down" : "unknown";
   let degrade_reason = null;
 
-  if (state !== "down") {
+  // ── 失败但还没攒够确认次数 → 黄（Uptime-Kuma 的 PENDING 语义）──
+  //
+  // 为什么必须有这一层：`fail_threshold` 原先只作用于 30 天色条（见 maxFailRunPerDay），
+  // 实时圆点却是「按最后一次结果」直接上色 —— 于是同一个站点在同一页面上有两套口径：
+  // 圆点第 1 次失败就红，色条要连续 3 次才标红，而设置项写的是「连续失败几次判故障」。
+  // 用户看到的是「刚红了一下又绿了」，且不知道该信哪个。
+  //
+  // 现在统一到设置项的口径：1..thr-1 次是黄（确认中），≥thr 次才是红。
+  // 实测意义：任一成功即可达的规则下，单轮全灭概率约 1.56%，5 分钟间隔的站点
+  // 一天仍会有约 4 次单轮全灭（探针链路抖动），原先每次都红 5 分钟 ——
+  // 现在只黄，红色只留给真正确认过的故障。
+  const threshold = Math.max(1, Number(s.fail_threshold || 3));
+  // consecutive_fail 为 0 但仍 last_ok=0，只会出现在「手动测过且失败」——
+  // upsertLastResult 刻意不动 consecutive_fail。至少要按 1 次算，
+  // 否则手动测出来的失败会被当成"已确认故障"直接标红。
+  const streak = state === "down" ? Math.max(1, Number(s.consecutive_fail || 0)) : 0;
+  const pending = state === "down" && streak < threshold;
+
+  if (pending) {
+    state = "degraded";
+    degrade_reason = `疑似故障（确认中 ${streak}/${threshold}）`;
+  } else if (state !== "down") {
+    // 确认中 / 故障的站点不再叠证书与延迟提示：degrade_reason 只有一个字符串，
+    // 叠上去会把更要紧的那一条挤掉。
     const baseMs = slowBaseMs(env);
     const warnDays = Number(env.SSL_WARN_DAYS);
     if (ssl && !ssl.error && ssl.valid === false) {
@@ -509,6 +543,24 @@ function bucketFor(hours) {
   if (hours <= 72) return { sec: 3600, label: "1 小时" };
   if (hours <= 168) return { sec: 7200, label: "2 小时" };
   return { sec: 43200, label: "12 小时" };
+}
+
+/**
+ * 色条最多能要几天 = min(接口允许的 90 天, 明细保留天数)。
+ *
+ * 为什么两处必须联动：checks 只保留 `check_keep_days`（默认 30）天，而接口原先一律
+ * 允许 `days=90`。于是 `?days=90` 会返回 90 格色条、其中 60 格永远是"无数据"——
+ * 读起来像"这两个月没在监测"，而事实是更早的明细已被保留策略删掉了。
+ * 上限跟着保留天数走，界面上剩下的就都是有意义的格子。
+ */
+function maxDays(env) {
+  const keep = clampInt(
+    env?.CHECK_KEEP_DAYS ?? SETTING_META.check_keep_days.def,
+    1,
+    365,
+    Number(SETTING_META.check_keep_days.def)
+  );
+  return Math.max(1, Math.min(90, keep));
 }
 
 /* ────────────────────────────── 存储层 ────────────────────────────── */
@@ -777,26 +829,28 @@ function queryInt(raw, dflt, min, max) {
 }
 
 /**
- * 站点 id 会拼进 URL（/monitor?id=）也用作主键。
- * SQL 是参数化的，不存在注入风险；真正要拦的是**会拆掉 URL 结构**的字符
- * （/ ? # % 与控制字符、空白），其余（含中文）放行，避免把已有的中文 id 站点变成无法编辑。
- */
-/**
  * 站点 ID 的合法字符集：`[A-Za-z0-9._-]`，1–64 字符。
  *
  * 为什么是**白名单**而不是黑名单：id 要进 URL（`/monitor?id=<id>`）。
  * 黑名单（原来的"不含 / ? # % < > \ " 与空白"）看着够用，实则永远漏 ——
  * 中文、全角符号、`&`、`+`、`=` 在 query 里都会被重新编码，
  * 于是"后台里看到的 id"与"URL 里的 id"不是同一个字符串，排查时极易误判。
- * 白名单同时消掉了 `..`/首尾点这类在路径语义上有歧义的值。
  *
  * ⚠️ 前端 `#f-id` 的 `pattern` 必须与这里**逐字符一致**：两处不同的字符集就是
  *    "前端放行、后端 400"（或反过来）的第三种口径，用户只会觉得"这站点存不进去"。
  */
 const SITE_ID_RE = /^[A-Za-z0-9._-]{1,64}$/;
 
+/**
+ * ⚠️ 正则本身放行 `.` 与 `..`（它们都由 `.` 组成、长度合法），必须单独排除：
+ *    这两个值在 URL / 路径语义上有歧义（会被当成"当前目录 / 上一级"），
+ *    而 id 会出现在 `/monitor?id=<id>` 里。排除是一行的事，没必要留个"理论上能用"的空子。
+ */
 function validSiteId(id) {
-  return typeof id === "string" && SITE_ID_RE.test(id.trim());
+  if (typeof id !== "string") return false;
+  const v = id.trim();
+  if (v === "." || v === "..") return false;
+  return SITE_ID_RE.test(v);
 }
 
 /** 只接受 http/https —— 阻断 javascript: / data: 等 scheme 落到 href 上被执行 */
@@ -903,10 +957,10 @@ const PENDING_TTL_MS = 180_000;
 async function collectGlobalping(env) {
   const d = await db(env);
   const { results: pending } = await d.prepare("SELECT * FROM pending").all();
-  // ⚠️ 返回值结构必须与下面的完整分支保持一致（尤其是 dropped / sslWritten）——
-  //    调用方会无条件读 collected.dropped，少了这个字段就会抛 TypeError，
+  // ⚠️ 返回值结构必须与下面的完整分支保持一致（尤其是 dropped / sslWritten / fetched）——
+  //    调用方会无条件读 collected.dropped 与 collected.fetched，少了字段就会抛 TypeError，
   //    导致整轮 cron 在打完日志前失败。
-  if (!pending || !pending.length) return { collected: 0, rows: [], dropped: [], perSite: {} };
+  if (!pending || !pending.length) return { collected: 0, fetched: 0, rows: [], dropped: [], perSite: {}, sslWritten: 0 };
 
   const sites = await loadSites(env);
   const byId = Object.fromEntries(sites.map((s) => [s.id, s]));
@@ -917,6 +971,10 @@ async function collectGlobalping(env) {
   const sslWrites = [];
   // 被丢弃、且**没有**写检查记录的 pending。正常恒为空，非空即代表有异常需要排查。
   const dropped = [];
+  // 本轮真正发出去的收取请求数（= 出网子请求消耗）。
+  // 返回给 dispatch 当作"已用额度"的起点 —— 否则预算只管发起、不管收取，
+  // 实际出网量会是预算的两倍，站点一多就撞免费层每次调用 50 个子请求的硬上限。
+  let fetched = 0;
 
   for (const p of pending) {
     // ── 兜底：存活过久的 pending 一律丢弃 ──
@@ -936,6 +994,7 @@ async function collectGlobalping(env) {
 
     let out;
     try {
+      fetched++;
       out = await gpCollect(env, p);
     } catch (e) {
       // 收取失败就丢弃，避免 pending 永久占位。同样不记检查记录（不知道站点当时的状态）
@@ -963,10 +1022,10 @@ async function collectGlobalping(env) {
     const site = byId[p.site];
     if (!site) continue;
 
-    // ── 多探针多数表决（口径与理由见 probe.js 的 gpDecide）──
+    // ── 多探针判定（口径与理由见 probe.js 的 gpDecide）──
     const dec = gpDecide(site, out.results);
     if (dec.void) {
-      // 平票 / 全是平台自身故障 / 一条结果都没有 —— 三种情况都**没有结论**。
+      // 全是平台自身故障 / 一条结果都没有 / 只剩 1 台且失败 —— 三种都**没有结论**。
       // 与上面的 broken 分支同一条约定：不写检查记录。
       // 记成失败会凭空造出一次"故障"、把 consecutive_fail 推上去、攒够阈值就发告警；
       // 而事实是我们对站点当时的可达性一无所知。pending 已删，下一轮会自动重发。
@@ -982,11 +1041,12 @@ async function collectGlobalping(env) {
     }
 
     const r0 = dec.pick;
-    // 票型只在**非全票**时标注：全票是常态，标了只是噪音（会让每行都变长）；
-    // 而一旦出现分歧（如 2/3），这个数字恰是判断"链路在抖 vs 站点真挂了"的关键线索。
-    const probeLabel = dec.unanimous
-      ? r0.probe || null
-      : `${r0.probe || "?"} (${dec.okCount}/${dec.total})`;
+    // 票型标注：全通是常态，标了只是噪音（会让每行都变长）；出现分歧（如 1/3）
+    // 或有失败时才标 —— 那个数字恰是判断"链路在抖 vs 站点真挂了"的关键线索。
+    const probeLabel =
+      dec.ok && dec.unanimous
+        ? r0.probe || null
+        : `${r0.probe || "?"} (${dec.okCount}/${dec.total})`;
 
     rows.push({
       ts: new Date().toISOString(),
@@ -1019,10 +1079,16 @@ async function collectGlobalping(env) {
   await bumpState(env, perSite);
   // 证书写入口：只有握手成功（tls 非空）才写，失败时保持上一次已知的证书状态 ——
   // 探针连不上不代表证书变了，把它写成"无证书"会让首页突然显示"证书未检测"。
-  for (const [siteId, tls] of sslWrites) {
-    await saveSsl(env, siteId, tls).catch(() => {});
-  }
-  return { collected: rows.length, rows, dropped, perSite, sslWritten: sslWrites.length };
+  // 一次 batch 落库：逐站 await 会变成 N 次串行 D1 往返（20 站就是十几秒）。
+  if (sslWrites.length) await saveSslBatch(env, sslWrites).catch(() => {});
+  return {
+    collected: rows.length,
+    fetched,
+    rows,
+    dropped,
+    perSite,
+    sslWritten: sslWrites.length,
+  };
 }
 
 /**
@@ -1049,10 +1115,10 @@ const DUE_GRACE_MS = 15_000;
  * 为什么需要这一步：cron 每分钟触发（见 wrangler.toml），但每个站点的监测间隔
  * 是独立配置的（1 / 5 / 10 / 30 / 60 分钟）。必须按「距上次检查是否已达间隔」
  * 筛选，否则 1 分钟和 1 小时的站点会被一视同仁地每分钟都查 ——
- * 既浪费子请求与 DO 额度，也让间隔设置彻底失去意义。
+ * 既浪费出网子请求，也让间隔设置彻底失去意义。
  *
  * last_checked_ts 由 bumpState 在每次检查**完成后**写入，所以它表示
- * 「上次真正完成检查的时刻」，对 CF 与 Globalping 两种后端语义一致。
+ * 「上次真正完成检查的时刻」。
  * 从未检查过的站点（无记录）直接纳入，保证新增站点立刻被探测一次。
  */
 async function dueSites(env, sites) {
@@ -1068,9 +1134,8 @@ async function dueSites(env, sites) {
     // Globalping 是两阶段：本轮发起、下一轮才收得到结果，探测本身就跨一个 cron 周期。
     // 若仍按「距上次**收到结果**满 interval 才发起」，结果落地会整整晚一轮
     // （1 分钟间隔 → 2 分钟）。所以提前一个周期把测量发出去，让**结果**落在 interval 上；
-    // 由于 collectGlobalping 先于 dueSites 执行，刚收完结果的站点在同一轮就会被重新发起，
-    // 形成「下一轮收上一轮的结果」的流水线。CF 后端同步返回，不存在这段延迟。
-    // 两阶段要多等一轮才拿到结果，所以提前一个周期发起，保证实际间隔接近配置值
+    // 由于 collectGlobalping 先于 dispatch 执行，刚收完结果的站点在同一轮就会被重新发起，
+    // 形成「下一轮收上一轮的结果」的流水线。
     const lead = CRON_PERIOD_MS;
 
     const dueAt = Math.max(0, ivMs - lead) - DUE_GRACE_MS;
@@ -1082,14 +1147,20 @@ async function dueSites(env, sites) {
  * 阶段二：发起本轮测量
  *
  * `subreq_budget` 是**本轮所有出网子请求**的额度 —— 免费层每次调用硬上限 50，
- * 而每个站点要 1 次发起 + 1 次收取，所以站点数越接近 20 越要盯着这个值。
+ * 而每个站点要 1 次发起 + 1 次收取。
+ *
+ * ⚠️ 所以 `alreadyUsed` 必须带上「本轮收取已经花掉的次数」，不能每轮从 0 起算：
+ *    预算只管发起、不管收取时，实际出网量是预算的两倍 —— 20 个站点、预算 30 的情况下
+ *    会是 20 次收取 + 20 次发起 = 40，看着"没超预算"，一旦站点再多几个就直接撞 50 的硬上限，
+ *    整轮 cron 以一个和站点无关的错误失败（而且日志里 subreqUsed 还显示得很安全）。
+ *
  * 额度不够时**跳过**（记进 `skipped`），而不是硬发出去把整轮 cron 打成失败 ——
  * 跳过的站点下一轮会自然补上（dueSites 靠 last_checked_ts 判断，本轮没写就不算已查）。
  */
-async function dispatch(env, sites) {
+async function dispatch(env, sites, alreadyUsed = 0) {
   const budget = Number((env && env.SUBREQ_BUDGET) || 30);
   const d = await db(env);
-  let used = 0;
+  let used = Math.max(0, Number(alreadyUsed) || 0);
   const skipped = [];
 
   // 已挂起的站点本轮不再重复发起：上一轮的测量还没收，重发等于白花额度
@@ -1152,6 +1223,10 @@ async function persistManualTest(env, site, { source, probe, result }) {
     // 同步刷新 state 的「最后一次结果快照」，让首页/后台立刻反映这次手动测试。
     // upsertLastResult 刻意不碰 consecutive_fail 与 last_checked_ts。
     upsertLastResult(env, row).catch(() => {}),
+    // 证书也顺带刷新：这次测量本来就把 tls 抓回来了，不写等于让后台的证书列
+    // 继续停留在上一次 cron 的旧值（手动测往往是"我就想看看现在怎么样"）。
+    // 与自动探测同一约定：只有握手成功（tls 非空）才写。
+    result?.tls ? saveSsl(env, site.id, result.tls).catch(() => {}) : null,
   ]);
   return { ok: v.ok, reason: v.reason };
 }
@@ -1460,10 +1535,12 @@ export default {
         //      days=36500 →  1.13 MB / 4.6s（30 万次迭代的日期轴 + 全量扫描）
         //    更糟的是缓存 key 里带 days —— 每个不同的值都是**独立的缓存条目**，
         //    等于给了任何人一个「用任意 days 灌满边缘缓存 + 拉高 D1 扫描量」的入口。
-        //    上限 90 与 /api/site 的 days 一致（前台 30 天色条只用得到 30 天）。
-        const days = queryInt(url.searchParams.get("days"), 30, 1, 90);
+        //    上限 90 与 /api/site 的 days 一致（前台 30 天色条只用得到 30 天），
+        //    并且再与「明细保留天数」取小 —— 见 maxDays。
+        const maxD = maxDays(env);
+        const days = queryInt(url.searchParams.get("days"), Math.min(30, maxD), 1, maxD);
         // 缓存 key 带上配置版本：后台一改配置版本就 +1，所有机房的旧 key 立即不再命中
-        const ver = await configVersion(env);
+        const ver = configVersionOf(rawSettings);
         const keyUrl = `${url.origin}/api/overview?days=${days}&pretty=${pretty ? 1 : 0}&v=${ver}`;
         return await withEdgeCache(request, ctx, 30, async () => {
           const d = await db(env);
@@ -1658,7 +1735,9 @@ export default {
         const hoursFor = queryInt(url.searchParams.get("hours"), 24, 1, 720);
         // 色条天数（前台只用得到 30）。与 hoursFor 一样先在缓存 key 之外算好，
         // 避免"key 里的值"与"实际查询用的值"两处各算一遍后分叉。
-        const daysFor = queryInt(url.searchParams.get("days"), 30, 1, 90);
+        // 上限同样与明细保留天数联动（见 maxDays），否则会画出永远空着的格子。
+        const maxD = maxDays(env);
+        const daysFor = queryInt(url.searchParams.get("days"), Math.min(30, maxD), 1, maxD);
         // 「最近检查」条数：后台设置 recent_limit（默认 20），?recent= 可临时覆盖
         const recentN = clampInt(
           url.searchParams.get("recent") || env.RECENT_LIMIT || defOf("recent_limit"),
@@ -1673,7 +1752,7 @@ export default {
           100,
           Number(defOf("incident_limit"))
         );
-        const verS = await configVersion(env);
+        const verS = configVersionOf(rawSettings);
         // ⚠️ hours / days / recent / incident 都必须进缓存 key：它们决定**返回体的内容与长度**，
         //    不进 key 的话先请求 ?recent=5（或 ?days=7）会把默认响应的缓存污染成 5 条 / 7 天（或反之）。
         const keyUrl = `${url.origin}/api/site?id=${encodeURIComponent(
@@ -1952,8 +2031,6 @@ export default {
         }, keyUrl);
       }
 
-      // ── SSL 检测 ──
-      // 统一走 Globalping（CF 直连拿不到证书）；低频，每站点每天一次即可
       // ── 分类管理 ──
       // 站点的分类归属存在 sites.group_name；这里维护显式分类表（支持空分类 + 顺序）。
       // 重命名 / 删除都会连带更新所有站点的 group_name，保证不会出现"孤儿分类"。
@@ -2199,8 +2276,14 @@ export default {
         const limit = Number.isFinite(raw) && raw > 0 ? Math.min(raw, sites.length) : sites.length;
         const picked = sites.slice(0, limit);
         const collect = await collectGlobalping(env);
-        const disp = await dispatch(env, picked);
-        return json({ ok: true, collect, dispatch: disp });
+        const disp = await dispatch(env, picked, collect.fetched);
+        // rows / perSite 只在服务端内部用，不下发给浏览器：
+        // 后台只需要「收了几条、发起了几个」，把整份明细塞进响应纯属浪费。
+        return json({
+          ok: true,
+          collect: { collected: collect.collected, fetched: collect.fetched, dropped: collect.dropped },
+          dispatch: disp,
+        });
       }
 
       // 即时测试：?api=test&[site=<id>|target=...]
@@ -2223,12 +2306,30 @@ export default {
         // 位置筛选统一取全局设置，不再支持按请求覆盖 ——
         // 否则"测出来的结果"和"真实探测"可能用的不是同一个筛选，失去参考价值。
         const { id, source, quota } = await gpCreate(env, { url: target });
+
+        /**
+         * 等结果：**自适应间隔 + 总时长上限**。
+         *
+         * 原写法是固定的 `12 × 2.5s`：既让"其实 1 秒就好了"的部分白等 2.5 秒，
+         * 又在外层没有任何时长上界（探针侧超时是 5–30 秒，跟 12×2.5 没有关系）。
+         * 现在按 700ms 起步、每次 ×1.5（封顶 2.5s）递增 —— 常见情况 1~3 秒就拿到，
+         * 慢的时候仍然能等到探针超时之后再收尾；总上限取「探针超时 + 8 秒」。
+         *
+         * 每一轮都是一次真实出网请求，所以只在还可能出结果时才继续问。
+         */
+        const startedAt = Date.now();
+        const waitBudgetMs = (Number(env.GP_TIMEOUT_SEC) || 15) * 1000 + 8000;
         let finished = null;
-        for (let i = 0; i < 12 && !finished; i++) {
-          await new Promise((r) => setTimeout(r, 2500));
+        let wait = 700;
+        while (!finished && Date.now() - startedAt < waitBudgetMs) {
+          await new Promise((r) => setTimeout(r, wait));
+          wait = Math.min(2500, Math.round(wait * 1.5));
           const out = await gpCollect(env, { measurement_id: id });
           if (out.done) finished = out;
         }
+        // 后台 toast 要显示「这次测试实际等了多久」—— 它本身就是排查信息
+        // （同一个站点等 3 秒 vs 25 秒，含义完全不同）。
+        const elapsedMs = Date.now() - startedAt;
         // 结果不可用（id 失效 / API 报错）→ 明确报错并**不落库**。
         // gpCollect 把这种响应判成 done+broken（见其返回契约），照旧往下走会把
         // "压根没拿到数据"存成一条假的失败记录，反而污染页面。
@@ -2241,7 +2342,7 @@ export default {
           );
         }
         const results = finished?.results || [];
-        // ⚠️ 判定必须走 gpDecide（多数表决），与自动探测**用同一条判定链**。
+        // ⚠️ 判定必须走 gpDecide（多探针判定），与自动探测**用同一条判定链**。
         //    早先这里写的是"取成功结果里最快的那条"，于是同一个站点
         //    「后台点『测』」与「等 cron」会得出不同结论（一个取中位数、一个取最快值），
         //    手动测试作为排查手段就此失去参考价值 —— 它测的应当就是生产那条链。
@@ -2249,27 +2350,37 @@ export default {
         //    用一个宽容的虚拟站点，只要求 HTTP 层跑通。
         const dec = gpDecide(site || { expect_codes: "" }, results);
         if (dec.void) {
-          // 无结论（平票 / 探针全部是平台自身故障 / 一条结果都没收到）→ 明确报错且**不落库**。
-          // 与 broken 分支同一约定：把"没拿到结论"存成一条记录，等于凭空造出一个
-          // up 或 down，直接污染可用率。
+          // 无结论（探针全部是平台自身故障 / 一条结果都没收到 / 只剩 1 台且失败）→
+          // 明确报错且**不落库**。与 broken 分支同一约定：把"没拿到结论"存成一条记录，
+          // 等于凭空造出一个 up 或 down，直接污染可用率。
           const why =
-            dec.why === "tie"
-              ? "探针平票，无法形成多数派"
+            dec.why === "single-fail"
+              ? "只剩 1 台有效探针且失败，不足以判定"
               : dec.why === "all-internal"
                 ? "探针全部为 Globalping 平台自身故障"
                 : "未收到任何探针结果";
           return json(
-            { ok: false, kind: "globalping", source, quota, results, error: `${why}，本次不记录` },
+            {
+              ok: false,
+              kind: "globalping",
+              source,
+              quota,
+              results,
+              elapsed_ms: elapsedMs,
+              error: `${why}，本次不记录`,
+            },
             502,
             "no-store",
             pretty
           );
         }
         const best = dec.pick;
-        // 票型标注规则与 collectGlobalping 一致：全票是常态（不标），分歧才标 `City/ASN (2/3)`
-        const probeLabel = dec.unanimous
-          ? best.probe || null
-          : `${best.probe || "?"} (${dec.okCount}/${dec.total})`;
+        // 票型标注规则与 collectGlobalping 一致：全通是常态（不标），
+        // 分歧或有失败才标 `City/ASN (1/3)`
+        const probeLabel =
+          dec.ok && dec.unanimous
+            ? best.probe || null
+            : `${best.probe || "?"} (${dec.okCount}/${dec.total})`;
         let persisted = null;
         if (site) {
           persisted = await persistManualTest(env, site, {
@@ -2279,7 +2390,7 @@ export default {
           });
         }
         return json({
-          ok: true, kind: "globalping", source, quota,
+          ok: true, kind: "globalping", source, quota, elapsed_ms: elapsedMs,
           // 与后台表格 / 前台同一口径的来源标签（见 origin.js）
           origin: formatOrigin(source, probeLabel),
           // 判定结论与票型 —— 后台据此用"判定成功"而不是"传输成功"上色
@@ -2363,15 +2474,17 @@ export default {
     // 那些测量已经发出去了，不收就白花了额度。
     const collected = await stage("collectGlobalping", () => collectGlobalping(env), {
       collected: 0,
+      fetched: 0,
       rows: [],
       dropped: [],
       perSite: {},
       sslWritten: 0,
     });
 
-    // 再按各站点的监测间隔，只对「已到期」的发起新一轮
+    // 再按各站点的监测间隔，只对「已到期」的发起新一轮。
+    // 预算要减掉本轮收取已经花掉的次数（见 dispatch 的注释）。
     const due = await stage("dueSites", () => dueSites(env, sites), []);
-    const disp = await stage("dispatch", () => dispatch(env, due), {
+    const disp = await stage("dispatch", () => dispatch(env, due, collected.fetched), {
       used: 0,
       gpStarted: [],
       skipped: [],
@@ -2394,9 +2507,14 @@ export default {
     // 按「距上次成功清理的时间」判断而不是卡某个钟点 —— 后者只要那一轮 cron
     // 失败或漂移，当天就再也不清理了，checks 会一路膨胀。按时间间隔判断自带自愈。
     let cleaned = 0;
+    let orphans = 0;
     if (shouldCleanup(settings)) {
       try {
         cleaned = await cleanupOldChecks(env, Number(env?.CHECK_KEEP_DAYS || 30));
+        // 顺带清掉「站点已删除」的遗留行（state / ssl / pending）。
+        // 级联删除是后加的，改造前删掉的站点会留下孤儿行；它们不影响正确性
+        // （读侧都由 sites 驱动），只是白占空间、让行数对不上。
+        orphans = await cleanupOrphans(env);
         await saveSetting(env, "last_cleanup_ts", String(Date.now()));
       } catch (e) {
         cleaned = -1; // -1 表示失败，便于在日志里区分"删了 0 条"和"没跑成"
@@ -2414,14 +2532,16 @@ export default {
         gpDropped: collected.dropped,
         gpStarted: disp.gpStarted,
         skipped: disp.skipped,
-        // 子请求：探测已用 / 本轮总预算。每站 1 次发起 + 1 次收取，站点多时贴预算
-        // 属正常；真要超了会看到 skipped 非空（那说明该调小站点数或调大预算）。
+        // 出网子请求：本轮已用（收取 + 发起）/ 预算。
+        // 站点多时会贴着预算跑，此时 skipped 非空属正常节流（下一轮补上）；
+        // 若 skipped 长期非空，说明要么站点太多、要么间隔太密，需要二选一。
         subreqUsed: disp.used,
         subreqBudget,
         persisted: collected.collected,
         // 本轮顺带更新的证书数量（与探测同一次请求，不额外消耗额度）
         ssl: collected.sslWritten || 0,
         cleaned, // 0 = 不在清理时点或无过期数据；-1 = 清理失败
+        orphans, // 本次清掉的孤儿行数（站点已删除的 state/ssl/pending）
         // 分段错误：正常恒为 []。非空说明本轮有阶段失败，但其余阶段仍照常跑完了。
         errors,
       })

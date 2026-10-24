@@ -406,7 +406,7 @@ function lastResultFields(info, nowIso) {
 }
 
 /**
- * 更新连续失败计数 / 告警标志 + 最后一次结果快照，返回需要告警的站点。
+ * 更新连续失败计数 + 最后一次结果快照。
  *
  * ⚠️ 必须**批量**：若每站点各发一次 SELECT + UPSERT，一轮 N 个站点就是 2N 次 D1 往返，
  *    而 Workers 上每次往返都是真实的网络开销 —— 这是定时任务整体耗时的主要来源。
@@ -521,34 +521,80 @@ export async function upsertLastResult(env, row) {
     .run();
 }
 
-/** 写入 SSL 结果 */
+/**
+ * 证书写入语句。`days_left` **恒写 NULL**（见下），其余列整体覆盖。
+ *
+ * 为什么用整体覆盖而不是「只写非空字段」：证书信息是一次握手的完整快照，
+ * 混着旧值拼出来的「半新半旧」比直接覆盖更容易误导（例如 issuer 还是旧的、expires_at 已更新）。
+ */
+const SSL_UPSERT =
+  `INSERT INTO ssl
+     (site, checked_ts, authorized, protocol, issuer, subject, key_type, expires_at, days_left, error)
+   VALUES (?,?,?,?,?,?,?,?,?,?)
+   ON CONFLICT(site) DO UPDATE SET
+     checked_ts=excluded.checked_ts, authorized=excluded.authorized,
+     protocol=excluded.protocol, issuer=excluded.issuer,
+     subject=excluded.subject, key_type=excluded.key_type,
+     expires_at=excluded.expires_at, days_left=excluded.days_left,
+     error=excluded.error`;
+
+/** 单条 ssl 记录 → 绑定参数（saveSsl / saveSslBatch 共用，避免两处列序漂移） */
+function sslParams(siteId, r, ts) {
+  return [
+    siteId,
+    ts,
+    r.authorized ?? null,
+    r.protocol ?? null,
+    r.issuer ?? null,
+    r.subject ?? null,
+    r.key_type ?? null,
+    r.expires_at ?? null,
+    // ⚠️ 刻意恒写 NULL：`days_left` 是相对时间，落库即过期（见 sslDaysLeftSql 注释）。
+    //    列保留只为兼容旧库（不删列，避免一次无谓的表重建），读侧一律现算。
+    null,
+    r.error ?? null,
+  ];
+}
+
+/**
+ * 批量写入多站点的证书结果（一次往返）。
+ *
+ * 原文是 `for (...) await saveSsl(...)`：一轮 cron 收到 N 份证书就是 N 次串行 D1 往返。
+ * 20 个站点时这部分单独就占十几秒，而它完全可以在一次 batch 里落库。
+ *
+ * entries: [[siteId, tlsInfo], ...]
+ */
+export async function saveSslBatch(env, entries) {
+  if (!entries || !entries.length) return 0;
+  const d = await db(env);
+  const ts = new Date().toISOString();
+  const stmt = d.prepare(SSL_UPSERT);
+  const stmts = entries.map(([siteId, r]) => stmt.bind(...sslParams(siteId, r, ts)));
+  for (const part of chunk(stmts, BATCH_CHUNK)) await d.batch(part);
+  return stmts.length;
+}
+
+/** 写入单个站点的 SSL 结果（后台手动「测」这类单点场景） */
 export async function saveSsl(env, siteId, r) {
   const d = await db(env);
-  await d
-    .prepare(
-      `INSERT INTO ssl
-         (site, checked_ts, authorized, protocol, issuer, subject, key_type, expires_at, days_left, error)
-       VALUES (?,?,?,?,?,?,?,?,?,?)
-       ON CONFLICT(site) DO UPDATE SET
-         checked_ts=excluded.checked_ts, authorized=excluded.authorized,
-         protocol=excluded.protocol, issuer=excluded.issuer,
-         subject=excluded.subject, key_type=excluded.key_type,
-         expires_at=excluded.expires_at, days_left=excluded.days_left,
-         error=excluded.error`
-    )
-    .bind(
-      siteId,
-      new Date().toISOString(),
-      r.authorized ?? null,
-      r.protocol ?? null,
-      r.issuer ?? null,
-      r.subject ?? null,
-      r.key_type ?? null,
-      r.expires_at ?? null,
-      // ⚠️ 刻意恒写 NULL：`days_left` 是相对时间，落库即过期（见 sslDaysLeftSql 注释）。
-      //    列保留只为兼容旧库（不删列，避免一次无谓的表重建），读侧一律现算。
-      null,
-      r.error ?? null
-    )
-    .run();
+  await d.prepare(SSL_UPSERT).bind(...sslParams(siteId, r, new Date().toISOString())).run();
+}
+
+/**
+ * 清掉「站点已不存在」的遗留行。
+ *
+ * state / ssl / pending 都以 site 为主键，没有任何外键约束 —— 站点被删时由
+ * deleteSite 级联清理；但这条级联是后加的，改造前删掉的站点会留下孤儿行。
+ * 它们不影响正确性（读侧都按 sites 驱动），只是白占空间、让行数对不上。
+ *
+ * 用 `NOT IN (SELECT id FROM sites)` 而不是把 id 列表搬进 IN (?,?,…)：
+ * 前者不需要绑定参数，也就不会撞上 100 个参数的上限。
+ */
+export async function cleanupOrphans(env) {
+  const d = await db(env);
+  const stmts = ["state", "ssl", "pending"].map((t) =>
+    d.prepare(`DELETE FROM ${t} WHERE site NOT IN (SELECT id FROM sites)`)
+  );
+  const res = await d.batch(stmts);
+  return res.reduce((a, r) => a + Number(r?.meta?.changes ?? r?.changes ?? 0), 0);
 }
