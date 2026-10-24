@@ -86,6 +86,88 @@ const json = (o, status = 200, cache = "no-store", pretty = false) =>
   });
 
 /**
+ * 把「D1 层面的报错」翻译成可执行的下一步。
+ *
+ * 为什么需要：这类故障在浏览器里只表现为 `500 ()` —— 响应体是空的（异常逃出了
+ * fetch 处理器），前端拿不到任何文案，用户看到的就是一句「加载失败」。
+ * 而它们的成因高度集中，几乎都是"库没准备好"或"绑定没生效"，一条指引就能解决。
+ *
+ * 只在 5xx 兜底处调用；映射不到时返回 null，不硬编一条泛泛的提示。
+ */
+function dbErrorHint(msg) {
+  const m = String(msg || "");
+  if (/D1\s*绑定缺失/.test(m))
+    return "wrangler.toml 的 [[d1_databases]] 没随部署生效（database_id 为空串时 wrangler 会跳过绑定）。跑 npm run deploy 会自动建库并写回 database_id。";
+  if (/no such table/i.test(m))
+    return "D1 里还没有建表。跑一次 npm run deploy（会建表并校验结构），或手工执行 npx wrangler d1 execute <库名> --remote --file=schema.sql。";
+  if (/no such column/i.test(m))
+    return "D1 表结构与 schema.sql 不一致（缺列）。schema.sql 全是 IF NOT EXISTS，不会给旧表补列：按提示 ALTER TABLE 补列，或换库名重建（会丢数据）。";
+  if (/no such (function|module)/i.test(m)) return "SQLite 版本能力不足，检查 wrangler.toml 的 compatibility_date。";
+  return null;
+}
+
+/**
+ * 部署自检要核对的表。**故意写死而不是解析 schema.sql** —— schema.sql 不会被打进
+ * Worker 包，运行期拿不到；写死一份清单，换来的是"缺哪张表"能被直接点名。
+ * 新增表时两处一起改（schema.sql + 这里），漏改的后果只是自检少报一张，不影响业务。
+ */
+const EXPECTED_TABLES = ["sites", "checks", "state", "pending", "ssl", "categories", "meta"];
+
+/** dbErrorHint 的响应体片段（映射不到时返回空对象，不塞 null） */
+const hintOf = (e) => {
+  const h = dbErrorHint(String((e && e.message) || e));
+  return h ? { hint: h } : {};
+};
+
+/**
+ * 部署自检：只回答「这个 Worker 装好了没有」，**不返回任何业务数据**。
+ *
+ * 为什么必须是公开接口：出问题时最先坏的可能就是登录（密码没配、D1 没表），
+ * 要求先登录再自检等于在最需要它的时候用不了。
+ *
+ * 为什么放在设置加载**之前**：`loadSettings` 本身就要读 D1 —— 库没建表时它先抛，
+ * 后面的任何分支都到不了。自检必须绕开这一步。
+ *
+ * 只暴露"哪张表在不在""密码配没配"这类结构信息，不含站点、地址、token。
+ */
+async function buildHealth(env, pwdConfigured, pretty) {
+  const out = {
+    ok: true,
+    db_bound: Boolean(env && env.DB),
+    password_set: Boolean(pwdConfigured),
+    tables: [],
+    missing_tables: [],
+  };
+
+  if (!out.db_bound) {
+    out.ok = false;
+    out.hint = dbErrorHint("D1 绑定缺失");
+    return json(out, 500, "no-store", pretty);
+  }
+
+  try {
+    const r = await env.DB.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all();
+    const have = new Set(
+      (r.results || [])
+        .map((x) => x.name)
+        .filter((n) => n && !String(n).startsWith("_cf_"))
+    );
+    out.tables = EXPECTED_TABLES.filter((t) => have.has(t));
+    out.missing_tables = EXPECTED_TABLES.filter((t) => !have.has(t));
+    if (out.missing_tables.length) {
+      out.ok = false;
+      out.hint = dbErrorHint("no such table");
+    }
+  } catch (e) {
+    out.ok = false;
+    out.error = String((e && e.message) || e);
+    out.hint = "D1 绑定存在但查询失败：库被删除 / 无权限 / 额度耗尽。";
+  }
+
+  return json(out, out.ok ? 200 : 500, "no-store", pretty);
+}
+
+/**
  * 同源校验（防 CSRF）。
  *
  * Cookie 已是 SameSite=Lax，这本身就挡掉了绝大多数跨站写；但 Lax **允许顶层 GET 导航带 cookie**，
@@ -1049,10 +1131,28 @@ export default {
     const api = m ? m[1] : "";
     const pretty = url.searchParams.get("pretty") === "1";
 
+    // 部署自检必须**先于**设置加载与认证闸门：库没建表时 loadSettings 会先抛异常，
+    // 那时任何分支都到不了，自检也就失去意义。它只读 sqlite_master，不碰业务表。
+    if (api === "health") return await buildHealth(env, env.ADMIN_PASSWORD, pretty);
+
     /* ── 站点设置 + 认证闸门 ──────────────────────────────────────────
        设置存 D1 且优先级高于环境变量；合并回 env 后，下游所有 `env.XXX` 读取
        自动变成「D1 设置 → 环境变量 → 代码默认」，不必在每个调用点改成读设置。 */
-    const rawSettings = await loadSettings(env);
+    // ⚠️ 这一步在 try 之外，必须自己兜住：D1 没建表 / 绑定没生效时它会第一个抛，
+    //    而异常一旦逃出 fetch 处理器，Cloudflare 只回一个空体 500 ——
+    //    浏览器里看到的就是 `Failed to load resource: 500 ()`，前端拿不到任何文案，
+    //    用户完全无从判断是"库没建"还是"代码有 bug"。所以在这里就地转成可读 JSON。
+    let rawSettings;
+    try {
+      rawSettings = await loadSettings(env);
+    } catch (e) {
+      return json(
+        { ok: false, error: String((e && e.message) || e), ...hintOf(e) },
+        500,
+        "no-store",
+        pretty
+      );
+    }
     // 密码**只认环境变量** ADMIN_PASSWORD（wrangler secret / Dashboard Variables）。
     // 不做后台可改密码：那样就得在 D1 里存哈希、还要处理"改了密码如何作废旧会话"，
     // 而密码本就属于部署期配置，放环境变量更简单也更容易审计。
@@ -2128,6 +2228,7 @@ export default {
           ok: false,
           error: `未知接口：${api || url.pathname}`,
           endpoints: [
+            "GET  /api/health    部署自检：D1 绑定 / 表结构 / 密码（公开，排障先看这个）",
             "GET  /api/overview  前台：统计 + 分组 + 30 天色条 + SSL（公开，边缘缓存）",
             "GET  /api/site?id=&hours=  详情页：窗口统计 + 序列 + 故障（公开）",
             "GET  /api/admin     后台：站点 + 状态 + 分类 + 证书 + 设置（需登录）",
@@ -2143,7 +2244,12 @@ export default {
         pretty
       );
     } catch (e) {
-      return json({ ok: false, error: String((e && e.message) || e) }, 500);
+      return json(
+        { ok: false, error: String((e && e.message) || e), ...hintOf(e) },
+        500,
+        "no-store",
+        pretty
+      );
     }
   },
 

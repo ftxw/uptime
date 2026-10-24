@@ -229,6 +229,7 @@ npx wrangler secret put GLOBALPING_TOKEN
 
 | 方法 | 路径 | 权限 | 说明 |
 |---|---|---|---|
+| GET | `/api/health` | 公开 | **部署自检**：D1 绑定是否生效、7 张表缺哪张、密码配没配。排障先看这个 |
 | GET | `/api/overview` | 公开 | 统计 + 分组 + 30 天色条 + SSL，边缘缓存 30s。⚠️ 站点勾了「隐藏 URL」时，该条目的 `url` 为 `null` |
 | GET | `/api/site?id=&hours=&recent=` | 公开 | 详情页：窗口统计 + 延迟序列 + 最近检查 + 故障记录（同上，`url` 可能为 `null`） |
 | GET | `/api/admin` | 登录 | 站点 + 状态 + 分类 + 证书 + 设置（**一次拿全**） |
@@ -239,6 +240,28 @@ npx wrangler secret put GLOBALPING_TOKEN
 | POST | `/api/run`、`/api/test` | 登录 | 调试：手动跑一轮 / 测单个站点 |
 
 Token 类设置**只写不读**——读取接口只返回掩码（`glp_****ghij`）和是否存在。
+
+---
+
+## 排障
+
+部署后页面报错，**先打开 `/api/health`**（不需要登录，库没建好时也能访问）：
+
+```bash
+curl -s https://<你的域名>/api/health?pretty=1
+```
+
+健康时返回 `ok: true` 与 7 张表名；不健康时 `ok: false` 并有 `hint` 说明下一步。三种典型返回：
+
+| 返回 | 含义 | 处理 |
+|---|---|---|
+| `db_bound: false` | `env.DB` 不存在，D1 绑定没生效 | `npm run deploy`（会自动建库并把 `database_id` 写回 `wrangler.toml`） |
+| `missing_tables: [...]` 非空 | 库在，但表没建 | 同上；或手工 `npx wrangler d1 execute uptime-db --remote --file=schema.sql` |
+| `ok: true` 但 `password_set: false` | 部署完整，只是没设密码 | `npx wrangler secret put ADMIN_PASSWORD`（**类型要选 Secret**） |
+
+> 所有 5xx 现在都会返回 JSON（`{ok:false, error, hint?}`），不会再出现
+> 「空格 500」——异常逃出 Worker 时浏览器只显示 `Failed to load resource: 500 ()`，
+> 前端拿不到任何文案，那是最难排查的一种失败态。
 
 ---
 

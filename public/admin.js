@@ -458,7 +458,9 @@ async function loadAll() {
     //    它会以为加载成功、继续执行 hideLogin() —— 于是 /admin 返回 5xx 时
     //    用户看到的是一个**空壳后台**（提示一闪而过、表格永远是空的），
     //    而不是一个说得清原因的失败态。提示统一由 bootstrap 弹，避免弹两条。
-    throw new Error(d.error || "加载失败");
+    //    服务端对 D1 类故障会附一条 `hint`（可执行的下一步），一并带出来 ——
+    //    否则用户只看到 "no such table: sites" 这种原文，不知道该做什么。
+    throw new Error((d.error || "加载失败") + (d.hint ? `｜${d.hint}` : ""));
   }
 
   SITES = sortSites(d.sites || []);

@@ -118,7 +118,22 @@ export async function cleanupOldChecks(env, keepDays = 30) {
   return Number(r?.meta?.changes ?? r?.changes ?? 0);
 }
 
+/**
+ * 取 D1 绑定。
+ *
+ * ⚠️ 这里必须显式判空：`env.DB` 缺失时若直接返回 undefined，报错会发生在
+ *    下游某个 `.prepare()` 上（`Cannot read properties of undefined`），
+ *    信息量等于零 —— 排查的人会一路怀疑 SQL、怀疑参数，而真正的原因是
+ *    **绑定没生效**（`wrangler.toml` 的 `[[d1_databases]]` 没部署上去、
+ *    或 `database_id` 还是空串被 wrangler 跳过了）。
+ */
 export async function db(env) {
+  if (!env || !env.DB) {
+    throw new Error(
+      "D1 绑定缺失：env.DB 不存在。检查 wrangler.toml 的 [[d1_databases]] 是否已随本次部署生效" +
+        "（database_id 为空串时 wrangler 会跳过该绑定）。"
+    );
+  }
   return env.DB;
 }
 
