@@ -1,12 +1,4 @@
-/* 后台管理 —— 零框架、零外部依赖
-   风格与前台一致（同一份 app.css）。
-
-   结构参考 HaoNav 的「链接管理」面板：
-     左卡 = 分类目录（点即筛选，选中态为实心主色块，卡头带「+ 添加分类」）
-     右卡 = 站点列表（卡头带「+ 添加站点」，表格内含拖拽排序）
-   两卡在宽屏下等高、各自独立滚动。
-
-   保存后立即生效：写接口会递增配置版本，前台缓存的 key 随之变化（详见 src/index.js）。 */
+/** 后台管理 —— 零框架、零外部依赖，风格与前台共用 app.css。 */
 
 const API = "/api";
 const qs = (s) => document.querySelector(s);
@@ -24,7 +16,7 @@ let DRAG_CAT = null;     // 正在拖拽的分类名
 let DRAG_SITE = null;    // 正在拖拽的站点 id
 let AUTHED = false;
 let SETTINGS = null;     // /admin 一次性带回的设置，用于设置面板预填
-// 证书结果不再单独一张 map：/admin 已把 ssl_* 摊平在**每个站点行**里（见 sslCell）。
+// 证书结果不再单独一张 map：/admin 已把 ssl_* 摊平在每个站点行里（见 sslCell）。
 // 原先既发整张 map 又发扁平字段，同一份证书在一个响应里出现两遍，体积近乎翻倍。
 
 const UNGROUPED = "未分组";
@@ -52,19 +44,7 @@ function relTime(iso) {
   return `${Math.floor(s / 86400)} 天前`;
 }
 
-/**
- * 顶部滑出提示（toast）。形态对齐 HaoNav 的「链接已复制」：
- * 顶部居中、宽度随文案自适应的小胶囊，一句话短文案，几秒后自动消失。
- *
- * ⚠️ 文案务必短 —— 挤在一条胶囊里，超过一屏宽度就会折行、失去"一眼扫过"的效果。
- *
- * 为什么是 fixed：这些提示原先插在页头下方、属文档流 —— 一出现就把下面的
- * 卡片整体顶下去，消失又弹回来，屏幕一直在跳。现在挂到 body 末尾的
- * #toast-host 上（fixed，从顶部滑出），完全不参与布局；多条会依次堆叠。
- *
- * 生命周期：入 DOM → 下一帧加 .show 触发滑出 → 到时移除 .show → 过渡结束摘节点。
- * 时长按严重程度分档（warn/error 给足阅读时间，但仍会自动消失，没有常驻条目）。
- */
+/** 顶部滑出 toast：短文案、自动消失。 */
 const TOAST_MS = { info: 3000, warn: 5000, error: 6000 };
 
 function banner(msg, kind) {
@@ -85,15 +65,7 @@ function banner(msg, kind) {
   }, TOAST_MS[kind] || TOAST_MS.info);
 }
 
-/**
- * 「未设置管理员密码」——不是提示，而是**唯一的界面**。
- *
- * 服务端在 ADMIN_PASSWORD 未配置时整体停用后台（fail-closed，见 src/index.js），
- * 所以这里不会有任何数据可显示：后台的骨架一直保持 visibility:hidden。
- *
- * 之前的行为是"未配置就放开认证"，只在顶部闪一条 5 秒警告 ——
- * 那等于用一个瞬间消失的提示去兜住"任何人都能改配置"这件事，兜不住。
- */
+/** 未配置管理员密码时这是唯一界面：服务端 fail-closed，没有任何数据可显示。 */
 function showSetup() {
   AUTHED = false;
   // dialog 在 top layer，层级高于遮罩 —— 不关掉的话，用户看到的是
@@ -104,10 +76,7 @@ function showSetup() {
   qs("#logout").hidden = true;
 }
 
-/**
- * 「整屏遮罩」类错误：未登录（401）与后台停用（403 need_setup）。
- * 这两种情况遮罩已经把界面盖住了，再弹 toast 没人看得到 —— 静默即可。
- */
+/** 整屏遮罩类错误（401 / 403 need_setup）：遮罩已盖住界面，静默即可。 */
 const isMasked = (e) => Boolean(e && (e.needLogin || e.needSetup));
 
 /* ── 请求封装：401 弹登录、403 need_setup 弹「后台已停用」───────── */
@@ -139,7 +108,7 @@ async function api(path, opts = {}) {
   }
 
   // 403 + need_setup = 服务端没配 ADMIN_PASSWORD，后台整体停用。
-  // 这时**不能**弹登录框 —— 密码根本没配置，输什么都进不去，
+  // 这时不能弹登录框 —— 密码根本没配置，输什么都进不去，
   // 用户只会以为是自己记错了密码。改弹说明页，直接告诉他去设变量。
   if (r.status === 403 && d && d.need_setup) {
     showSetup();
@@ -279,12 +248,7 @@ function renderCats() {
     .join("");
 }
 
-/**
- * 站点表单里的分类下拉：**只列已有分类**。
- * 不支持在这里新建分类 —— 新建/改名/删除统一在左侧「分类」栏做，
- * 避免"同一个分类两个入口"带来的状态不一致（例如下拉里临时新建一个、
- * 之后在左侧改名，两边指向的分裂）。
- */
+/** 分类下拉只列已有分类；新建/改名统一在左侧分类栏做，避免两个入口状态不一致。 */
 function fillGroupSelect(current) {
   const sel = qs("#f-group");
   if (!sel) return;
@@ -299,17 +263,7 @@ function fillGroupSelect(current) {
   if (keep && names.includes(keep)) sel.value = keep;
 }
 
-/**
- * 监测间隔下拉：**动态补项**，绝不静默改写站点的间隔。
- *
- * 为什么必须这样做：下拉只有 1/5/10/30/60，而服务端 `clampInt(interval_min,1,1440,5)`
- * 允许 1–1440 的**任意**整数（接口直连、或早期数据都可能出现 15、45 这类值）。
- * 旧写法 `qs("#f-interval").value = String(n)` 遇到列表里没有的值时，
- * `<select>` 找不到匹配项 → `selectedIndex = -1`、下拉**一片空白**；
- * 用户接着点「保存」，`Number("") || 5` 会把 15 **静默改成 5** ——
- * 一次「打开编辑 → 保存」就改掉了配置，页面没有任何提示。
- * 这里照搬 fillGroupSelect 的思路：列表里没有就补一项并选中。
- */
+/** 间隔下拉动态补项，绝不静默改写站点间隔（服务端允许 1–1440 任意值）。 */
 function fillIntervalSelect(current) {
   const sel = qs("#f-interval");
   if (!sel) return;
@@ -323,22 +277,13 @@ function fillIntervalSelect(current) {
   sel.value = want;
 }
 
-/**
- * 证书降级阈值（天）—— **跟随后台设置**，不写死。
- *
- * 原实现是硬编码 `d <= 14`，而 `ssl_warn_days` 是可配置项（默认 14）。
- * 一旦把阈值调到 30 天，前台页脚会跟着变，后台却仍按 14 天判色 ——
- * 剩 20 天的证书在后台显示为**绿色**，正好在最该报警的地方报喜不报忧。
- */
+/** 证书降级阈值跟随后台设置，不写死。 */
 function warnDays() {
   const n = Number(SETTINGS && SETTINGS.ssl_warn_days);
   return Number.isFinite(n) && n > 0 ? n : 14;
 }
 
-/**
- * 证书单元格。入参是**站点行**（/admin 已把 ssl 表的列摊平成 ssl_* 前缀），
- * 不再是单独一张 site→证书 的 map —— 同一份数据在响应里只出现一次。
- */
+/** 证书单元格：入参是摊平了 ssl_* 的站点行。 */
 function sslCell(s) {
   if (!s || !s.ssl_checked_ts) return `<span class="muted">未检测</span>`;
   if (s.ssl_error) return `<span class="ssl ssl-warn">未知</span>`;
@@ -355,7 +300,7 @@ function sslCell(s) {
 async function renderRows() {
   const list = visibleSites();
   const title = FILTER || "全部";
-  // 拖拽排序只在**具体分类**视图下开放：「全部」视图里列表混着多个分类，而 sort
+  // 拖拽排序只在具体分类视图下开放：「全部」视图里列表混着多个分类，而 sort
   // 只在同一分类内比较 —— 跨分类拖拽改了 sort 也不改变它所在的位置，表现为
   // 「拖了没反应」。与其让用户对着一个静默失败的手势猜，不如先要求选个分类。
   const canDrag = Boolean(FILTER);
@@ -434,32 +379,12 @@ function applyBrandTitle(st) {
   if (b) b.textContent = t;
 }
 
-/**
- * 后台数据加载：**一次请求**拿全（站点 + 最近状态 + 分类 + 设置）。
- *
- * 为什么不再分开发 /sites 与 /categories：本站在 CF 边缘，从国内访问单次往返
- * 约 0.2s（实测静态文件 TTFB 中位 767ms，其中大部分是链路）。原先 /session →
- * /sites → /categories 是**串行**的，加上首屏 HTML 共 4 个 RTT，叠起来就明显慢。
- * 合并成 1 个 /admin 后，首屏只剩「HTML + /admin」两个请求。
- */
-/**
- * 拉取后台全量数据（一次 /admin 拿到站点 + 分类 + 证书 + 设置）。
- *
- * ⚠️ 401 / 403(need_setup) 时**必须让异常继续往上抛**，不要在这里吞掉：
- *    `api()` 已经弹出了对应的遮罩，而 bootstrap 要靠这个异常来判断"没进去"。
- *    一旦在此 return，bootstrap 会以为加载成功、继续执行 hideLogin()，
- *    把刚弹出的登录框又藏回去 —— 表现为后台一片空白且无法登录。
- */
+/** 后台一次请求拿全：站点 + 最近状态 + 分类 + 设置。 */
+/** 拉取后台全量数据；401/403 必须继续抛，bootstrap 靠异常判断有没有进去。 */
 async function loadAll() {
   const d = await api("/admin");
   if (!d.ok) {
-    // ⚠️ 必须让异常继续往上抛（不是弹个提示就 return）：
-    //    bootstrap 正是靠"有没有异常"判断"到底进没进去"，一旦在此 return，
-    //    它会以为加载成功、继续执行 hideLogin() —— 于是 /admin 返回 5xx 时
-    //    用户看到的是一个**空壳后台**（提示一闪而过、表格永远是空的），
-    //    而不是一个说得清原因的失败态。提示统一由 bootstrap 弹，避免弹两条。
-    //    服务端对 D1 类故障会附一条 `hint`（可执行的下一步），一并带出来 ——
-    //    否则用户只看到 "no such table: sites" 这种原文，不知道该做什么。
+    // 异常必须继续往上抛：否则 bootstrap 会误判加载成功。
     throw new Error((d.error || "加载失败") + (d.hint ? `｜${d.hint}` : ""));
   }
 
@@ -527,17 +452,7 @@ async function handleCatAction(btn) {
   }
 }
 
-/**
- * 「取消 / 关闭」按钮统一在这里关掉所属弹窗。
- *
- * ⚠️ 它们刻意**不是** submit 按钮，原因不只是风格：表单是 `method="dialog"`，
- *    而「隐式提交」（在任意输入框里按回车）用的 submitter 是表单的**默认按钮**——
- *    即树序里第一个 submit 按钮。原先关闭按钮在弹窗右上角、排在保存按钮之前，
- *    于是按回车会以 `submitter.value === "cancel"` 触发 submit：保存处理器把它当成
- *    "取消"直接 return（且**没有** preventDefault），method="dialog" 随即关掉弹窗。
- *    结果就是「在输入框里改完按回车 = 关闭弹窗且丢掉全部改动，还没有任何报错」。
- *    改成 type="button" 后，保存按钮成为唯一的（也就是默认的）submit 按钮，回车即保存。
- */
+/** 取消/关闭按钮统一在这里关弹窗；刻意不是 submit，避免隐式提交误触。 */
 for (const b of document.querySelectorAll("[data-close]")) {
   b.addEventListener("click", () => b.closest("dialog")?.close());
 }
@@ -566,15 +481,7 @@ function openCatForm(name) {
 qs("#cat-add-toggle").addEventListener("click", () => openCatForm(null));
 
 qs("#catform").addEventListener("submit", async (e) => {
-  // 只处理「保存」（`submitter` 为空时也按保存走，做一层防御）。
-  //
-  // ⚠️ 原写法 `if (e.submitter?.value !== "save") return;` 是个静默 bug：
-  //    隐式提交（在输入框里按回车）的 submitter 是表单的**默认按钮**，
-  //    而当时关闭按钮是树序里第一个 submit 按钮 → submitter.value === "cancel"，
-  //    于是这里直接 return 且**不执行 preventDefault()**，method="dialog" 随即关掉弹窗 ——
-  //    用户看到弹窗关闭、没有任何报错或提示，以为保存成功，实际一个字都没提交。
-  //    现已把关闭/取消按钮改成 type="button"（见 [data-close] 的处理），
-  //    保存按钮成为唯一的默认按钮，回车即保存。
+  // 只处理 submitter 为 save 的提交；submitter 为空也按保存走。
   if (e.submitter && e.submitter.value !== "save") return;
   e.preventDefault();
 
@@ -631,14 +538,7 @@ function catOrderFromDom() {
     .filter(Boolean);
 }
 
-/**
- * 拖拽结束后提交新顺序。
- *
- * ⚠️ 关键点：只提交**显式分类**（v2_categories 里登记过的）。
- * 左侧目录里还会出现「未分组」和只在站点上出现过的分类名 —— 它们不是显式分类，
- * 若一并提交，后端 reorder 会 INSERT 进分类表，把它们「升级」成显式分类，
- * 于是「未分组」会永远占着目录、删除也删不掉。所以这里按 explicit 过滤。
- */
+/** 拖拽结束后提交新顺序，只提交显式分类。 */
 async function saveCatOrder(names) {
   const explicit = new Set(CATS.filter((c) => c.explicit).map((c) => c.name));
   const only = names.filter((n) => explicit.has(n));
@@ -717,16 +617,7 @@ function clearRowDragUi() {
     .forEach((el) => el.classList.remove("row-dragging", "row-drag-over"));
 }
 
-/**
- * 提交站点新顺序。
- *
- * 与分类的 reorder 同一约定（只传顺序、不传对象），但传的是**当前视图下全部站点的
- * id**：sort 只在同一分类内比较，整组重排不会与别的分类撞位；反过来只传被移动的
- * 那一条，服务端也无从判断它该落在哪里（一条记录谈不上"顺序"）。
- *
- * 成功与失败都重新拉取 —— 失败时列表会回到服务端的真实顺序，不会停在一个
- * "本地看着已经变了、一刷新又变回去"的假状态。
- */
+/** 提交站点新顺序：只传当前视图下全部站点的 id。 */
 async function saveSiteOrder(ids) {
   try {
     const d = await post("/sites", { action: "reorder", ids });
@@ -778,7 +669,7 @@ rowsEl.addEventListener("drop", (e) => {
   clearRowDragUi();
   if (!target || target === src) return;
 
-  // 取的是**拖拽前的 DOM 顺序**（拖动过程中没有实时挪行），所以先摘掉源、再插到目标位
+  // 取的是拖拽前的 DOM 顺序（拖动过程中没有实时挪行），所以先摘掉源、再插到目标位
   const ids = [...rowsEl.querySelectorAll("tr[data-id]")].map((el) => el.dataset.id);
   const si = ids.indexOf(src);
   if (si < 0) return;
@@ -820,15 +711,7 @@ function openForm(site) {
 }
 
 qs("#form").addEventListener("submit", async (e) => {
-  // 只处理「保存」（`submitter` 为空时也按保存走，做一层防御）。
-  //
-  // ⚠️ 原写法 `if (e.submitter?.value !== "save") return;` 是个静默 bug：
-  //    隐式提交（在输入框里按回车）的 submitter 是表单的**默认按钮**，
-  //    而当时关闭按钮是树序里第一个 submit 按钮 → submitter.value === "cancel"，
-  //    于是这里直接 return 且**不执行 preventDefault()**，method="dialog" 随即关掉弹窗 ——
-  //    用户看到弹窗关闭、没有任何报错或提示，以为保存成功，实际一个字都没提交。
-  //    现已把关闭/取消按钮改成 type="button"（见 [data-close] 的处理），
-  //    保存按钮成为唯一的默认按钮，回车即保存。
+  // 只处理 save 提交，submitter 为空也按保存走。
   if (e.submitter && e.submitter.value !== "save") return;
   e.preventDefault();
 
@@ -845,10 +728,7 @@ qs("#form").addEventListener("submit", async (e) => {
   };
   if (!body.id || !body.url) return;
 
-  // 「显示顺序」已从表单移除，排序统一由列表拖拽负责（见 saveSiteOrder）。
-  // 但**编辑时必须把原值带回去**：服务端把"没给 sort"的站点当作新建、排到队尾 ——
-  // 否则每改一次名字，站点就会被悄悄挪到列表最后。
-  // 新建时**刻意不带**这个字段，交给服务端分配队尾位置。
+  // 排序统一由列表拖拽负责，但编辑时要把原 sort 带回去，否则会被挪到队尾。
   const prev = siteById(body.id);
   if (prev) body.sort = Number(prev.sort) || 0;
 
@@ -897,12 +777,7 @@ document.addEventListener("click", async (e) => {
     btn.disabled = true;
     btn.textContent = "…";
     try {
-      // 位置（区域组 / 筛选）统一由后端从全局设置取，前端不再传 ——
-      // 保证"测出来的"与"真实探测"走同一套参数。
-      // 带上 site=<id>：让后端把这次结果写进 checks，
-      // 这样手动测的点会出现在详情页折线与「最近检查」里。
-      // ⚠️ 必须是 POST：这个接口会落库并可能消耗 Globalping 额度，
-      //    GET 语义的幂等前提不成立（也避免被导航/预取意外触发）。
+      // 位置由后端从全局设置取，前端不传；带 site=<id> 让结果落库。
       const d = await post("/test", { site: site.id });
       const res = (d.results || [])[0] || {};
       // 来源标签由服务端算好（origin），与前台首页 / 详情页同一口径 ——
@@ -910,20 +785,11 @@ document.addEventListener("click", async (e) => {
       const where = d.origin || "";
       // 文案压成一条紧凑的短句：toast 是单个胶囊，字段用 · 分隔比用中文更省宽度
       const mark = d.persisted ? (d.persisted.ok ? " · 已记录" : ` · 未记录：${d.persisted.reason || "失败"}`) : "";
-      // 顺序：先重渲染表格（让「状态 / 最近检查」立刻反映这次结果），再弹提示 ——
-      // 这样用户看到的是"表已更新"而不是先闪一条提示再等表格刷新。
-      // 这里只调 renderRows 而不是 loadAll：后者会重拉一次全量数据，
-      // 让这条刚弹出的结果提示白等一个 RTT。
+      // 先重渲染表格再弹提示，只调 renderRows 不重拉全量。
       if (d.persisted) await renderRows();
-      // 上色按**判定结果**，不是按"传输是否成功"：
-      //   `res.ok` 只说明 fetch 没抛错，而「期望 200、实得 500」这类**判定失败**
-      //   在它看来仍是 true —— 于是文案写着"未记录：状态码 500 不在期望集合"、
-      //   气泡却是绿色，读起来自相矛盾。
-      //   verdict 由 /api/test 按 gpDecide / judge 给出（与自动探测同一口径）。
+      // 上色按判定结果而非传输是否成功（期望 200 实得 500 仍算失败）。
       const judged = d.verdict ? d.verdict.ok : d.persisted ? d.persisted.ok : res.ok;
-      // 第三个字段是「这次测试实际等结果等了多久」（服务端 elapsed_ms）。
-      // ⚠️ 别再写成 d.roundTripMs —— 那个字段服务端从来没返回过，于是这一格
-      //    永远显示 "—"，看起来像"测不出耗时"，实际是取错了名字。
+      // elapsed_ms 是这次测试实际等了多久。
       banner(
         `${site.name} · HTTP ${res.status ?? "—"} · ${res.ttfb ?? "—"}ms · ${where} · ${
           d.elapsed_ms ?? "—"
@@ -947,12 +813,7 @@ qs("#checkall").addEventListener("click", async () => {
   try {
     // 同理必须是 POST —— 手动跑一轮会真实发起探测并写库
     const d = await post("/run", {});
-    // 两阶段调度的语义：这一轮能拿到的只有**上一轮发起**的结果，
-    // 本轮刚发出去的测量要等下一轮 cron 才收得回来。所以两个数字分开报：
-    //   collected 收回来并落库的条数（本轮真正写进去的）
-    //   started   本轮发起的测量数（结果下一轮才出）
-    // 原来只报 collected、并且还去读一个不存在的 d.persisted（恒 0），
-    // 于是第一次点「立即全部检查」看到的总是「落库 0 条」，像是没生效。
+    // 两阶段语义：本轮只能拿到上一轮的结果，两个数字分开报。
     const collected = d.collect?.collected || 0;
     const started = (d.dispatch?.gpStarted || []).filter((x) => x.id).length;
     banner(`已执行一轮 · 落库 ${collected} 条 · 发起 ${started} 个（结果下一轮出）`, "info");
@@ -971,12 +832,7 @@ const setdlg = qs("#setdlg");
 
 /** 位置筛选下拉里的「自定义…」哨兵值 */
 const MAGIC_CUSTOM = "__custom__";
-/**
- * 预设选项（必须与 admin.html 里 `#s-magic` 的 <option> 一致，顺序也一致）。
- * ⚠️ **[0] 被当作「内置默认值」使用**（见 writeMagicLike）—— 它必须等于
- *    `src/settings.js` 的 `SETTING_META.gp_magic.def`（两者同值），否则"库里没这一行"时
- *    回显的选中项会与服务端实际生效的筛选不一致。改默认值要三处一起改。
- */
+/** 预设选项必须与 admin.html 的 option 一致，[0] 是内置默认值。 */
 const MAGIC_PRESETS = [
   "CN+datacenter-network",
   "CN",
@@ -994,16 +850,7 @@ function readMagicLike(selId, customId) {
   return v === MAGIC_CUSTOM ? qs(customId).value.trim() : v;
 }
 
-/**
- * 写「预设 + 自定义」型下拉：预设值→选中对应项；非预设值→切到「自定义」并填入输入框。
- *
- * ⚠️ 两个下拉里都**没有「不指定」这一项**（按要求移除），所以空值不能再映射成 `""`——
- *    那会让 <select> 找不到匹配项而变成"什么都不选中"的空白态（selectedIndex = -1）。
- *    改为回落到 `MAGIC_PRESETS[0]`（内置默认），界面上永远有确定的选中项，
- *    保存时会把该值显式写进 meta。**实际探测效果不变**：空值与
- *    `CN+datacenter-network` 本来等价（`effectiveEnv` 对空值回落 `SETTING_META` 的 def），
- *    区别只是从「跟着代码默认走」变成「把当前默认显式落库」。
- */
+/** 写「预设 + 自定义」下拉：非预设值切到自定义并填入输入框。 */
 function writeMagicLike(selId, customId, v) {
   const val = v || MAGIC_PRESETS[0];
   const isPreset = MAGIC_PRESETS.includes(val);
@@ -1012,7 +859,7 @@ function writeMagicLike(selId, customId, v) {
   qs(customId).hidden = qs(selId).value !== MAGIC_CUSTOM;
 }
 
-/** `#s-magic`：对全部站点的**可用性探测**生效 */
+/** `#s-magic`：对全部站点的可用性探测生效 */
 function readMagic() {
   return readMagicLike("#s-magic", "#s-magic-custom");
 }
@@ -1056,10 +903,7 @@ function fillSettingsForm(s) {
   qs("#s-theme").value = s.default_theme || "auto";
   qs("#s-utc").value = s.utc_offset_min ?? "";
   writeMagic(s.gp_magic || "");
-  // 回填 gp_limit。取值**只**由这个下拉的 <option> 定义（服务端刻意不做校验），
-  // 但库里仍可能是下拉之外的值 —— 环境变量 GP_LIMIT=7，或早期用数字框存下的值。
-  // 直接赋值会让 selectedIndex = -1（显示成空白），点保存又被洗成默认档，
-  // 等于静默改掉用户配置。所以这里补一项：没有引入任何校验，只保证"所见即所存"。
+  // 回填 gp_limit：取值只由下拉 option 定义，越界会显示空白。
   const limitSel = qs("#s-limit");
   const limitVal = String(s.gp_limit ?? "");
   if (limitVal && ![...limitSel.options].some((o) => o.value === limitVal)) {
@@ -1068,6 +912,7 @@ function fillSettingsForm(s) {
   if (limitVal) limitSel.value = limitVal;
   qs("#s-gptimeout").value = s.gp_timeout_sec || "";
   qs("#s-warn").value = s.ssl_warn_days || "";
+  qs("#s-slow").value = s.slow_ms ?? "";
   qs("#s-ipver").value = s.gp_ip_version || "4";
   qs("#s-budget").value = s.subreq_budget || "";
   qs("#s-keep").value = s.check_keep_days || "";
@@ -1081,13 +926,7 @@ function fillSettingsForm(s) {
 
 qs("#settings-open").addEventListener("click", openSettings);
 
-/**
- * 「清除 Token」—— 界面上删除已配置 Globalping Token 的**唯一**入口。
- *
- * 服务端的 `clear_globalping_token` 分支一直存在，但前端从来没发送过它，
- * 于是这个能力等于不存在：输入框留空只会走"保留旧值"（发 `__KEEP__`），
- * 用户配错 token 之后没有任何办法撤回。破坏性操作，先确认一次。
- */
+/** 「清除 Token」是删除已配置 Token 的唯一入口。 */
 qs("#s-gp-token-clear").addEventListener("click", async () => {
   if (!confirm("清除已保存的 Globalping Token？\n清除后额度回落到匿名档（250 次/小时）。")) return;
   const btn = qs("#s-gp-token-clear");
@@ -1116,15 +955,7 @@ for (const [selId, customId] of [["#s-magic", "#s-magic-custom"]]) {
 }
 
 qs("#setform").addEventListener("submit", async (e) => {
-  // 只处理「保存」（`submitter` 为空时也按保存走，做一层防御）。
-  //
-  // ⚠️ 原写法 `if (e.submitter?.value !== "save") return;` 是个静默 bug：
-  //    隐式提交（在输入框里按回车）的 submitter 是表单的**默认按钮**，
-  //    而当时关闭按钮是树序里第一个 submit 按钮 → submitter.value === "cancel"，
-  //    于是这里直接 return 且**不执行 preventDefault()**，method="dialog" 随即关掉弹窗 ——
-  //    用户看到弹窗关闭、没有任何报错或提示，以为保存成功，实际一个字都没提交。
-  //    现已把关闭/取消按钮改成 type="button"（见 [data-close] 的处理），
-  //    保存按钮成为唯一的默认按钮，回车即保存。
+  // 只处理 save 提交，submitter 为空也按保存走。
   if (e.submitter && e.submitter.value !== "save") return;
   e.preventDefault();
 
@@ -1143,6 +974,7 @@ qs("#setform").addEventListener("submit", async (e) => {
     gp_limit: qs("#s-limit").value.trim(),
     gp_timeout_sec: qs("#s-gptimeout").value.trim(),
     ssl_warn_days: qs("#s-warn").value.trim(),
+    slow_ms: qs("#s-slow").value.trim(),
     gp_ip_version: qs("#s-ipver").value,
     subreq_budget: qs("#s-budget").value.trim(),
     check_keep_days: qs("#s-keep").value.trim(),
@@ -1191,10 +1023,7 @@ qs("#f-id").addEventListener("input", (e) => {
 });
 
 async function bootstrap() {
-  // 一次 /admin 同时拿到「登录态」与「全部数据」——不再先发 /session 再发数据。
-  // 未登录时它返回 401：api() 已经弹出登录框，并把 needLogin 抛到这里。
-  // ⚠️ 这种情况必须**直接返回**，绝不能继续往下走 ——
-  //    下面的 hideLogin() 会把刚弹出的登录框又藏回去，变成空白页无法登录。
+  // 一次 /admin 同时拿到登录态与全部数据；401 时直接返回。
   try {
     await loadAll();
     hideLogin();
@@ -1208,14 +1037,11 @@ async function bootstrap() {
 }
 
 // 「我已设置，重新检查」——只刷新页面，重新走一次 bootstrap 的判定。
-// 变量在 Cloudflare 侧是**秒级生效**的，不需要等部署，所以刷新就能进。
+// 变量在 Cloudflare 侧是秒级生效的，不需要等部署，所以刷新就能进。
 qs("#setup-reload").addEventListener("click", () => location.reload());
 
 bootstrap();
-// 每 2 分钟**重新拉数据**，而不是只重渲染 DOM。
-// 旧实现只调 renderRows()：相对时间（"3 分钟前"）会不停变新，但底层数据一直是你
-// 上次操作时的那份 —— 于是页面上会出现"刚刚检查过"却其实是半小时前的错觉。
-// loadAll 失败时静默（401 会由 api() 弹登录框，其余交给下次轮询）。
+// 每 2 分钟重拉数据，而不只重渲染 DOM。
 setInterval(() => {
   if (document.hidden || !AUTHED) return;
   loadAll().catch(() => {});

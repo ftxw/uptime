@@ -1,34 +1,22 @@
 /**
- * 认证：常量时间比较 + HMAC-SHA256 签名会话 + 内存限速。
+ * 认证：常量时间比较 + HMAC-SHA256 自包含会话 + 内存限速。
  *
- * 密码**只来自环境变量** `ADMIN_PASSWORD`（wrangler secret 或 Dashboard Variables），
- * 不在 D1 里存哈希 —— 密码属于部署期配置，放环境变量更简单、更容易审计，
- * 也省掉了"改了密码如何作废旧会话"这类额外状态。因此本文件不含 PBKDF2。
- *
- * 会话是**自包含签名 token**，服务端不留状态（不写 D1/KV）：
- *   token = base64url(JSON payload) . base64url(HMAC-SHA256(secret, payload))
- * 签名密钥取自 ADMIN_SECRET 环境变量；未设则在 D1 里生成一个随机值持久化
- * （这样多机房、多 isolate 之间签名一致，重启也不会把所有会话踢掉）。
+ * 密码只来自环境变量 ADMIN_PASSWORD（部署期配置，不入库、不提供后台改密）。
+ * 会话是签名 token，服务端不留状态；签名密钥取 ADMIN_SECRET，未设则在 D1 里
+ * 生成随机值持久化，保证多机房一致、重启不踢会话。
  */
 
 const encoder = new TextEncoder();
 
-/* ───────────────────────── 常量时间比较 ───────────────────────── */
-
-/**
- * 常量时间比较：**长度不同也必须遍历固定长度，绝不能提前 return**。
- * 提前 return 会泄漏「前多少位匹配」，配合大量请求可逐位还原密码。
- */
+/** 常量时间比较：长度不同也走满全程，绝不提前返回（否则会泄漏匹配了多少位）。 */
 export function constantTimeEqual(a, b) {
   const ab = encoder.encode(String(a ?? ""));
   const bb = encoder.encode(String(b ?? ""));
   const len = Math.max(ab.length, bb.length);
-  let diff = ab.length ^ bb.length; // 长度差异折进 diff，而不是直接返回 false
+  let diff = ab.length ^ bb.length;
   for (let i = 0; i < len; i++) diff |= (ab[i] ?? 0) ^ (bb[i] ?? 0);
   return diff === 0;
 }
-
-/* ───────────────────────── 十六进制工具 ───────────────────────── */
 
 function toHex(bytes) {
   let s = "";
@@ -42,7 +30,7 @@ export function randomHex(bytes = 32) {
   return toHex(buf);
 }
 
-/* ───────────────────────── 会话（HMAC 签名 token）───────────────────────── */
+/* ───────────────────────── 会话 ───────────────────────── */
 
 function b64urlEncode(bytes) {
   let bin = "";
@@ -58,14 +46,31 @@ function b64urlToBytes(s) {
   return out;
 }
 
+/** 缓存的 HMAC key。实际只有一个 secret，故只留最近一份；失败清空以便重试。 */
+let cachedKey = null;
+
+function hmacKey(secret) {
+  if (!cachedKey || cachedKey.secret !== secret) {
+    cachedKey = {
+      secret,
+      key: crypto.subtle.importKey(
+        "raw",
+        encoder.encode(secret),
+        { name: "HMAC", hash: "SHA-256" },
+        false,
+        ["sign"]
+      ),
+    };
+  }
+  const cur = cachedKey;
+  return Promise.resolve(cur.key).catch((e) => {
+    if (cachedKey === cur) cachedKey = null;
+    throw e;
+  });
+}
+
 async function hmacBytes(secret, data) {
-  const key = await crypto.subtle.importKey(
-    "raw",
-    encoder.encode(secret),
-    { name: "HMAC", hash: "SHA-256" },
-    false,
-    ["sign"]
-  );
+  const key = await hmacKey(secret);
   const sig = await crypto.subtle.sign("HMAC", key, encoder.encode(data));
   return new Uint8Array(sig);
 }
@@ -78,13 +83,8 @@ async function signSession(payload, secret) {
 
 /**
  * 签发管理员会话（默认 30 天）。
- *
- * `epoch` 是「会话纪元」：每次「登出所有设备」把它 +1，所有旧 token 立即失效。
- *
- * 为什么需要它而不是只轮换签名密钥：签名密钥可能来自环境变量 `ADMIN_SECRET`，
- * 此时它是**只读**的（改不了环境变量），轮换 D1 里那份 secret 对验签毫无影响 ——
- * 于是"登出所有设备"在那套配置下是个假按钮：提示成功，别的设备照旧能用。
- * 把纪元写进 token 载荷后，吊销能力就与"密钥从哪来"解耦了。
+ * `epoch` 是会话纪元：登出所有设备时 +1，旧 token 立即失效。
+ * 它与签名密钥解耦，所以即使 ADMIN_SECRET 来自环境变量（只读）也能吊销。
  */
 export async function issueSession(secret, maxAgeSec, now = Date.now(), epoch = 0) {
   const iat = Math.floor(now / 1000);
@@ -92,10 +92,8 @@ export async function issueSession(secret, maxAgeSec, now = Date.now(), epoch = 
 }
 
 /**
- * 验签失败 / 过期 / 格式非法 / 纪元不匹配一律返回 null（不区分原因，避免信息泄漏）。
- *
- * ⚠️ `ep` 缺失按 0 处理：这样本改动上线**不会**把所有人的现存会话一起踢掉
- *    （纪元默认就是 0，旧 token 等价于 ep=0）。
+ * 验签失败/过期/格式非法/纪元不匹配一律返回 null（不区分原因）。
+ * `ep` 缺失按 0 处理，这样加纪元时不会把所有现存会话一起踢掉。
  */
 export async function verifySession(token, secret, epoch = 0) {
   if (typeof token !== "string" || token.length === 0) return null;
@@ -118,11 +116,11 @@ export async function verifySession(token, secret, epoch = 0) {
   return payload;
 }
 
-/* ───────────────────────── Cookie 工具 ───────────────────────── */
+/* ───────────────────────── Cookie ───────────────────────── */
 
-export const SESSION_COOKIE = "uptime_admin";
+const SESSION_COOKIE = "uptime_admin";
 
-export function parseCookies(header) {
+function parseCookies(header) {
   const out = {};
   if (!header) return out;
   for (const part of header.split(";")) {
@@ -157,13 +155,11 @@ export function clearSessionCookie(secure = true) {
   return parts.join("; ");
 }
 
-/* ───────────────────────── 内存限速（best-effort）───────────────────────── */
+/* ───────────────────────── 限速（best-effort）───────────────────────── */
 
 /**
- * ⚠️ 不要用 KV/D1 做登录计数：既烧额度，且 KV 最终一致本来也数不准。
- *    内存 Map 是 best-effort —— isolate 重启会清空、多 PoP 不共享，
- *    所以它只是**纵深防御的一层**，真正的闸门是密码强度 + 平台侧 WAF。
- * 惰性清理：桶数超阈值时顺手扫一遍过期的，避免无上界增长。
+ * 内存限速：不使用 KV/D1（既烧额度，最终一致也数不准）。
+ * isolate 重启即清空、多 PoP 不共享，只作纵深防御的一层。
  */
 export function createRateLimiter(maxPerMinute, windowMs = 60_000) {
   const buckets = new Map();
@@ -193,7 +189,7 @@ export function createRateLimiter(maxPerMinute, windowMs = 60_000) {
   };
 }
 
-/** 固定延迟（登录失败后调用）。等待不计 CPU，但抬高爆破成本。 */
+/** 固定延迟（登录失败后用）。等待不计 CPU，但抬高爆破成本。 */
 export function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }

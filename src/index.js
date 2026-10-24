@@ -1,13 +1,4 @@
-/**
- * uptime —— 站点监测编排层
- *
- * 核心设计：
- *   ① 探测走 Globalping「两阶段」：本轮发起测量、下一轮收取结果
- *      —— 因为 Workers 免费计划每次调用最多 50 个子请求，
- *         轮询等待几下就吃光了；两阶段把每站点压到 2 个子请求
- *   ② 一次测量同时产出延迟 / 状态码 / 证书，所以 SSL 不单独发请求
- *   ③ 展示侧读的是 state（最后结果快照）+ day 聚合，不扫 checks 明细
- */
+/** uptime —— 站点监测编排层。探测走 Globalping 两阶段（本轮发起、下轮收取），一次测量同时产出延迟、状态码与证书。 */
 
 import {
   db,
@@ -58,28 +49,10 @@ import { formatOrigin } from "./origin.js";
 
 const JSON_HEADERS = { "content-type": "application/json; charset=utf-8" };
 
-/**
- * 只读接口的默认缓存策略。
- *
- * 为什么必须加：实测从西安访问本 Worker，TLS 之后 Worker+D1 还要 ~200ms，
- * 而数据本来 5 分钟才更新一次 —— 完全没必要每次都回源。
- * 加 s-maxage 后 CF 边缘会缓存，命中时省掉 Worker 执行 + D1 查询。
- *
- * stale-while-revalidate 让边缘先返回旧值再后台刷新，用户永远不等。
- */
+/** 只读接口的边缘缓存策略：数据几分钟才更新一次，没必要每次都回源。 */
 const READ_CACHE = "public, s-maxage=30, stale-while-revalidate=120";
 
-/**
- * 会真正写库的接口 —— 只有它们（非 GET 时）才递增 config_version。
- *
- * 这份名单存在的意义：config_version 是**全机房缓存的总开关**（key 里带它），
- * 一变则所有 overview/site 缓存条目同时失效。所以它只该在"配置变了"时动，
- * 不该被登录失败、未知接口、跨站被拒这类"什么也没写"的请求推动。
- * 名单外的写接口（目前只有 login / logout）改了也不影响公开数据：
- * 前者只发 cookie，后者只动会话纪元与密钥。
- *
- * 注意 test / run 也在名单里：它们会往 checks 写记录，属于"公开数据变了"。
- */
+/** 会真正写库的接口：只有它们（非 GET）才递增 config_version。 */
 const WRITE_APIS = new Set(["settings", "sites", "categories", "test", "run"]);
 
 /** 默认输出紧凑 JSON（省流量）；调试时加 &pretty=1 才缩进 */
@@ -89,15 +62,7 @@ const json = (o, status = 200, cache = "no-store", pretty = false) =>
     headers: { ...JSON_HEADERS, "Cache-Control": cache },
   });
 
-/**
- * 把「D1 层面的报错」翻译成可执行的下一步。
- *
- * 为什么需要：这类故障在浏览器里只表现为 `500 ()` —— 响应体是空的（异常逃出了
- * fetch 处理器），前端拿不到任何文案，用户看到的就是一句「加载失败」。
- * 而它们的成因高度集中，几乎都是"库没准备好"或"绑定没生效"，一条指引就能解决。
- *
- * 只在 5xx 兜底处调用；映射不到时返回 null，不硬编一条泛泛的提示。
- */
+/** 把 D1 层报错翻译成可执行的下一步，否则前端只看到空体 500。 */
 function dbErrorHint(msg) {
   const m = String(msg || "");
   if (/D1\s*绑定缺失/.test(m))
@@ -110,13 +75,7 @@ function dbErrorHint(msg) {
   return null;
 }
 
-/**
- * 部署自检要核对的表。
- *
- * 从 `SCHEMA_STMTS` 直接推导，而不是再手工维护一份清单 —— 原来写死七个表名时，
- * 加表要改两处（schema.sql + 这里），漏改的后果是自检少报一张表，
- * 于是「库缺表」这件事反而被自检漏掉了。现在只有 schema.sql 一个真源。
- */
+/** 部署自检要核对的表，从 SCHEMA_STMTS 推导，避免手工清单漂移。 */
 const EXPECTED_TABLES = SCHEMA_STMTS.map(
   (s) => (s.match(/^CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)/i) || [])[1]
 ).filter(Boolean);
@@ -127,17 +86,7 @@ const hintOf = (e) => {
   return h ? { hint: h } : {};
 };
 
-/**
- * 部署自检：只回答「这个 Worker 装好了没有」，**不返回任何业务数据**。
- *
- * 为什么必须是公开接口：出问题时最先坏的可能就是登录（密码没配、D1 没表），
- * 要求先登录再自检等于在最需要它的时候用不了。
- *
- * 为什么放在设置加载**之前**：`loadSettings` 本身就要读 D1 —— 库没建表时它先抛，
- * 后面的任何分支都到不了。自检必须绕开这一步。
- *
- * 只暴露"哪张表在不在""密码配没配"这类结构信息，不含站点、地址、token。
- */
+/** 部署自检：只回答「装好了没有」，不返回业务数据；必须公开，否则最需要它时用不了。 */
 async function buildHealth(env, pwdConfigured, pretty, schema) {
   const out = {
     ok: true,
@@ -146,11 +95,7 @@ async function buildHealth(env, pwdConfigured, pretty, schema) {
     password_set: Boolean(pwdConfigured),
     schema: {
       expected_version: SCHEMA_VERSION,
-      // 本次请求里自动补结构的结果：
-      //   none      本来就已经是最新结构（正常状态，绝大多数时候看到的就是它）
-      //   created   这个库原本一张表都没有，本次把它建起来了
-      //   repaired  库已存在（旧库/缺表），本次补齐了结构与迁移
-      //   failed    自动建表失败，原因见 schema.error
+      // 本次自动补结构的结果：none 已是最新 / created 新建 / migrated 补了结构。
       auto_applied:
         schema && schema.ok
           ? !schema.migrated
@@ -204,15 +149,7 @@ async function buildHealth(env, pwdConfigured, pretty, schema) {
   return json(out, out.ok ? 200 : 500, "no-store", pretty);
 }
 
-/**
- * 同源校验（防 CSRF）。
- *
- * Cookie 已是 SameSite=Lax，这本身就挡掉了绝大多数跨站写；但 Lax **允许顶层 GET 导航带 cookie**，
- * 所以只要存在"会改状态的 GET"，就仍然有空子可钻。为了不依赖"记得每个端点都写成 POST"，
- * 这里对所有**非安全方法**统一加一道显式校验。
- *   优先看 Origin（最可靠）；缺失时退回 Sec-Fetch-Site。两者都没有时**拒绝** ——
- *   全部现代浏览器都会带上这两个头，放行只会白白留一个可绕过的口子。
- */
+/** 同源校验（防 CSRF）：SameSite=Lax 允许顶层 GET 带 cookie，不能只靠它。 */
 function sameOriginOk(request, url) {
   const origin = request.headers.get("origin");
   if (origin) {
@@ -234,17 +171,7 @@ function requirePost(request, pretty) {
   return json({ ok: false, error: "仅支持 POST" }, 405, "no-store", pretty);
 }
 
-/**
- * 用 Cache API 做边缘缓存。
- *
- * ⚠️ 实测结论：**光加 `Cache-Control: public, s-maxage=...` 不会让 CF 缓存 Worker 响应**
- *    —— 响应头里根本不会出现 `cf-cache-status`，因为 Worker 路由下 Worker 就是源站，
- *    边缘缓存不会自动介入。必须显式用 Cache API。
- *
- * 收益：命中时跳过 Worker 执行 + D1 查询。实测暖连接下单次请求 0.39s，
- *      其中约 0.19s 是 Worker+D1，缓存命中后这部分直接省掉。
- * 注意：`caches.default` 是**机房本地**缓存，不是全局 CDN 缓存。
- */
+/** 用 Cache API 做边缘缓存：只加 Cache-Control 不会让 CF 缓存 Worker 响应。 */
 async function withEdgeCache(request, ctx, ttl, producer, keyUrl) {
   const key = new Request(keyUrl || request.url, { method: "GET" });
   const cache = caches.default;
@@ -267,15 +194,7 @@ async function withEdgeCache(request, ctx, ttl, producer, keyUrl) {
   const status = res.status;
   const text = await res.text();
 
-  /**
-   * ⚠️ 只缓存 200，并把**原始状态码**原样返回。
-   *
-   * 原先不论源响应是什么状态，都 `new Response(text, { status: 200 })` 再 PUT 进缓存：
-   *   · `/api/site?id=不存在` 的 404 变成 200 —— 前端 `r.ok` 为真，走成功分支去读
-   *     `data.site.name`，拿到 undefined 后渲染出一个空白详情页，控制台没有任何错误；
-   *   · 更糟的是这个 404 被缓存了 30 秒：期间**任何**请求都拿到"200 + 站点不存在"。
-   * 非 200 一律不写缓存（`no-store`），状态码与源响应保持一致。
-   */
+  /** 只缓存 200，并原样返回原始状态码，否则 404 会被缓存成 200。 */
   const cacheable = status === 200 && !res.headers.get("set-cookie");
   const headers = cacheable
     ? { ...JSON_HEADERS, "Cache-Control": `public, s-maxage=${ttl}` }
@@ -285,11 +204,7 @@ async function withEdgeCache(request, ctx, ttl, producer, keyUrl) {
       };
 
   if (cacheable) {
-    // ⚠️ 用 await 而不是 ctx.waitUntil：PUT 是机房本地的同步操作，耗时可忽略；
-    //    而异步 PUT 会让写入跨越请求边界（响应已返回、PUT 才落地），
-    //    在 config_version 递增这类时序里留下难以复现的残影。
-    //    顺带说明：缓存**失效**不依赖任何 append/delete 动作，
-    //    全靠 key 里带 config_version（写操作一改版本号，旧 key 就再也不会被命中）。
+    // 用 await 而非 ctx.waitUntil：PUT 是本地同步操作，异步会跨请求边界留时序残影。
     try {
       await cache.put(key, new Response(text, { status: 200, headers }));
     } catch {}
@@ -300,36 +215,13 @@ async function withEdgeCache(request, ctx, ttl, producer, keyUrl) {
   });
 }
 
-/**
- * 读当前配置版本 —— 用于拼 overview / site 详情的缓存 key。
- *
- * ⚠️ 从**已经读到的设置**里取，不再单独查一次 D1。
- *    版本号就存在 meta 表里，而 `loadSettings()` 在请求开头已经把整张 meta 读进内存
- *    （`SELECT key, value FROM meta`）—— 原来这里再发一条
- *    `SELECT value FROM meta WHERE key='config_version'`，等于每个读请求多一次
- *    跨国往返，换回一个已经在手里的字符串。
- *
- *    时序上也安全：`bumpConfigVersion` 在路由分发前执行，而本函数只用于
- *    读接口的缓存 key；写接口的响应本来就不进缓存（no-store）。
- */
+/** 读配置版本用于缓存 key，从已读到的设置里取，不额外查 D1。 */
 function configVersionOf(rawSettings) {
   const v = rawSettings && rawSettings.config_version;
   return v ? String(v) : "0";
 }
 
-/**
- * 写操作后让缓存失效。
- *
- * ⚠️ 这里**只**递增 config_version，不再手动 delete 缓存条目 —— 原因：
- *    overview / site 的缓存 key 形如 `...?days=..&pretty=..&v=<config_version>`，
- *    版本号一变，所有旧 key 立刻不再命中，等于**全机房同时失效**；
- *    而 `caches.default.delete()` 是**机房本地**的，只能清当前这一台，
- *    其他机房仍会命中旧值（实测「改完分类顺序前台没变」正是这个原因）。
- *
- *    早先还有一个 `purgeOverview()` 在 delete「不带查询串的 /api/overview」——
- *    而写入用的 key 始终带 `?days=&pretty=&v=`，两者**永远不相等**，
- *    那行代码从头到尾都是空的。已删掉，避免后人以为"已经清过缓存了"。
- */
+/** 写操作后只递增 config_version 让缓存 key 失效，不逐条 delete 缓存。 */
 async function bumpConfigVersion(env) {
   try {
     const d = await db(env);
@@ -342,12 +234,7 @@ async function bumpConfigVersion(env) {
   } catch {}
 }
 
-/**
- * 后台站点列表：站点配置 + 最近一次检查 + 分类。
- *
- * 抽出来是为了给 /api/admin 聚合接口复用 —— 后台一次请求就能拿到全部数据，
- * 不必再串行发 /sites + /categories 两次往返（跨国链路上每次往返约 0.2s）。
- */
+/** 后台站点列表：站点 + 最近状态 + 分类，供 /api/admin 聚合复用。 */
 async function buildAdminPayload(env) {
   const d = await db(env);
 
@@ -366,13 +253,7 @@ async function buildAdminPayload(env) {
       )
       .all(),
     buildCategories(d),
-    // ⚠️ 只读已有证书结果，绝不在渲染路径上触发检测。
-    //    证书由 cron 的每次探测顺带写入（见 collectGlobalping 的 sslWrites），
-    //    这里只做一次 LEFT JOIN 式的读取，不产生任何出网请求。
-    //
-    // days_left 用现算表达式取（库里的值是 NULL，见 db.sslDaysLeftSql）：
-    // 后台表格、首页、详情页三条读路径必须用同一个算法，否则同一天会在三个页面
-    // 显示三个剩余天数。
+    // 只读已有证书结果，绝不在渲染路径上触发检测。
     d.prepare(`SELECT ${SSL_COLUMNS_SQL()} FROM ssl`).all(),
   ]);
 
@@ -395,7 +276,7 @@ async function buildAdminPayload(env) {
       // 这一列在 state 表里，不在 sites 表 —— 不加就会让后台永远算不出 pending，
       // 于是首页是黄、后台是红，同一时刻两个页面说两套话。
       consecutive_fail: lastMap[s.id]?.consecutive_fail ?? 0,
-      // stateOf() 读的是 ssl_* 前缀的**扁平**字段（与 overview 的 SQL 别名同形），
+      // stateOf() 读的是 ssl_* 前缀的扁平字段（与 overview 的 SQL 别名同形），
       // 这里把 ssl 表的列重命名摊平后再交给它，避免后台自算一套三态逻辑。
       ssl_checked_ts: ssl?.checked_ts ?? null,
       ssl_authorized: ssl?.authorized ?? null,
@@ -420,13 +301,7 @@ async function buildAdminPayload(env) {
   };
 }
 
-/**
- * 是否该清理过期明细。
- *
- * 只用「上次成功清理的时间」判断，不用固定的 UTC 时刻窗口 ——
- * 后者只要那一轮 cron 没跑成就漏一整天，且没有补救机制。
- * 周期设 20 小时（略短于 24）：正常一天一次，漏了也能在下个窗口自动补。
- */
+/** 是否该清理过期明细：按「上次成功清理时间」判断，固定时刻窗口漏跑就漏一天。 */
 const CLEANUP_INTERVAL_MS = 20 * 3600 * 1000;
 function shouldCleanup(rawSettings) {
   const last = Number(rawSettings.last_cleanup_ts || 0);
@@ -438,38 +313,19 @@ function gpMagicOf(env) {
   return (env && env.GP_MAGIC) || null;
 }
 
-/**
- * 站点的来源标签（首页 / 详情页 / 后台共用，格式见 origin.js）。
- *
- * 有检查记录时用**最近一次实际跑的那台**（last_source/last_probe）——
- * 探针每次可能换城市，如实显示才能解释"延迟为什么变了"。
- * 从未检查过的站点则用配置推一个（`GP:CN`），免得首页那一行留一块空白。
- */
+/** 来源标签：有记录时用最近一次实际跑的探针，探针会换城市，如实显示才能解释延迟变化。 */
 function originOf(site, lastSource, lastProbe, env) {
   const real = formatOrigin(lastSource, lastProbe);
   if (real) return real;
   return formatOrigin(`gp:${gpMagicOf(env) || defOf("gp_magic")}`, null);
 }
 
-/**
- * 「响应偏慢」判定的基线（毫秒）。
- *
- * 直接用探针端超时（gp_timeout_sec，默认 15s）作为基线：超过一半即 7.5s 判"偏慢"。
- * 不另设一个数字，是因为"多慢算慢"必须和"多久算失败"同一把尺子 ——
- * 两个独立配置迟早会配成"慢阈值 > 超时阈值"这种自相矛盾的状态。
- */
-function slowBaseMs(env) {
-  const sec = Number((env && env.GP_TIMEOUT_SEC) || defOf("gp_timeout_sec"));
-  return (Number.isFinite(sec) && sec > 0 ? sec : 15) * 1000;
+/** 「响应偏慢」的绝对阈值（毫秒），0 = 关闭该项降级。 */
+function slowMs(env) {
+  return clampInt(env?.SLOW_MS ?? defOf("slow_ms"), 0, 60000, Number(defOf("slow_ms")));
 }
 
-/**
- * 三态判定：up / down / degraded（overview、site 详情、后台列表三处共用，避免逻辑漂移）
- *
- * 降级规则对齐参考项目 ftxw/uptime-monitor 的 lib/checker.ts：
- *   证书无效 或 剩余 ≤ SSL_WARN_DAYS（默认 14）天 或 响应时间 > 探针超时上限的一半
- * 注意 down 不参与降级判定 —— 故障比降级更严重。
- */
+/** 三态判定：降级 = 证书无效 / 剩余天数不足 / 响应超过 slow_ms；down 不参与降级。 */
 function stateOf(s, env) {
   const ssl = s.ssl_checked_ts
     ? {
@@ -491,21 +347,9 @@ function stateOf(s, env) {
   let state = s.last_ok === 1 ? "up" : s.last_ok === 0 ? "down" : "unknown";
   let degrade_reason = null;
 
-  // ── 失败但还没攒够确认次数 → 黄（Uptime-Kuma 的 PENDING 语义）──
-  //
-  // 为什么必须有这一层：`fail_threshold` 原先只作用于 30 天色条（见 maxFailRunPerDay），
-  // 实时圆点却是「按最后一次结果」直接上色 —— 于是同一个站点在同一页面上有两套口径：
-  // 圆点第 1 次失败就红，色条要连续 3 次才标红，而设置项写的是「连续失败几次判故障」。
-  // 用户看到的是「刚红了一下又绿了」，且不知道该信哪个。
-  //
-  // 现在统一到设置项的口径：1..thr-1 次是黄（确认中），≥thr 次才是红。
-  // 实测意义：任一成功即可达的规则下，单轮全灭概率约 1.56%，5 分钟间隔的站点
-  // 一天仍会有约 4 次单轮全灭（探针链路抖动），原先每次都红 5 分钟 ——
-  // 现在只黄，红色只留给真正确认过的故障。
+  // 未达确认次数先标黄（Kuma 的 PENDING 语义）：1..thr-1 次是「疑似故障」，≥thr 才红。
   const threshold = Math.max(1, Number(s.fail_threshold || 3));
-  // consecutive_fail 为 0 但仍 last_ok=0，只会出现在「手动测过且失败」——
-  // upsertLastResult 刻意不动 consecutive_fail。至少要按 1 次算，
-  // 否则手动测出来的失败会被当成"已确认故障"直接标红。
+  // 手动测过且失败时 consecutive_fail 仍为 0，按 1 次算，否则会直接标红。
   const streak = state === "down" ? Math.max(1, Number(s.consecutive_fail || 0)) : 0;
   const pending = state === "down" && streak < threshold;
 
@@ -513,9 +357,8 @@ function stateOf(s, env) {
     state = "degraded";
     degrade_reason = `疑似故障（确认中 ${streak}/${threshold}）`;
   } else if (state !== "down") {
-    // 确认中 / 故障的站点不再叠证书与延迟提示：degrade_reason 只有一个字符串，
-    // 叠上去会把更要紧的那一条挤掉。
-    const baseMs = slowBaseMs(env);
+    // degrade_reason 只有一个字符串，确认中/故障的站点不再叠加证书与延迟提示。
+    const slow = slowMs(env);
     const warnDays = Number(env.SSL_WARN_DAYS);
     if (ssl && !ssl.error && ssl.valid === false) {
       state = "degraded";
@@ -528,7 +371,7 @@ function stateOf(s, env) {
     ) {
       state = "degraded";
       degrade_reason = `证书剩余 ${ssl.days_remaining} 天`;
-    } else if ((s.last_ttfb || 0) > baseMs * 0.5) {
+    } else if (slow > 0 && (s.last_ttfb || 0) > slow) {
       state = "degraded";
       degrade_reason = `响应偏慢 ${s.last_ttfb}ms`;
     }
@@ -536,7 +379,7 @@ function stateOf(s, env) {
   return { state, degrade_reason, ssl };
 }
 
-/** 时间序列的桶宽：窗口越长桶越粗，保证返回点数在 60~200 之间（图表够用又不臃肿） */
+/** 时间序列桶宽：窗口越长桶越粗，点数保持在 60~200 */
 function bucketFor(hours) {
   if (hours <= 6) return { sec: 300, label: "5 分钟" };
   if (hours <= 24) return { sec: 900, label: "15 分钟" };
@@ -545,14 +388,7 @@ function bucketFor(hours) {
   return { sec: 43200, label: "12 小时" };
 }
 
-/**
- * 色条最多能要几天 = min(接口允许的 90 天, 明细保留天数)。
- *
- * 为什么两处必须联动：checks 只保留 `check_keep_days`（默认 30）天，而接口原先一律
- * 允许 `days=90`。于是 `?days=90` 会返回 90 格色条、其中 60 格永远是"无数据"——
- * 读起来像"这两个月没在监测"，而事实是更早的明细已被保留策略删掉了。
- * 上限跟着保留天数走，界面上剩下的就都是有意义的格子。
- */
+/** 色条最多能要几天 = min(90, 明细保留天数)，超出的格子必然永远是空的。 */
 function maxDays(env) {
   const keep = clampInt(
     env?.CHECK_KEEP_DAYS ?? SETTING_META.check_keep_days.def,
@@ -568,17 +404,9 @@ function maxDays(env) {
 /* ────────────────────────── 站点设置（存 D1，后台可改）────────────────────────── */
 /* 设置项清单、环境变量映射与默认值都在 src/settings.js —— 那里是唯一来源 */
 
-/**
- * 不对外暴露的内部状态键（不在 SETTING_KEYS 里，后台读写接口都碰不到）：
- *   session_secret     会话签名密钥，首次需要时随机生成并落库
- *   config_version     配置版本号，用于让边缘缓存立即失效
- *   login_fail_window / login_fail_count   登录失败计数（全局限速）
- */
+/** 不对外暴露的内部状态键，后台读写接口都碰不到。 */
 
-/**
- * 把 D1 设置合并进 env —— 现有代码全部读 env.XXX，这样一处覆盖、全链路生效，
- * 不必在每个调用点都改成读设置。
- */
+/** 把 D1 设置合并进 env，一处覆盖、全链路生效。 */
 async function effectiveEnv(env, S) {
   const s = S || (await loadSettings(env));
   const merged = Object.assign({}, env);
@@ -589,15 +417,7 @@ async function effectiveEnv(env, S) {
   return merged;
 }
 
-/**
- * 「一天」从哪一刻起算 —— 30 天色条与按天聚合的唯一时区来源。
- *
- * 必须可配的原因：色条是"某天的成功/失败占比"，而"某天"完全取决于时区。
- * 写死在一个值上，换时区的部署就必须改代码；而 SQL 与 JS 两侧又必须算出**同一个**
- * 边界，否则首帧会在两个日期间漂移。所以统一从这里取。
- *
- * @returns {number} 毫秒偏移。供 JS 侧生成日期轴用；SQL 侧走 dayMod()
- */
+/** 「一天」从哪一刻起算：30 天色条与按天聚合的唯一时区来源。 */
 function dayOffsetMs(env) {
   const min = clampInt(
     env?.UTC_OFFSET_MIN ?? SETTING_META.utc_offset_min.def,
@@ -613,28 +433,7 @@ function dayMod(env) {
   return `${min < 0 ? "-" : "+"}${Math.abs(min)} minutes`;
 }
 
-/**
- * 按天算出「最长的一段连续失败有多长（次数）」。
- *
- * 为什么需要：30 天可用率色条原先只看当天的失败**次数** —— 只要有失败就标成
- * 「当天有故障」。但一次没到 fail_threshold 的失败（下一拍就恢复）本就不是故障
- * （见「故障记录」卡片的口径），却被涂成红色，同一件事在同一个页面上有两种说法。
- * 现在色条改用与告警 / 故障记录**同一个定义**：当天出现过「连续失败 ≥ fail_threshold」
- * 的段才算故障（`fault`），其余只有 `blip`（有抖动，不标红）。
- *
- * 连续性只能靠时间戳间隔判断：同一站点的探测是等间隔的，两次失败的时间差接近一个
- * 间隔就说明它们相邻（中间没有成功过）。容差取 1.3 倍间隔 —— 既容忍调度抖动
- * （cron 相位、Globalping 两阶段带来的 ±秒级偏移），又保证 < 2 倍间隔，从而**不会**
- * 把"中间夹着一次成功"的两次失败并成一段。
- *
- * 跨天的段在按天分组时会被切开，属保守处理：宁可少标红，不多标红。
- * 代价上这是"只读失败行"，配合 idx_checks_ok_ts_site 索引，读取量与该段时间的
- * 失败次数成正比，而不是与总检查数成正比。
- *
- * @param {Array<{d: string, ts: string}>} rows 失败检查，需按 ts 升序（同一天的行连续）
- * @param {number} intervalMin 该站点的期望检查间隔（分钟）
- * @returns {Object<string, number>} 天 → 当天最长连续失败次数
- */
+/** 按天算最长连续失败段：两次失败间隔 ≤ 1.3 倍间隔视为相邻，跨天切断（宁可少标红）。 */
 function maxFailRunPerDay(rows, intervalMin) {
   const tol = Math.max(1, Number(intervalMin) || 5) * 60 * 1.3; // 秒，见上方容差说明
   const out = {};
@@ -656,11 +455,8 @@ function maxFailRunPerDay(rows, intervalMin) {
 }
 
 /**
- * 按 key 做取值的类型/范围规范化。
- *
- * 为什么必须在写入侧拦：这些值会直接参与探测参数（超时、IP 版本、位置筛选）和降级判定。
- * 一个 gp_timeout_sec = "abc" 会让 Number(...) 得到 NaN，进而使判定条件恒假、
- * 或让所有请求立即超时 —— 表现为"整站全线故障"，极难联想到是某个设置项写坏了。
+ * 按 key 规范化取值。必须在写入侧拦：这些值直接进探测参数与降级判定，
+ * 一个非法值（如 gp_timeout_sec="abc"）会让所有站点表现为全线故障。
  */
 function normalizeSetting(k, v) {
   const def = SETTING_META[k]?.def ?? "";
@@ -669,34 +465,24 @@ function normalizeSetting(k, v) {
   switch (k) {
     case "ssl_warn_days":
       return num(0, 90);
+    case "slow_ms":
+      return num(0, 60000);
     case "subreq_budget":
-      // ⚠️ 上限 35 而不是 45：这是「本轮出网子请求」的额度，而 Workers 免费层
-      //    每次调用硬上限是 50，且 **D1 往返也算子请求**（不在这里计数）。
-      //    一轮 cron 的 D1 往返实测 15~20 次（loadSettings / loadSites / collect /
-      //    dispatch / bumpState / saveSsl / bumpConfigVersion …），所以
-      //    35 + 20 = 55 已经到临界；设到 45 就是"配置合法但一定跑不通"。
+      // 上限 35：免费层每次调用硬上限 50 个子请求，而一轮 cron 的 D1 往返另有 15~20 次。
       return num(1, 35);
     case "check_keep_days":
       return num(1, 365);
     case "recent_limit":
-      // 上限 200 与 /api/site 的 recent 参数钳制保持一致 —— 再大对页面没有意义，
-      // 只会让详情页的返回体变大
       return num(5, 200);
     case "incident_limit":
       return num(1, 100);
     case "utc_offset_min":
       return num(-720, 840);
     case "gp_timeout_sec":
-      // Globalping API 的硬约束：整数秒，5–30。越界它直接 422，
-      // 所以在写入侧就拦下，别把非法值存进 meta 再让 cron 每轮去撞
+      // Globalping 硬约束：整数秒 5–30，越界直接 422
       return num(5, 30);
     case "gp_ip_version":
       return v === "6" ? "6" : SETTING_META.gp_ip_version.def;
-    // ⚠️ 下面四项原先**完全没有校验**（落到 default 分支原样存库），而它们直接决定
-    //    每一次 Globalping 请求的请求体：一个 `gp_limit=abc` 让所有 GP 站点 422、
-    //    一个带空格的 magic 让所有 GP 站点 no_probes_found。
-    //    失败面是"全部 GP 站点一起失败"，而站点本身完全正常 —— 这正是最容易被误判成
-    //    "站点挂了"的一类故障，所以必须在写入侧就拦死。
     case "gp_limit":
       return String(gpLimitNum(v));
     case "gp_magic":
@@ -710,19 +496,7 @@ function normalizeSetting(k, v) {
   }
 }
 
-/**
- * 会话签名密钥：优先生效环境变量 `ADMIN_SECRET`，否则用 D1 里的随机值（首次访问时生成）。
- *
- * ⚠️ 首次生成必须用「先到先得」而不是「读不到就写」：
- *    原写法是典型的 read-modify-write，两个并发请求（或多机房的两个 isolate）
- *    会各自生成一份并各自 `saveSetting`，**后写的覆盖先写的** ——
- *    于是先签发出去的 token 在下一个请求上就验签失败。
- *    表现是「刚登录成功，下一次请求又要求登录，刷新一下又好了」，
- *    只在首次部署/首次访问时出现，事后完全无法复现。
- *
- *    现在 `INSERT OR IGNORE` 让第一个写入者胜出，其余请求随后从这个位置读回
- *    **同一个**值，从而保证全机房签出、验签用的是同一把钥匙。
- */
+/** 会话签名密钥：优先 ADMIN_SECRET，否则用 D1 随机值；首次生成靠「先到先得」避免并发覆盖。 */
 async function sessionSecret(env, S) {
   // 环境变量优先：让"轮换密钥 = 作废所有会话"这件事在部署侧可控
   if (env.ADMIN_SECRET) return env.ADMIN_SECRET;
@@ -741,12 +515,7 @@ async function sessionSecret(env, S) {
   return String(row?.value || mine);
 }
 
-/**
- * 会话纪元：吊销所有已签发会话的**唯一可靠手段**（与密钥来源无关）。
- *
- * 存在 D1 的 meta 里，随 loadSettings 一起读出来（每个请求本来就要读一次设置，
- * 所以这是零额外往返）。「登出所有设备」把它 +1，旧 token 的 ep 立刻对不上。
- */
+/** 会话纪元：吊销所有已签发会话的唯一手段，与密钥来源无关；随 loadSettings 读出，零额外往返。 */
 function sessionEpoch(S) {
   const n = Number(S && S.session_epoch);
   return Number.isFinite(n) && n > 0 ? Math.trunc(n) : 0;
@@ -783,11 +552,7 @@ const loginLimiter = createRateLimiter(5, 60_000);
 
 /* ─────────────────────── 入参校验 ─────────────────────── */
 
-/**
- * 服务端必须自己校验，不能只信任前端。
- * 前端那些 Number()/trim() 只是为了让表单好用 —— 绕过页面直接调接口时它们完全不存在，
- * 届时 fail_threshold = -1、interval_min = 0、url = javascript:... 都会原样落库。
- */
+/** 服务端必须自己校验：绕过页面直接调接口时，前端的 Number/trim 完全不存在。 */
 
 /** 钳到整数区间；非数字返回默认值（而不是 NaN 落库） */
 function clampInt(v, min, max, dflt) {
@@ -796,30 +561,12 @@ function clampInt(v, min, max, dflt) {
   return Math.min(max, Math.max(min, Math.trunc(n)));
 }
 
-/**
- * 0/1 开关列（默认关）：接受布尔、数字 1、字符串 "1"，其余一律 0。
- *
- * 不用 `clampInt` 代替：那个函数的默认值语义是"取不到就给 dflt"，
- * 而这里"取到任何非法值"和"压根没传"都应当收敛到 0（关），不能因为
- * 传了个 "yes" 就悄悄保持原值 —— 这是隐私开关，宁可关掉。
- */
+/** 0/1 开关列：接受布尔、数字 1、字符串 "1"，其余一律 0。 */
 function boolInt(v) {
   return v === true || v === 1 || v === "1" ? 1 : 0;
 }
 
-/**
- * 解析 URL 查询参数里的整数（**不能用 clampInt 代替**）。
- *
- * ⚠️ 两个真实踩过的坑：
- *  1. `url.searchParams.get("x")` 缺省返回 **null**，而 `Number(null) === 0`
- *     且 0 是有限数 —— 走 clampInt 会被当成"传了 0"钳成 min，而不是落到默认值。
- *     后果是 /api/overview 不带 days 时 days=1：首页 30 天色条只剩今天一格，
- *     被 CSS 的 flex:1 拉满整行，看上去就是「运行历史变成一根长条」。
- *  2. `Number("abc")` 是 NaN，若让它漏下去，`new Date(NaN).toISOString()`
- *     会直接抛异常 → 接口 500（`/api/site?days=abc` 原先就是这样）。
- *
- * 所以：缺失（null / undefined / 空白）与非法值都回落到 dflt，其余钳到 [min,max]。
- */
+/** 解析查询参数里的整数：searchParams 缺省返回 null 而 Number(null) 是 0，不能用 clampInt 代替。 */
 function queryInt(raw, dflt, min, max) {
   if (raw === null || raw === undefined) return dflt;
   const s = String(raw).trim();
@@ -828,24 +575,10 @@ function queryInt(raw, dflt, min, max) {
   return Number.isFinite(n) ? Math.min(max, Math.max(min, Math.trunc(n))) : dflt;
 }
 
-/**
- * 站点 ID 的合法字符集：`[A-Za-z0-9._-]`，1–64 字符。
- *
- * 为什么是**白名单**而不是黑名单：id 要进 URL（`/monitor?id=<id>`）。
- * 黑名单（原来的"不含 / ? # % < > \ " 与空白"）看着够用，实则永远漏 ——
- * 中文、全角符号、`&`、`+`、`=` 在 query 里都会被重新编码，
- * 于是"后台里看到的 id"与"URL 里的 id"不是同一个字符串，排查时极易误判。
- *
- * ⚠️ 前端 `#f-id` 的 `pattern` 必须与这里**逐字符一致**：两处不同的字符集就是
- *    "前端放行、后端 400"（或反过来）的第三种口径，用户只会觉得"这站点存不进去"。
- */
+/** 站点 ID 白名单 [A-Za-z0-9._-]{1,64}：id 会进 URL，黑名单永远漏。 */
 const SITE_ID_RE = /^[A-Za-z0-9._-]{1,64}$/;
 
-/**
- * ⚠️ 正则本身放行 `.` 与 `..`（它们都由 `.` 组成、长度合法），必须单独排除：
- *    这两个值在 URL / 路径语义上有歧义（会被当成"当前目录 / 上一级"），
- *    而 id 会出现在 `/monitor?id=<id>` 里。排除是一行的事，没必要留个"理论上能用"的空子。
- */
+/** 正则放行 . 与 ..，必须单独排除（路径语义有歧义）。 */
 function validSiteId(id) {
   if (typeof id !== "string") return false;
   const v = id.trim();
@@ -870,17 +603,7 @@ function validExpectCodes(v) {
   return /^\d{3}(,\d{3})*$/.test(s);
 }
 
-/**
- * 登录失败的第二道闸门（存 D1）。
- *
- * 为什么内存限速不够：本 Worker 流量很低，CF 很可能**每个请求都新建 isolate**，
- * 内存里的 Map 随之清空 —— 实测连续 6 次错误密码都没被拦住。
- * 所以把「窗口内失败次数」落进 D1，跨 isolate / 跨机房都算数。
- *
- * 代价：只在**失败**时写 D1（2 行），成功登录时清一次，日常零开销。
- * 选全局计数而不是按 IP：个人后台单管理员场景下够用，
- * 且攻击者换 IP 也绕不过；窗口只有 60 秒，不至于把管理员自己长时间锁在门外。
- */
+/** 登录失败第二道闸门（存 D1）：低流量下 CF 可能每请求新建 isolate，内存限速拦不住。 */
 const LOGIN_MAX_FAILS = 8;
 const LOGIN_WINDOW_MS = 60_000;
 
@@ -912,22 +635,14 @@ async function clearLoginFail(env) {
 /** 会话有效期：30 天（内部工具，频繁登录反而促使人用弱密码） */
 const SESSION_TTL = 30 * 86400;
 
-/**
- * 取某个设置项的「最终生效值」，用于回显到后台表单。
- *
- * env 此时已被 effectiveEnv 合并过：有环境变量的项从 env 读，
- * 纯展示项（没有 env 变量）直接从 meta 读；两者都没有就回落到 SETTING_META 的默认值。
- */
+/** 设置项的最终生效值，用于回显后台表单。 */
 function effectiveSettingValue(env, raw, k) {
   const m = SETTING_META[k];
   if (!m) return raw[k] ?? "";
   return m.env ? env[m.env] || m.def : raw[k] || m.def;
 }
 
-/**
- * 设置的对外表示。token **永不回传明文**，只给掩码 + 是否存在。
- * /api/settings 与 /api/admin 共用，避免两处脱敏逻辑漂移（漏一处就是明文泄露）。
- */
+/** 设置的对外表示：token 永不回传明文，只给掩码与是否存在。 */
 function publicSettings(env, raw) {
   const s = {};
   for (const k of SETTING_KEYS) s[k] = effectiveSettingValue(env, raw, k);
@@ -939,18 +654,7 @@ function publicSettings(env, raw) {
 
 /* ────────────────────────── 两阶段调度 ────────────────────────── */
 
-/**
- * pending 行的最长存活时间（兜底）。
- *
- * 为什么必须有：`dispatch` 里 `if (pendingSet.has(s.id)) continue` 会让**已有 pending 的
- * 站点不再被发起探测**，所以一条永不收尾的 pending 就等于该站点**永久静默停摆** ——
- * 页面上还在显示旧状态，实际早已不再检测，且不会有任何告警。
- *
- * 取值依据：正常测量一定在 ~40s 内进入 finished/failed（探针侧最多 30s + 收尾 ≥10s），
- * 而 cron 每分钟醒一次 —— 3 分钟远大于任何正常情况，不会误杀在途测量；
- * 又短到让异常在一两个监测周期内自愈。
- * gpCollect 已经直接把"响应缺 status"判为 broken（见其返回契约），这里只是最后一道兜底。
- */
+/** pending 最长存活时间：永不收尾的 pending 会让该站点永久静默停摆。 */
 const PENDING_TTL_MS = 180_000;
 
 /** 阶段一：收取上一轮发起的 Globalping 测量 */
@@ -969,7 +673,7 @@ async function collectGlobalping(env) {
   const doneIds = [];
   // 证书随同一次测量回来 —— 攒起来最后一起写，避免每个站点一次独立往返
   const sslWrites = [];
-  // 被丢弃、且**没有**写检查记录的 pending。正常恒为空，非空即代表有异常需要排查。
+  // 被丢弃、且没有写检查记录的 pending。正常恒为空，非空即代表有异常需要排查。
   const dropped = [];
   // 本轮真正发出去的收取请求数（= 出网子请求消耗）。
   // 返回给 dispatch 当作"已用额度"的起点 —— 否则预算只管发起、不管收取，
@@ -1010,10 +714,7 @@ async function collectGlobalping(env) {
     if (!out.done) continue; // 还没跑完，留到下一轮
     doneIds.push(p.site);
 
-    // 结果不可用（measurement id 失效 / API 返回错误体）：丢弃 pending，但**不写检查记录**。
-    // 为什么不能记成一次失败：我们对站点当时的可达性一无所知，记失败会凭空造出一次"故障"，
-    // 攒到阈值还会发告警 —— 那是把"我们没拿到数据"谎报成"站点挂了"。
-    // 丢弃 pending 让下一轮能重新发起，比让它永久占位（站点静默停摆）安全得多。
+    // 结果不可用：丢弃 pending 但不写检查记录，否则把「没拿到数据」谎报成故障。
     if (out.broken) {
       dropped.push({ site: p.site, id: p.measurement_id, why: "broken", error: out.error });
       continue;
@@ -1025,10 +726,7 @@ async function collectGlobalping(env) {
     // ── 多探针判定（口径与理由见 probe.js 的 gpDecide）──
     const dec = gpDecide(site, out.results);
     if (dec.void) {
-      // 全是平台自身故障 / 一条结果都没有 / 只剩 1 台且失败 —— 三种都**没有结论**。
-      // 与上面的 broken 分支同一条约定：不写检查记录。
-      // 记成失败会凭空造出一次"故障"、把 consecutive_fail 推上去、攒够阈值就发告警；
-      // 而事实是我们对站点当时的可达性一无所知。pending 已删，下一轮会自动重发。
+      // 平台故障 / 无结果 / 单票失败都没有结论，一律不写检查记录。
       dropped.push({
         site: p.site,
         id: p.measurement_id,
@@ -1091,36 +789,13 @@ async function collectGlobalping(env) {
   };
 }
 
-/**
- * cron 周期，必须与 wrangler.toml 的 `* * * * *` 一致。
- * 下面两处修正都建立在「调度器最多每分钟醒一次」这个前提上。
- */
+/** cron 每分钟触发，下面两处修正都基于「调度器最多每分钟醒一次」。 */
 const CRON_PERIOD_MS = 60_000;
 
-/**
- * 判定「到期」时允许的提前量。
- *
- * 为什么必须有：last_checked_ts 是在探测**写库之后**（bumpState）才更新的，
- * 比 check 自身的时间戳晚几百毫秒到几秒。而 cron 是按分钟触发的 ——
- * 于是「间隔 = 1 分钟」的站点在下一分钟醒来时，now - last_checked 只有 59.x 秒，
- * 差一点点不到 60 秒，被判成「未到期」，白等一整分钟（1 分钟间隔实际变 2 分钟）。
- * 给一个远小于 cron 周期的宽容量即可消除；因为 cron 与监测间隔都是整分钟对齐的，
- * 这么小的提前量不会把探测挪到别的 tick 上。
- */
+/** 判定到期的提前量：last_checked_ts 在写库之后才更新，比 check 自身时间戳晚几秒。 */
 const DUE_GRACE_MS = 15_000;
 
-/**
- * 挑出「本轮该检查」的站点。
- *
- * 为什么需要这一步：cron 每分钟触发（见 wrangler.toml），但每个站点的监测间隔
- * 是独立配置的（1 / 5 / 10 / 30 / 60 分钟）。必须按「距上次检查是否已达间隔」
- * 筛选，否则 1 分钟和 1 小时的站点会被一视同仁地每分钟都查 ——
- * 既浪费出网子请求，也让间隔设置彻底失去意义。
- *
- * last_checked_ts 由 bumpState 在每次检查**完成后**写入，所以它表示
- * 「上次真正完成检查的时刻」。
- * 从未检查过的站点（无记录）直接纳入，保证新增站点立刻被探测一次。
- */
+/** 挑出本轮该检查的站点：按各站点 interval_min 判断是否到期。 */
 async function dueSites(env, sites) {
   const d = await db(env);
   const { results } = await d.prepare("SELECT site, last_checked_ts FROM state").all();
@@ -1131,11 +806,7 @@ async function dueSites(env, sites) {
     if (!last) return true;
     const ivMs = Math.max(1, Number(s.interval_min || 5)) * 60_000;
 
-    // Globalping 是两阶段：本轮发起、下一轮才收得到结果，探测本身就跨一个 cron 周期。
-    // 若仍按「距上次**收到结果**满 interval 才发起」，结果落地会整整晚一轮
-    // （1 分钟间隔 → 2 分钟）。所以提前一个周期把测量发出去，让**结果**落在 interval 上；
-    // 由于 collectGlobalping 先于 dispatch 执行，刚收完结果的站点在同一轮就会被重新发起，
-    // 形成「下一轮收上一轮的结果」的流水线。
+    // 两阶段结果晚一轮落地，所以提前一个周期发起，让结果落在 interval 上。
     const lead = CRON_PERIOD_MS;
 
     const dueAt = Math.max(0, ivMs - lead) - DUE_GRACE_MS;
@@ -1143,20 +814,7 @@ async function dueSites(env, sites) {
   });
 }
 
-/**
- * 阶段二：发起本轮测量
- *
- * `subreq_budget` 是**本轮所有出网子请求**的额度 —— 免费层每次调用硬上限 50，
- * 而每个站点要 1 次发起 + 1 次收取。
- *
- * ⚠️ 所以 `alreadyUsed` 必须带上「本轮收取已经花掉的次数」，不能每轮从 0 起算：
- *    预算只管发起、不管收取时，实际出网量是预算的两倍 —— 20 个站点、预算 30 的情况下
- *    会是 20 次收取 + 20 次发起 = 40，看着"没超预算"，一旦站点再多几个就直接撞 50 的硬上限，
- *    整轮 cron 以一个和站点无关的错误失败（而且日志里 subreqUsed 还显示得很安全）。
- *
- * 额度不够时**跳过**（记进 `skipped`），而不是硬发出去把整轮 cron 打成失败 ——
- * 跳过的站点下一轮会自然补上（dueSites 靠 last_checked_ts 判断，本轮没写就不算已查）。
- */
+/** 阶段二：发起本轮测量。subreq_budget 是本轮全部出网子请求的额度。 */
 async function dispatch(env, sites, alreadyUsed = 0) {
   const budget = Number((env && env.SUBREQ_BUDGET) || 30);
   const d = await db(env);
@@ -1193,17 +851,7 @@ async function dispatch(env, sites, alreadyUsed = 0) {
   return { used, gpStarted, skipped };
 }
 
-/**
- * 手动测试（后台「测」按钮）的结果也要落库 ——
- * 否则它不会出现在详情页的折线和「最近检查」里，与自动探测的数据割裂。
- *
- * ⚠️ 只写 checks，**刻意不调 bumpState**，原因是两个副作用都不该由一次调试点击引起：
- *    ① bumpState 会更新 state.last_checked_ts，而 dueSites() 正是靠它判断"是否到期"，
- *       于是手动测一次就会把该站点的下次计划检查往后推 interval_min；
- *    ② 会累加 consecutive_fail 并可能在达到阈值时真的发出告警。
- *    手动测试是排查手段，不应该改变调度与告警状态。
- *    因此「连续失败次数」只由 cron 的自动探测累积；手动结果仅作为数据点展示。
- */
+/** 手动测试结果也落库，但不调 bumpState（不推动调度、不累加失败）。 */
 async function persistManualTest(env, site, { source, probe, result }) {
   const v = judge(site, result);
   const ts = new Date().toISOString();
@@ -1241,18 +889,7 @@ export default {
     const api = m ? m[1] : "";
     const pretty = url.searchParams.get("pretty") === "1";
 
-    /* ── 库结构自举：不等任何人跑命令 ──────────────────────────────────
-       放在**所有分支之前**，包括 /api/health —— 因为「库没建表」是最常见的
-       首次部署故障，而自检恰恰是最该在这种时候修好问题、而不是只报告问题的地方。
-
-       为什么必须在运行时做：建表原先只发生在 `npm run deploy` 里的
-       `scripts/setup-d1.mjs`。但凡部署方式不是「本地跑那条命令」（Cloudflare
-       控制台连 GitHub 自动构建、CI、Dashboard 里改代码），建表就被跳过了 ——
-       Worker 部署成功、页面能打开，而每个接口都回 `no such table: meta`。
-       部署路径有好几条，只有 Worker 自己补能覆盖全部。
-
-       幂等且只跑一次：isolate 内用 Promise 缓存，库侧用 meta.schema_v 版本号。
-       正常状态下每个 isolate 只多一次单行 D1 读。 */
+    /** 库结构自举：放在所有分支之前，包括 /api/health。 */
     let schemaState;
     try {
       schemaState = { ok: true, ...(await ensureSchema(env)) };
@@ -1260,7 +897,7 @@ export default {
       schemaState = { ok: false, error: String((e && e.message) || e) };
     }
 
-    // 部署自检必须**先于**设置加载与认证闸门：库没建表时 loadSettings 会先抛异常，
+    // 部署自检必须先于设置加载与认证闸门：库没建表时 loadSettings 会先抛异常，
     // 那时任何分支都到不了，自检也就失去意义。它只读 sqlite_master，不碰业务表。
     if (api === "health") {
       return await buildHealth(env, env.ADMIN_PASSWORD, pretty, schemaState);
@@ -1280,10 +917,7 @@ export default {
     /* ── 站点设置 + 认证闸门 ──────────────────────────────────────────
        设置存 D1 且优先级高于环境变量；合并回 env 后，下游所有 `env.XXX` 读取
        自动变成「D1 设置 → 环境变量 → 代码默认」，不必在每个调用点改成读设置。 */
-    // ⚠️ 这一步在 try 之外，必须自己兜住：D1 没建表 / 绑定没生效时它会第一个抛，
-    //    而异常一旦逃出 fetch 处理器，Cloudflare 只回一个空体 500 ——
-    //    浏览器里看到的就是 `Failed to load resource: 500 ()`，前端拿不到任何文案，
-    //    用户完全无从判断是"库没建"还是"代码有 bug"。所以在这里就地转成可读 JSON。
+    // 这一步在 try 之外必须自己兜住：异常逃出 fetch 只会得到空体 500。
     let rawSettings;
     try {
       rawSettings = await loadSettings(env);
@@ -1295,7 +929,7 @@ export default {
         pretty
       );
     }
-    // 密码**只认环境变量** ADMIN_PASSWORD（wrangler secret / Dashboard Variables）。
+    // 密码只认环境变量 ADMIN_PASSWORD（wrangler secret / Dashboard Variables）。
     // 不做后台可改密码：那样就得在 D1 里存哈希、还要处理"改了密码如何作废旧会话"，
     // 而密码本就属于部署期配置，放环境变量更简单也更容易审计。
     const pwdConfigured = Boolean(env.ADMIN_PASSWORD);
@@ -1319,18 +953,7 @@ export default {
     // 公开接口：前台只读展示 + 登录/登出。其余（含所有写接口）都要求已登录。
     const PUBLIC_APIS = new Set(["overview", "site", "login", "logout"]);
 
-    /* ── 认证闸门：**fail-closed** ────────────────────────────────────
-       没配 ADMIN_PASSWORD 时后台**一律不提供服务**，而不是"不启用认证"。
-       早先的写法是"未配置就 authed = true"—— 后果是任何猜到 /admin 的人都能
-       改配置、读到告警 Webhook 与 Globalping Token，一个 URL 就是全部权限，
-       而页面上只是顶部闪一条 5 秒的提示，很容易被忽略。
-
-       现在的行为：/admin 这个 HTML 照常能打开（静态资源由 Assets 直接返回，
-       不经 Worker，拦不住也没必要拦 —— 页面里只有空壳，没有任何数据），
-       但它拿不到任何数据，前端会停在"未设置密码"的说明页。
-
-       用 403 + need_setup 而不是 401：此时弹登录框毫无意义（密码未配置，
-       输什么都进不去），前端据此直接切到说明页，而不是让用户白试一遍密码。 */
+    /** 认证 fail-closed：没配 ADMIN_PASSWORD 时后台一律不提供服务。 */
     if (!PUBLIC_APIS.has(api)) {
       if (!pwdConfigured) {
         return json(
@@ -1350,9 +973,9 @@ export default {
       }
     }
 
-    // 跨站写请求一律拒 —— 放在 **认证之后**：先回答"你有没有权限"（401 / 403），
+    // 跨站写请求一律拒 —— 放在 认证之后：先回答"你有没有权限"（401 / 403），
     // 再回答"这个请求从哪来"。反过来的话，明明是没登录，却收到"跨站请求被拒绝"，
-    // 排查起来会被带偏。也放在下面的 bumpConfigVersion **之前**，避免无谓的 D1 写。
+    // 排查起来会被带偏。也放在下面的 bumpConfigVersion 之前，避免无谓的 D1 写。
     if (request.method !== "GET" && request.method !== "HEAD" && !sameOriginOk(request, url)) {
       return json(
         { ok: false, error: "跨站请求被拒绝（同源校验失败）" },
@@ -1362,15 +985,7 @@ export default {
       );
     }
 
-    // 只有"真会改配置"的写接口才递增配置版本。
-    //
-    // 原先是「任何非 GET 都 bump」，于是：
-    //   · 登录失败一次 → 递增一次 → 全机房 overview/site 缓存全部作废（key 里带版本号），
-    //     谁能拿到一个后台地址，就能用错误密码把缓存无限打穿，同时白耗一次 D1 写；
-    //   · 拼错接口名、跨站被拒、方法不允许……全部照样 bump。
-    // 更根本的是"配置版本"被当成了"数据新鲜度"的开关：cron 每分钟写检查记录，
-    // 若也跟着 bump，缓存条目寿命只剩一分钟、永远命中不了（见 scheduled 里的说明）。
-    // 数据新鲜度交给 TTL（READ_CACHE 的 s-maxage），配置变更才用版本号。
+    // 只有真会改配置的写接口才递增配置版本，否则登录失败也会清空全机房缓存。
     const isWrite = request.method !== "GET" && request.method !== "HEAD";
     if (isWrite && WRITE_APIS.has(api)) {
       await bumpConfigVersion(env);
@@ -1383,7 +998,7 @@ export default {
         if (request.method !== "POST") {
           return json({ ok: false, error: "仅支持 POST" }, 405, "no-store", pretty);
         }
-        // 未配密码 → 说清原因就收工。**不要**落到下面的"密码错误"分支：
+        // 未配密码 → 说清原因就收工。不要落到下面的"密码错误"分支：
         // 那会记一次登录失败（多试几次还会把 IP 拉黑），而真正的问题在部署配置，
         // 跟用户输什么完全无关。
         if (!pwdConfigured) {
@@ -1416,6 +1031,10 @@ export default {
 
         const body = await request.json().catch(() => ({}));
         const input = String(body.password || "");
+        // 限制长度：constantTimeEqual 会逐字节遍历，超大 body 足以烧穿 CPU 配额。
+        if (input.length > 256) {
+          return json({ ok: false, error: "密码长度非法" }, 400, "no-store", pretty);
+        }
 
         // 兜底：走到这里说明 pwdConfigured 为真（上面已拦下未配置的情况），
         // 仍保留 `expected.length > 0` —— 空密码永不匹配，避免任何意外路径放行空串。
@@ -1452,25 +1071,9 @@ export default {
       if (api === "logout") {
         const bodyP = request.json().catch(() => ({}));
         const body = await bodyP;
-        /**
-         * 「登出并作废所有会话」。
-         *
-         * 会话是无状态签名 token，服务端不留表 —— 吊销只能靠"让旧签名验不过"。
-         * 这里有两件事，**都要做**：
-         *   ① 递增 session_epoch（写进 token 载荷）—— 与密钥来源无关，永远有效；
-         *   ② 顺手轮换 D1 里的 session_secret —— 仅在未配 ADMIN_SECRET 时才有意义，
-         *      配了的话 sessionSecret() 根本不读这一项。
-         *
-         * 为什么不能只做 ②：`ADMIN_SECRET` 存在时 sessionSecret() 直接返回环境变量，
-         * 轮换 D1 那份对验签毫无影响 —— 于是这个按钮"提示成功、别的设备照旧能用"。
-         * 这正是上一轮 P0-7 记的问题，也是引入 ① 的原因。
-         */
+        /** 登出并作废所有会话：会话无状态，只能让旧签名验不过 + 纪元 +1。 */
         let revoked = false;
-        // ⚠️ 「登出所有设备」要求**已登录**。
-        //    /api/logout 必须留在公开接口里（清自己的 cookie 不需要权限），但"吊销全部会话"
-        //    是个有副作用的操作：不加这道判断，任何能构造同源 POST 的人都能反复把管理员
-        //    的所有设备踢下线 —— 一个按需触发的拒绝服务。
-        //    未登录时只清 cookie，revoked 如实返回 false。
+        // 「登出所有设备」要求已登录，否则任何人可反复踢掉管理员。
         if (body.all === true && authed) {
           const ep = await bumpSessionEpoch(env);
           revoked = ep !== null;
@@ -1529,14 +1132,7 @@ export default {
       // ── 前台一次性取全量：统计卡 + 分组 + 每站点 30 天色条 + SSL ──
       // 刻意做成"单接口返回全部"，避免前端对 N 个站点发 N 个请求
       if (api === "overview") {
-        // ⚠️ days 必须钳制（这是公开接口，不需要登录）。
-        //    改之前它直接 `Number(...)` 就用了，实测放大效应：
-        //      days=30    →  1.7 KB / 1.7s
-        //      days=36500 →  1.13 MB / 4.6s（30 万次迭代的日期轴 + 全量扫描）
-        //    更糟的是缓存 key 里带 days —— 每个不同的值都是**独立的缓存条目**，
-        //    等于给了任何人一个「用任意 days 灌满边缘缓存 + 拉高 D1 扫描量」的入口。
-        //    上限 90 与 /api/site 的 days 一致（前台 30 天色条只用得到 30 天），
-        //    并且再与「明细保留天数」取小 —— 见 maxDays。
+        // days 必须钳制：公开接口，每个不同 days 都是独立缓存条目，可用于灌满边缘缓存。
         const maxD = maxDays(env);
         const days = queryInt(url.searchParams.get("days"), Math.min(30, maxD), 1, maxD);
         // 缓存 key 带上配置版本：后台一改配置版本就 +1，所有机房的旧 key 立即不再命中
@@ -1548,7 +1144,7 @@ export default {
           const since24 = new Date(Date.now() - 86400000).toISOString();
 
           const [siteRows, dayRows, h24, u24, failRows] = await Promise.all([
-            // ⚠️ 刻意**不用**窗口函数取"每个站点的最新一条"（那是对 checks 全表分区排序）。
+            // ⚠️ 刻意不用窗口函数取"每个站点的最新一条"（那是对 checks 全表分区排序）。
             //    最后一行的结果快照由落库路径同步写进 state（见 STATE_UPSERT），
             //    这里只是主键 LEFT JOIN —— 代价与历史数据量无关。
             d
@@ -1653,11 +1249,7 @@ export default {
             (groups[g] = groups[g] || []).push({
               id: s.id,
               name: s.name,
-              // ⚠️ 隐藏地址的站点**根本不下发 url**，而不是"下发了但前端不显示"：
-              //    这是公开接口（无需登录，还被边缘缓存 30s），
-              //    只在前端藏起来等于没藏 —— 右键查看源码、或直接请求 /api/overview
-              //    就能拿到地址。hide_url 单独回传，让前端能区分
-              //    「站点刻意隐藏地址」与「url 意外为空（那是 bug）」。
+              // 隐藏地址的站点根本不下发 url：公开接口 + 边缘缓存，前端藏等于没藏。
               url: s.hide_url ? null : s.url,
               hide_url: !!s.hide_url,
               state,
@@ -1753,7 +1345,7 @@ export default {
           Number(defOf("incident_limit"))
         );
         const verS = configVersionOf(rawSettings);
-        // ⚠️ hours / days / recent / incident 都必须进缓存 key：它们决定**返回体的内容与长度**，
+        // ⚠️ hours / days / recent / incident 都必须进缓存 key：它们决定返回体的内容与长度，
         //    不进 key 的话先请求 ?recent=5（或 ?days=7）会把默认响应的缓存污染成 5 条 / 7 天（或反之）。
         const keyUrl = `${url.origin}/api/site?id=${encodeURIComponent(
           id
@@ -1772,15 +1364,7 @@ export default {
 
           const [meta, agg, seriesRows, recentRows, changeRows, dayRows, failRows] =
             await Promise.all([
-              // ① 配置 + 状态 + 最近一次 + SSL
-              //
-              // ⚠️ 「最后一次结果」只从 `state` 读，**不再**去 checks 里另取一条。
-              //    原先这里有一段 `WITH last AS (SELECT ... FROM checks ORDER BY ts DESC LIMIT 1)`，
-              //    与首页读的 state.last_* 是两份数据。正常情况下它们一致，但
-              //    「insertChecks 成功、bumpState 失败」（A1 那类）/「明细被保留策略删掉」
-              //    / 「手动测试只写了一半」时，同一站点会在首页显示"正常 · 2 分钟前"、
-              //    在详情页显示"从未检查"。监控工具里两个页面说两套话，用户只会不再相信任何一个。
-              //    代价上也没必要：state 是主键查询，而那段 CTE 每次都要在 (site, ts) 上倒序取行。
+              // 配置 + 状态 + 最近一次 + SSL；最后一次结果只读 state，不再扫 checks。
               d
                 .prepare(
                   `SELECT s.id, s.name, s.url, s.group_name,
@@ -1804,11 +1388,7 @@ export default {
                 )
                 .bind(id)
                 .first(),
-              // ② 窗口聚合
-              //
-              // ⚠️ 只要前端真正显示的那几个数：次数 / 成功数 / 成功请求的平均延迟。
-              //    原先还带了 MIN/MAX，但页面上的"最高"是趋势图**某一点**里的
-              //    max（按桶聚合出来的），不是窗口极值 —— 窗口 mn/mx 从没被读过。
+              // 窗口聚合：只算前端真正显示的几个数。
               d
                 .prepare(
                   `SELECT COUNT(*) AS n, SUM(ok) AS okl,
@@ -1860,7 +1440,7 @@ export default {
                 )
                 .bind(id, sinceD)
                 .all(),
-              // ⑦ 失败明细的**时间戳**（30 天窗口）—— 只为判断「某天有没有真的连续故障」。
+              // ⑦ 失败明细的时间戳（30 天窗口）—— 只为判断「某天有没有真的连续故障」。
               //    走 idx_checks_ok_ts_site，读的是失败行而不是全部检查。
               d
                 .prepare(
@@ -1915,15 +1495,11 @@ export default {
                 ongoing: !e.end,
                 duration_s,
                 error: e.error,
-                // 用时长估算段内的失败次数，与告警口径（连续 N 次失败）对齐。
-                // start = 首个失败点、end = 其后第一个成功点，所以
-                //   duration ≈ 失败次数 × 间隔
-                // ⚠️ 不要再 +1：那会把「1 次失败」估成 2 次，使阈值判定整体少一次，
-                //    连单次抖动都会被当成故障事件（与告警不一致）。
+                // 用时长估算段内失败次数，与故障记录口径（连续 N 次）对齐。
                 checks_est: Math.max(1, Math.round(duration_s / (intervalMin * 60))),
               };
             })
-            // 未达 fail_threshold 的单次抖动不算故障事件（与告警判定一致）
+            // 未达 fail_threshold 的单次抖动不算故障事件
             .filter((e) => e.ongoing || e.checks_est >= failThreshold)
             // 上面的遍历是按时间正序，这里翻成最新在前，再按设置只留最近 N 条
             .reverse()
@@ -2045,8 +1621,6 @@ export default {
           if (action !== "reorder" && !name) {
             return json({ ok: false, error: "分类名不能为空" }, 400, "no-store", pretty);
           }
-          const now = new Date().toISOString();
-
           if (action === "create") {
             const exists = await d
               .prepare("SELECT name FROM categories WHERE name = ?")
@@ -2059,8 +1633,8 @@ export default {
               .prepare("SELECT COALESCE(MAX(sort), 0) + 1 AS s FROM categories")
               .first();
             await d
-              .prepare("INSERT INTO categories (name, sort, created_ts) VALUES (?,?,?)")
-              .bind(name, Number(mx?.s || 1), now)
+              .prepare("INSERT INTO categories (name, sort) VALUES (?,?)")
+              .bind(name, Number(mx?.s || 1))
               .run();
             return json({ ok: true, action, name }, 200, "no-store", pretty);
           }
@@ -2074,8 +1648,8 @@ export default {
             // 目标名已存在 → 直接合并过去，避免留下重复分类
             await d.batch([
               d
-                .prepare("INSERT OR IGNORE INTO categories (name, sort, created_ts) VALUES (?,?,?)")
-                .bind(nn, 9999, now),
+                .prepare("INSERT OR IGNORE INTO categories (name, sort) VALUES (?,?)")
+                .bind(nn, 9999),
               d.prepare("UPDATE sites SET group_name = ? WHERE group_name = ?").bind(nn, name),
               d.prepare("DELETE FROM categories WHERE name = ?").bind(name),
             ]);
@@ -2101,9 +1675,9 @@ export default {
             await d.batch(
               names.map((n, i) =>
                 d
-                  .prepare("INSERT INTO categories (name, sort, created_ts) VALUES (?,?,?) " +
+                  .prepare("INSERT INTO categories (name, sort) VALUES (?,?) " +
                     "ON CONFLICT(name) DO UPDATE SET sort = excluded.sort")
-                  .bind(n, i + 1, now)
+                  .bind(n, i + 1)
               )
             );
             return json({ ok: true, action, order: names }, 200, "no-store", pretty);
@@ -2121,15 +1695,12 @@ export default {
         if (request.method === "DELETE") {
           const id = url.searchParams.get("id");
           if (!id) return json({ ok: false, error: "缺少 id" }, 400);
-          // 一张表一条，但**一次 batch**（原子）：见 db.deleteSite 的注释
+          // 一张表一条，但一次 batch（原子）：见 db.deleteSite 的注释
           await deleteSite(env, id);
           return json({ ok: true, deleted: id });
         }
         if (request.method === "POST") {
-          // `.catch()` 不能少：其它写端点（login / run / test）都有，唯独这里漏了 ——
-          // body 不是合法 JSON 时 request.json() 直接抛，被最外层 catch 兜成 **500**。
-          // 注意不能 `.catch(() => ({}))` —— 那会把"解析失败"伪装成"写了一个空对象"，
-          // 返回 200 + upserted:1 的假成功。这里显式区分"解析失败"与"内容为空"。
+          // request.json() 失败必须 .catch，否则非法 JSON 会被兜成 500。
           const parsed = await request.json().catch(() => null);
           if (!parsed || typeof parsed !== "object") {
             return json(
@@ -2139,10 +1710,7 @@ export default {
               pretty
             );
           }
-          // 站点排序：`{ action: "reorder", ids: [...] }` —— 只传顺序，按下标写 sort。
-          // 与分类的 reorder 同一约定（那边传 names），区别是这里用 UPDATE 而非 upsert：
-          // 分类是「目录」，可以凭空建出来；站点必须先存在 —— 传错的 id 应当静默无效，
-          // 绝不能因为一次排序请求凭空造出一个只有 id 的空站点。
+          // 站点排序：只传顺序，按下标写 sort。
           if (!Array.isArray(parsed) && parsed.action === "reorder") {
             const ids = Array.isArray(parsed.ids) ? parsed.ids.map(String).filter(Boolean) : [];
             if (!ids.length) {
@@ -2168,8 +1736,8 @@ export default {
           const list = Array.isArray(parsed) ? parsed : [parsed];
           let upserted = 0; // 真实写入条数 —— 不是 list.length（空 id/url 的会被跳过）
           const stmt = d.prepare(
-            `INSERT INTO sites (id,name,url,group_name,expect_codes,hide_url,fail_threshold,interval_min,enabled,sort,created_ts)
-                 VALUES (?,?,?,?,?,?,?,?,?,?,?)
+            `INSERT INTO sites (id,name,url,group_name,expect_codes,hide_url,fail_threshold,interval_min,enabled,sort)
+                 VALUES (?,?,?,?,?,?,?,?,?,?)
                  ON CONFLICT(id) DO UPDATE SET
                    name=excluded.name, url=excluded.url,
                    group_name=excluded.group_name,
@@ -2179,11 +1747,7 @@ export default {
                    interval_min=excluded.interval_min, enabled=excluded.enabled,
                    sort=excluded.sort`
           );
-          // 未指定 sort 的（= 新建站点）排到队尾：取一次全局最大值，循环里递增分配。
-          // 一次查询而不是每条查一次 —— Free 计划子请求预算很紧，且 D1 也计入。
-          // 编辑已有站点时前端会把原 sort 带回来，所以走不到这里，位置不会被打乱。
-          // 循环里只 `.bind()` 不 `.run()`：每条 run 都是一次完整 D1 往返，
-          // 导入 50 个站点就是 50 次。先全收集，再分组 batch。
+          // 未指定 sort 的新站点排到队尾，取一次全局最大值递增分配。
           const stmts = [];
           let nextSort = null;
           for (const s of list) {
@@ -2216,7 +1780,7 @@ export default {
               );
             }
             // 顺序要留给拖拽来定：没给 sort 就分配队尾，给了（编辑回带）就用原值。
-            // sort 只在**同一分类内**比较，所以全局取最大值不影响别的分类。
+            // sort 只在同一分类内比较，所以全局取最大值不影响别的分类。
             let sortValue;
             if (s.sort === undefined || s.sort === null || s.sort === "") {
               if (nextSort === null) {
@@ -2242,8 +1806,7 @@ export default {
                 clampInt(s.fail_threshold, 1, 20, 3),
                 clampInt(s.interval_min, 1, 1440, 5),
                 s.enabled === false ? 0 : 1,
-                sortValue,
-                new Date().toISOString()
+                sortValue
               )
             );
             upserted++;
@@ -2255,10 +1818,7 @@ export default {
         return json({ ok: false, error: "请用 /api/admin" }, 405, "no-store", pretty);
       }
 
-      /* ── 后台聚合接口：一次请求拿全（站点 + 最近状态 + 分类 + 设置）──
-         为什么要有：后台原先串行发 /session → /sites → /categories 三次请求，
-         跨国链路上每次往返 ~0.2s，加上首屏 HTML 就是 4 个 RTT。合并成 1 次后
-         首屏只需「HTML + /admin」两个请求，后台打开速度接近减半。 */
+      /** 后台聚合接口：一次请求拿全，省掉三次串行往返。 */
       if (api === "admin") {
         const payload = await buildAdminPayload(env);
         // 复用请求开头已读到的 rawSettings，不再多查一次 D1
@@ -2286,10 +1846,7 @@ export default {
         });
       }
 
-      // 即时测试：?api=test&[site=<id>|target=...]
-      //   带 site=<id> 时，结果会**写入 checks**（这样「测」出来的点会出现在
-      //   详情页折线与「最近检查」里）；不带则纯调试、不落库。
-      //   ⚠️ 判定一律走 gpDecide，与自动探测同一条链。
+      // 即时测试：带 site=<id> 时结果写入 checks，不带则纯调试。
       if (api === "test") {
         const m2 = requirePost(request, pretty);
         if (m2) return m2;
@@ -2307,16 +1864,7 @@ export default {
         // 否则"测出来的结果"和"真实探测"可能用的不是同一个筛选，失去参考价值。
         const { id, source, quota } = await gpCreate(env, { url: target });
 
-        /**
-         * 等结果：**自适应间隔 + 总时长上限**。
-         *
-         * 原写法是固定的 `12 × 2.5s`：既让"其实 1 秒就好了"的部分白等 2.5 秒，
-         * 又在外层没有任何时长上界（探针侧超时是 5–30 秒，跟 12×2.5 没有关系）。
-         * 现在按 700ms 起步、每次 ×1.5（封顶 2.5s）递增 —— 常见情况 1~3 秒就拿到，
-         * 慢的时候仍然能等到探针超时之后再收尾；总上限取「探针超时 + 8 秒」。
-         *
-         * 每一轮都是一次真实出网请求，所以只在还可能出结果时才继续问。
-         */
+        /** 等结果：自适应间隔 + 总时长上限，固定间隔既慢又没有上界。 */
         const startedAt = Date.now();
         const waitBudgetMs = (Number(env.GP_TIMEOUT_SEC) || 15) * 1000 + 8000;
         let finished = null;
@@ -2330,7 +1878,7 @@ export default {
         // 后台 toast 要显示「这次测试实际等了多久」—— 它本身就是排查信息
         // （同一个站点等 3 秒 vs 25 秒，含义完全不同）。
         const elapsedMs = Date.now() - startedAt;
-        // 结果不可用（id 失效 / API 报错）→ 明确报错并**不落库**。
+        // 结果不可用（id 失效 / API 报错）→ 明确报错并不落库。
         // gpCollect 把这种响应判成 done+broken（见其返回契约），照旧往下走会把
         // "压根没拿到数据"存成一条假的失败记录，反而污染页面。
         if (finished?.broken) {
@@ -2342,16 +1890,11 @@ export default {
           );
         }
         const results = finished?.results || [];
-        // ⚠️ 判定必须走 gpDecide（多探针判定），与自动探测**用同一条判定链**。
-        //    早先这里写的是"取成功结果里最快的那条"，于是同一个站点
-        //    「后台点『测』」与「等 cron」会得出不同结论（一个取中位数、一个取最快值），
-        //    手动测试作为排查手段就此失去参考价值 —— 它测的应当就是生产那条链。
-        //    纯调试（不带 site）时没有 expect_codes 可判，
-        //    用一个宽容的虚拟站点，只要求 HTTP 层跑通。
+        // 判定必须走 gpDecide，与自动探测同一条判定链。
         const dec = gpDecide(site || { expect_codes: "" }, results);
         if (dec.void) {
           // 无结论（探针全部是平台自身故障 / 一条结果都没收到 / 只剩 1 台且失败）→
-          // 明确报错且**不落库**。与 broken 分支同一约定：把"没拿到结论"存成一条记录，
+          // 明确报错且不落库。与 broken 分支同一约定：把"没拿到结论"存成一条记录，
           // 等于凭空造出一个 up 或 down，直接污染可用率。
           const why =
             dec.why === "single-fail"
@@ -2414,7 +1957,7 @@ export default {
             "GET/POST /api/settings",
             "GET/POST/DELETE /api/categories",
             "POST /api/sites（写）",
-            "POST /api/run  手动跑一轮（调试）；POST /api/test  测单个后端（调试）",
+            "POST /api/run  手动跑一轮（调试）；POST /api/test  测单个站点（调试）",
           ],
         },
         404,
@@ -2432,17 +1975,7 @@ export default {
   },
 
   async scheduled(controller, env, ctx) {
-    /**
-     * 分段容错：每一段单独 try/catch，任何一段失败都**不中断**整轮。
-     *
-     * 原先整轮是一个大 try 都没有的线性流程 —— 于是 `bumpState` 里任何一次抛错
-     * （A1 的绑定参数上限、D1 抖动、SQL 变更）都会让后面的 SSL 补检、缓存失效、
-     * 过期清理、以及最后那行 console.log **全部不执行**：
-     * 这一轮的检查已经写进 checks，但 state 一个没更新、告警一条没发、
-     * 日志里连"出过错"这件事都看不到。监控系统自己静默失败，比它监控的站点挂了更糟。
-     *
-     * 现在每段失败都记进 `errors`，并照常走完剩余阶段、打出日志。
-     */
+    /** 分段容错：每段单独 try/catch，任何一段失败都不中断整轮。 */
     const errors = [];
     const stage = async (name, fn, fallback) => {
       try {
@@ -2453,18 +1986,10 @@ export default {
       }
     };
 
-    // ⚠️ 必须**先**建表/补结构，再读设置。
-    //    cron 是完全独立的入口：部署完之后若还没有任何人访问过站点，
-    //    第一个跑到这里的可能就是定时任务 —— 此时库可能一张表都没有。
-    //    失败不中断：后面的 stage 各自会记一次错，日志里能看出这一轮发生了什么。
+    // 必须先建表补结构，再读设置。
     await stage("ensureSchema", () => ensureSchema(env), null);
 
-    // ⚠️ 必须先合并后台设置再往下走。
-    //    fetch 路径有 `env = await effectiveEnv(...)`，但 cron 是独立入口 ——
-    //    漏掉这一步的话，后台里改的区域组 / 筛选 / 超时 / 告警 / 保留天数
-    //    对定时探测**全部无效**（只会用到环境变量或代码默认值），
-    //    而页面上却显示"已保存、立即生效"，属于静默失效。
-    //    合并一次即可：下面所有函数都读 env。
+    // cron 是独立入口，必须先合并后台设置再往下走。
     const settings = await stage("loadSettings", () => loadSettings(env), {});
     env = await effectiveEnv(env, settings);
 
@@ -2491,16 +2016,7 @@ export default {
     });
     const subreqBudget = Number((env && env.SUBREQ_BUDGET) || 30);
 
-    // ⚠️ 这里**不再**递增 config_version。
-    //
-    // 曾经是「本轮写了任何数据就 bump 一次」，本意是让自动探测的结果立刻能被前台看到。
-    // 但缓存 key 里带版本号 ⇒ 版本号一变，上一分钟的缓存条目全部作废：
-    //   · 探测每分钟都在写，于是缓存**永远命中不了**（每个条目活不过 60 秒），
-    //     只剩下"防并发"的作用，而首页每次回源要跑 5 条重查询；
-    //   · 每分钟多一次 meta 写，一天 1440 次。
-    // 数据新鲜度本来就有 TTL 兜着（READ_CACHE = s-maxage 30），最坏晚 30 秒 ——
-    // 对一个"5 分钟才探一次"的监控来说完全够。版本号只留给**配置变更**用
-    // （见 fetch 入口的 WRITE_APIS 白名单），那才是一天变几次、且必须立即全机房失效的东西。
+    // 这里不再递增 config_version，否则每分钟都让前台缓存全失效。
     void collected; // 结果只用于日志汇总
 
     // 每天一次的过期明细清理（保留 N 天）。

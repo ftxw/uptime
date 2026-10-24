@@ -431,11 +431,7 @@ function renderFailed(msg) {
 
 const params = new URLSearchParams(location.search);
 const SITE_ID = params.get("id") || "";
-// 窗口小时数。取值与服务端 `/api/site` 的钳制（1–720）**保持一致**。
-// 早先这里把不在 [6,24,168,720] 里的数字一律折成 24，于是 `?hours=72` 这种
-// 分享出去的链接会被**静默改成 24 小时**展示，而地址栏里仍写着 72 —— 对不上，
-// 且前端不会回写 URL 去纠正。现在原样接受：下面的按钮只负责"跳常用档"，
-// 不是取值白名单（给了非按钮值时四个按钮都不高亮，用户仍能看出这是自定义窗口）。
+// 窗口小时数，与服务端 /api/site 的钳制（1–720）一致；非法值回落 24。
 let HOURS = (() => {
   const raw = params.get("hours");
   const n = Number(raw);
