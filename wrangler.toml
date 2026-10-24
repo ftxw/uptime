@@ -3,109 +3,47 @@ main = "src/index.js"
 compatibility_date = "2026-09-22"
 
 # ── ⚠️ 必须保留：别让部署清空 Dashboard 上设的变量 ─────────────────────
-# 背景（已实测踩坑）：`wrangler deploy` 会把「版本的全部明文变量」按本地配置重写，
-# 因此**只在 Cloudflare 控制台填的明文变量，会在下一次部署时被整个清掉**
-# （以本地 wrangler.toml 为准，[vars] 里没有的就视为"已删除"）。
-# 本项目 [vars] 是空的，所以每次部署都会把 Dashboard 里填的明文变量抹掉 ——
-# ADMIN_PASSWORD 曾因此丢失，表现为"设了环境变量但后台仍说没设密码"。
-#
+# `wrangler deploy` 会把「版本的全部明文变量」按本地配置重写，
+# 因此只在 Cloudflare 控制台填的明文变量会在下一次部署时被整个清掉。
 # keep_vars = true 让 wrangler 不去动 Dashboard 上的变量。
 # （Secrets 本来就跨部署保留，与这一项无关 —— 敏感值仍建议用 Secret。）
 keep_vars = true
 
 # ── 对外入口 ──────────────────────────────────────────────────────────
-# 这里**故意不写任何 [[routes]]**：域名由你在 Cloudflare 控制台手动绑定
-# （Workers & Pages → 本 Worker → Settings → Domains & Routes → Add）。
-#
-# 之所以不放在配置里：`routes` 是**声明式的** —— 一旦写进来，wrangler 每次部署都会
-# 按配置重建 DNS 记录与证书（域名抢占、configuration drift 都由它接管）；
-# 反过来，控制台手动加的域名也是独立持有的路由资源，不在配置里就不会被 wrangler 动，
-# 两者互不干扰。交给人工绑定更省心：换域名不必改仓库，也不必重新 deploy。
+# 这里**故意不写任何 [[routes]]**：域名由你在 Cloudflare 控制台手动绑定。
+# routes 是声明式的，写进来 wrangler 每次部署都会按配置重建 DNS 与证书；
+# 交给人工绑定更省心：换域名不必改仓库，也不必重新 deploy。
 #
 # ⚠️ 必须显式打开 workers.dev：不写 [[routes]] 时 wrangler 会把它关掉，
 #    那样在控制台绑好域名之前，部署出来连一个自检地址都没有。
-#
-# ⚠️ 位置敏感：这是**顶层**字段，必须写在任何 [table] / [[array]] 之前，
-#    否则会被当成上一个表的字段（实测报 Unexpected fields found in triggers field）。
+# ⚠️ 位置敏感：这是**顶层**字段，必须写在任何 [table] / [[array]] 之前。
 workers_dev = true
 
 # ── 定时 ──────────────────────────────────────────────────────────────
-# 每分钟触发一次：因为每个站点的监测间隔是独立配置的（1/5/10/30/60 分钟），
+# 每分钟触发一次：每个站点的监测间隔是独立配置的（1/5/10/30/60 分钟），
 # cron 必须按**最细粒度（1 分钟）**来跑，再由 dueSites() 按各站点的间隔筛选，
-# 只对「距上次检查已达间隔」的站点发起探测。
-#   若这里写 */5，则 1 分钟的站点实际仍是 5 分钟一次 —— 间隔设置会失效。
-# cron 触发本身很轻（一次 D1 查询），不探测就不调用 DO、不写 checks。
+# 只对「距上次检查已达间隔」的站点发起探测。若这里写 */5，1 分钟的站点仍是 5 分钟一次。
+#
+# cron 触发本身很轻（一次 D1 查询）：没有站点到期就既不调 Globalping 也不写 checks。
+# 探测位置与 cron 执行位置无关：活交给 Globalping 的第三方探针执行。
 #
 # 免费计划：每账号最多 5 个 cron trigger，最小粒度 1 分钟，时区固定 UTC。
-# 探测位置与 cron 执行位置无关：CF 后端把活交给 Durable Object（locationHint 锁区域），
-# Globalping 后端把活交给第三方探针 —— 两条路都不受 cron 落在哪个机房影响。
 [triggers]
 crons = ["* * * * *"]
 
 # ── 存储：所有数据都在这一张 D1 里（建表语句见 schema.sql）──────────────
 # database_id 由 scripts/setup-d1.mjs 自动维护：**提交进仓库的应始终是空值**。
 # 流程是「按名字列出账号下的库 → 没有就 d1 create → 写回 uuid → 建表 → 校验结构」，
-# 全程幂等，且**只认库名、不认已有 uuid**。所以换个 Cloudflare 账号 clone 下来，
-# 跑一次 setup 就会指向新账号的库，不会因为这里残留旧 uuid 而指错。
-#
-# ⚠️ setup / deploy 会在**本机**把实际 uuid 写回这一行（工作区文件会变，属正常现象），
-#    但**不要把它提交上去** —— 一旦提交，就等于把一个只对当前账号有效的 uuid 固化进仓库，
-#    换环境时它必然指向不存在的库。保持空值，让脚本每次都自己去对齐。
+# 全程幂等，且**只认库名、不认已有 uuid**。
 [[d1_databases]]
 binding = "DB"
 database_name = "uptime-db"
 database_id = ""
 
-# ── CF 探测后端：Durable Object（位置可控）─────────────────────────────
-# 免费计划只能用 SQLite 后端 → 必须 new_sqlite_classes
-# 免费额度：10 万请求/天、13000 GB-s/天
-[[durable_objects.bindings]]
-name = "PROBER"
-class_name = "Prober"
-
-[[migrations]]
-tag = "v1"
-new_sqlite_classes = ["Prober"]
-
 # ── 静态资源（前台 + 后台）─────────────────────────────────────────────
-# Workers Static Assets：命中静态文件时**不执行 Worker**，官方说明此类请求
-# 也不消耗 Worker 请求额度（免费层 10 万/天）。
-# 默认 run_worker_first = false → 先匹配静态文件，未命中才进 Worker，
-# 所以 /api/* 会自动落到 Worker，而 / 与 /admin 走静态文件。
+# Workers Static Assets：命中静态文件时**不执行 Worker**，这类请求也不消耗
+# Worker 请求额度（免费层 10 万/天）。默认 run_worker_first = false →
+# 先匹配静态文件，未命中才进 Worker，所以 /api/* 自动落到 Worker。
 [assets]
-directory = "./public"
-binding = "ASSETS"
-
-# ── 预览环境（预发布）─────────────────────────────────────────────────
-# 独立 Worker + 独立 D1，改坏也不会碰生产数据。域名同样在控制台手动绑定。
-# 该环境的 database_id 由 `npm run setup:preview` 自动写入。
-[env.preview]
-name = "uptime-preview"
-workers_dev = true
-
-# ⚠️ 预览环境**必须显式禁用 cron**。
-#    wrangler 的命名环境会继承顶层配置（含 [triggers]），
-#    不显式清空的话，预览 Worker 会和生产 Worker **并行跑同一个定时任务** ——
-#    两个 Worker 每分钟各自探测一遍，既白白双倍消耗额度，又多占一个 cron 名额
-#    （免费计划每账号上限 5 个）。
-[env.preview.triggers]
-crons = []
-
-# ⚠️ 预览必须用**独立的数据库**，否则预览上的写操作会直接落到生产数据上，
-#    就等于没有隔离。uuid 同样由 setup 脚本自动写入，仓库里保持空值。
-[[env.preview.d1_databases]]
-binding = "DB"
-database_name = "uptime-db-preview"
-database_id = ""
-
-[[env.preview.durable_objects.bindings]]
-name = "PROBER"
-class_name = "Prober"
-
-[[env.preview.migrations]]
-tag = "v1"
-new_sqlite_classes = ["Prober"]
-
-[env.preview.assets]
 directory = "./public"
 binding = "ASSETS"

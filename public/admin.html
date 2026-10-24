@@ -88,14 +88,13 @@
             <tr>
               <th>名称</th>
               <th>地址</th>
-              <th>探测后端</th>
               <th>证书</th>
               <th>状态</th>
               <th style="text-align:right">操作</th>
             </tr>
           </thead>
           <tbody id="rows">
-            <tr><td colspan="6" class="empty">加载中…</td></tr>
+            <tr><td colspan="5" class="empty">加载中…</td></tr>
           </tbody>
         </table>
       </div>
@@ -148,39 +147,22 @@
         <span class="hint">路径会被保留 —— 填 /health 就检测 /health，不会退化成首页，「URL隐藏」只影响前台展示</span>
       </div>
 
-      <div class="grid-2">
-        <div class="field">
-          <label for="f-group">分类</label>
-          <select id="f-group"></select>
-          <span class="hint">新建分类请用左侧「＋ 添加分类」</span>
-        </div>
-        <div class="field">
-          <label for="f-kind">探测后端</label>
-          <select id="f-kind">
-            <option value="cf">Cloudflare</option>
-            <option value="globalping">Globalping</option>
-            <!-- 大陆探测臂：出口在中国大陆机房（境内打境内），测国内站点拿到的延迟
-                 是真实的境内视角，比 cf（出口在香港/首尔）准得多。 -->
-            <option value="cn">大陆探测臂 · 境内视角</option>
-          </select>
-          <span class="hint">区域组 / 位置筛选在「设置 → 探测」里统一配置</span>
-        </div>
+      <div class="field">
+        <label for="f-group">分类</label>
+        <select id="f-group"></select>
+        <span class="hint">新建分类请用左侧「＋ 添加分类」</span>
       </div>
 
-      <div class="grid-3">
+      <div class="grid-2">
         <div class="field">
           <label for="f-codes">期望状态码</label>
           <input id="f-codes" placeholder="200,301,302">
           <span class="hint">留空 = 接受 200-399</span>
         </div>
         <div class="field">
-          <label for="f-keyword">正文关键字</label>
-          <input id="f-keyword" placeholder="（可空）">
-          <span class="hint" id="f-keyword-hint">必须包含，防 200 假页面</span>
-        </div>
-        <div class="field">
-          <label for="f-threshold">连续失败几次告警</label>
+          <label for="f-threshold">连续失败几次判故障</label>
           <input id="f-threshold" type="number" min="1" max="20" value="3">
+          <span class="hint">未达阈值只算抖动，不标红</span>
         </div>
       </div>
 
@@ -284,36 +266,10 @@
       </div>
 
       <h3 class="set-group">探测</h3>
-      <div class="grid-3">
-        <div class="field">
-          <label for="s-hint">CF 区域组</label>
-          <select id="s-hint">
-            <option value="apac">亚太</option>
-            <option value="apac-se">东南亚</option>
-            <option value="apac-ne">东北亚</option>
-            <option value="oc">大洋洲</option>
-            <option value="wnam">北美西部</option>
-            <option value="enam">北美东部</option>
-            <option value="weur">西欧</option>
-            <option value="eeur">东欧</option>
-            <option value="me">中东</option>
-            <option value="afr">非洲</option>
-            <option value="sam">南美</option>
-          </select>
-          <span class="hint">对所有用 cf 后端的站点生效</span>
-        </div>
-        <div class="field">
-          <label for="s-timeout">CF 探测超时（ms）</label>
-          <input id="s-timeout" type="number" min="1000" max="30000" step="500" placeholder="8000">
-          <span class="hint">只对 cf 后端生效；也用作「响应偏慢」基线的一半</span>
-        </div>
-      </div>
-
-      <div class="grid-3">
+      <div class="grid-2">
         <div class="field">
           <label for="s-gp-token">Globalping Token</label>
-          <!-- 「清除」是唯一能删掉已存 token 的入口：服务端的 clear_globalping_token
-               分支一直存在，但前端从未发送过 —— 输入框留空只表示"不修改"。 -->
+          <!-- 「清除」是唯一能删掉已存 token 的入口：输入框留空只表示"不修改"。 -->
           <div style="display:flex;gap:8px">
             <input id="s-gp-token" type="password" placeholder="留空 = 不修改" autocomplete="off" style="flex:1;min-width:0">
             <button class="btn" type="button" id="s-gp-token-clear">清除</button>
@@ -321,10 +277,9 @@
           <span class="hint" id="s-gp-token-hint">未配置（额度 250 次/小时）</span>
         </div>
         <div class="field">
-          <label for="s-magic">Globalping 位置筛选</label>
-          <!-- `CN` 单独一项 = 不限网络类型，即云机房 + 家庭宽带全部探针（实测 66 个：
-               云机房 40 + 家宽 26，两个标签互斥）。没有这一项时，
-               "想覆盖两类网络"只能靠下面的「自定义…」手填 CN，很容易被漏掉。 -->
+          <label for="s-magic">探测位置筛选</label>
+          <!-- `CN` 单独一项 = 不限网络类型，即云机房 + 家庭宽带全部探针。
+               没有这一项时，"想覆盖两类网络"只能靠下面的「自定义…」手填 CN，很容易被漏掉。 -->
           <select id="s-magic">
             <option value="CN+datacenter-network">中国 · 云机房</option>
             <option value="CN">中国 · 全部网络（云机房 + 家庭宽带）</option>
@@ -335,7 +290,7 @@
             <option value="__custom__">自定义…</option>
           </select>
           <input id="s-magic-custom" placeholder="CN+changsha+4837" hidden aria-label="自定义位置筛选">
-          <span class="hint">对所有用 globalping 后端的站点生效</span>
+          <span class="hint">对所有站点生效</span>
         </div>
       </div>
 
@@ -346,7 +301,7 @@
                以后要加档位（如 7、9）只在这里加一行 option 即可，别处无需改动。
                为什么只给奇数：偶数点的多数表决会平票（2 点时 1:1），而平票的处理是
                整次作废、不写检查记录 —— 等于一半次数白花额度还拿不到数据。
-               1 = 退回单点采样（旧行为，链路抖动会 100% 记成站点故障）。 -->
+               1 = 退回单点采样（链路抖动会 100% 记成站点故障）。 -->
           <select id="s-limit">
             <option value="1">1 · 单点采样（不表决）</option>
             <option value="3" selected>3 · 多数表决（推荐）</option>
@@ -357,62 +312,7 @@
         <div class="field">
           <label for="s-gptimeout">GP 探针超时（秒）</label>
           <input id="s-gptimeout" type="number" min="5" max="30" step="1" placeholder="15">
-          <span class="hint">整数秒 5–30，只对 globalping 后端生效</span>
-        </div>
-      </div>
-
-      <div class="grid-3">
-        <div class="field">
-          <label for="s-cn-probes">大陆探测臂端点</label>
-          <!-- 逗号分隔可填多个：多地域端点会各自回报一份结果，后端据此做多数表决
-               （同一套表决逻辑，GP 的「多探针」与这里的「多地域」共用）。
-               占位符只写域名即可：请求时会拼上 /api/ping 与 /api/ssl，
-               填了完整路径也会被覆盖，写全反而让人以为路径不能改。 -->
-          <div style="display:flex;gap:8px">
-            <input id="s-cn-probes" placeholder="https://xxx.edgeone.app">
-            <button class="btn" type="button" id="s-cn-verify">验证</button>
-          </div>
-          <span class="hint">逗号分隔可填多个（多地域做多数表决）；留空 = 不启用</span>
-          <span class="hint" id="s-cn-verify-out"></span>
-        </div>
-        <div class="field">
-          <label for="s-cn-token">探测臂令牌</label>
-          <!-- 与 Globalping Token 同款：只写不读。输入框留空 = 不修改（发 __KEEP__），
-               已配置时只回显掩码；「清除」是删掉它的唯一入口。 -->
-          <div style="display:flex;gap:8px">
-            <input id="s-cn-token" type="password" placeholder="留空 = 不修改" autocomplete="off" style="flex:1;min-width:0">
-            <button class="btn" type="button" id="s-cn-token-clear">清除</button>
-          </div>
-          <span class="hint" id="s-cn-token-hint">未配置</span>
-        </div>
-        <div class="field">
-          <label for="s-cn-timeout">探测臂超时（ms）</label>
-          <input id="s-cn-timeout" type="number" min="1000" max="30000" step="500" placeholder="8000">
-          <span class="hint">只对 cn 后端生效，默认 8000（毫秒）</span>
-        </div>
-      </div>
-
-      <div class="grid-3">
-        <div class="field">
-          <label for="s-sslmagic">SSL 检测筛选</label>
-          <select id="s-sslmagic">
-            <option value="CN+datacenter-network">中国 · 云机房</option>
-            <option value="CN">中国 · 全部网络（云机房 + 家庭宽带）</option>
-            <option value="CN+eyeball-network">中国 · 家庭宽带</option>
-            <option value="east-asia">东亚</option>
-            <option value="western-europe">西欧</option>
-            <option value="north-america">北美</option>
-            <option value="__custom__">自定义…</option>
-          </select>
-          <input id="s-sslmagic-custom" placeholder="CN+changsha+4837" hidden aria-label="自定义 SSL 检测筛选">
-          <span class="hint">与站点的位置筛选解耦，避免窄筛选导致证书检测连带失败</span>
-        </div>
-        <div class="field">
-          <label for="s-per-tick">每轮补检 SSL 数</label>
-          <!-- min=0 与服务端 normalizeSetting("ssl_per_tick") 的 0–10 对齐：0 = 停用补检。
-               早先写成 min=1，等于把一个合法配置从界面上抹掉了。 -->
-          <input id="s-per-tick" type="number" min="0" max="10" placeholder="2">
-          <span class="hint">0 = 停用证书补检。单站最坏 14 个子请求，与探测共享同一份预算</span>
+          <span class="hint">整数秒 5–30；也用作「响应偏慢」的基线</span>
         </div>
         <div class="field">
           <label for="s-warn">证书降级阈值（天）</label>
@@ -437,7 +337,7 @@
           <!-- max=35 与服务端钳制一致（见 normalizeSetting("subreq_budget")）：
                50 是免费层硬上限，D1 往返另计约 15–20 次，设到 45 等于"合法但一定跑不通"。 -->
           <input id="s-budget" type="number" min="1" max="35" placeholder="30">
-          <span class="hint">探测 + 证书检测共用；免费层硬上限 50，D1 另计约 15–20</span>
+          <span class="hint">每站点 2 次（发起 + 收取）；免费层硬上限 50</span>
         </div>
         <div class="field">
           <label for="s-keep">明细保留天数</label>
@@ -446,7 +346,7 @@
         </div>
       </div>
 
-      <div class="grid-3">
+      <div class="grid-2">
         <div class="field">
           <label for="s-recent">最近检查条数</label>
           <input id="s-recent" type="number" min="5" max="200" placeholder="20">
@@ -457,13 +357,6 @@
           <input id="s-incident" type="number" min="1" max="100" placeholder="10">
           <span class="hint">详情页「故障记录」最多列几条</span>
         </div>
-      </div>
-
-      <h3 class="set-group">告警</h3>
-      <div class="field">
-        <label for="s-webhook">Webhook 地址</label>
-        <input id="s-webhook" placeholder="https://...（留空则不告警）">
-        <span class="hint">可直接对接飞书 / 钉钉 / Server 酱的通用 Webhook</span>
       </div>
     </div>
 
@@ -497,7 +390,7 @@
     <h2>后台已停用</h2>
     <p class="muted">
       未设置管理员密码，后台不提供任何服务 —— 否则任何人打开这个网址就能改配置、
-      读到告警 Webhook 与 Globalping Token。
+      读到 Globalping Token。
     </p>
     <ol class="setup-steps muted">
       <li>打开 Cloudflare 控制台 → Workers &amp; Pages → 本 Worker → Settings → Variables and Secrets</li>
@@ -517,26 +410,5 @@
 <div class="toast-host" id="toast-host" aria-live="polite"></div>
 
 <script src="/admin.js" defer></script>
-<script>
-// 后台也要注册 SW：否则每次进后台 HTML 与静态资源都要走一次跨国往返。
-// 前台 index.html / monitor.html 已注册，这里补上（同一个 SW 作用域覆盖全站）。
-if ("serviceWorker" in navigator) {
-  // ⚠️ 发版后要「一次 F5 就看到新版」，光靠 SW 的 skipWaiting 不够：
-  //    外壳是缓存优先，这次导航是旧 SW 应答的（新 SW 要等这次导航结束才接管），
-  //    直接刷新看到的仍是旧页面；而且 /*.css 有 5 分钟 HTTP 新鲜期，
-  //    连按多次也刷不掉，只能硬刷。新 SW 接管(claim)那一刻 controller 会变，
-  //    就地重载一次即可。守卫：首访时 controller 为 null —— 那时装好后 claim
-  //    也会触发一次 controllerchange，不挂监听就不会白闪第二下。
-  if (navigator.serviceWorker.controller) {
-    var reloading = false;
-    navigator.serviceWorker.addEventListener("controllerchange", function () {
-      if (reloading) return;
-      reloading = true;
-      location.reload();
-    });
-  }
-  navigator.serviceWorker.register("/sw.js").catch(function () {});
-}
-</script>
 </body>
 </html>

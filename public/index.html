@@ -63,25 +63,5 @@
 
 <div class="tip" id="tip" role="tooltip"></div>
 <script src="/app.js" defer></script>
-<script>
-// Service Worker：第二次访问起外壳走本地缓存，绕开 CF 首访 ~1s 的网络成本。
-if ("serviceWorker" in navigator) {
-  // ⚠️ 发版后要「一次 F5 就看到新版」，光靠 SW 的 skipWaiting 不够：
-  //    外壳是缓存优先，这次导航是旧 SW 应答的（新 SW 要等这次导航结束才接管），
-  //    直接刷新看到的仍是旧页面；而且 /*.css 有 5 分钟 HTTP 新鲜期，
-  //    连按多次也刷不掉，只能硬刷。新 SW 接管(claim)那一刻 controller 会变，
-  //    就地重载一次即可。守卫：首访时 controller 为 null —— 那时装好后 claim
-  //    也会触发一次 controllerchange，不挂监听就不会白闪第二下。
-  if (navigator.serviceWorker.controller) {
-    var reloading = false;
-    navigator.serviceWorker.addEventListener("controllerchange", function () {
-      if (reloading) return;
-      reloading = true;
-      location.reload();
-    });
-  }
-  navigator.serviceWorker.register("/sw.js").catch(function () {});
-}
-</script>
 </body>
 </html>

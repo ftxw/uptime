@@ -9,16 +9,13 @@ CREATE TABLE IF NOT EXISTS sites (
   name           TEXT NOT NULL,
   url            TEXT NOT NULL,
   group_name     TEXT,                -- 所属分类；NULL/空 = 未分组
-  probe_kind     TEXT,                -- 'cf' | 'globalping' | 'cn'；NULL = 继承全局默认
-  -- 位置（CF 区域组 / Globalping 筛选）是**全局设置**，不在这里。
-  -- 一个站点只解析出唯一后端，站点级放两份位置必然只有一份生效，是死配置。
+  -- 探测位置（Globalping 筛选）是**全局设置**，不在这里。
   expect_codes   TEXT,                -- 逗号分隔，如 "200,301"；空 = 接受 2xx/3xx
-  keyword        TEXT,                -- 正文关键字校验（防"200 但内容是错误页"）
   -- 1 = 前台不公开地址：/api/overview 与 /api/site **不下发 url**（不是前端不渲染），
   -- 也不渲染「打开站点」按钮 —— 访客既看不到地址，也没有入口可以点过去。
   -- 适用于 API 端点、内部系统这类"能公开可用率、但地址不想外传"的站点。
   hide_url       INTEGER NOT NULL DEFAULT 0,
-  fail_threshold INTEGER NOT NULL DEFAULT 3,  -- 连续失败多少次才判故障/告警
+  fail_threshold INTEGER NOT NULL DEFAULT 3,  -- 连续失败多少次才判故障
   interval_min   INTEGER NOT NULL DEFAULT 5,  -- 期望检查间隔（分钟）
   enabled        INTEGER NOT NULL DEFAULT 1,
   sort           INTEGER NOT NULL DEFAULT 0,
@@ -30,8 +27,8 @@ CREATE TABLE IF NOT EXISTS sites (
 CREATE TABLE IF NOT EXISTS checks (
   site     TEXT NOT NULL,
   ts       TEXT NOT NULL,
-  source   TEXT,                      -- 'cf:apac' / 'gp:CN+datacenter-network'
-  probe    TEXT,                      -- 具体探针：机房代码(colo) 或 city/asn
+  source   TEXT,                      -- 'gp:CN+datacenter-network'
+  probe    TEXT,                      -- 具体探针：city/asn
   ok       INTEGER NOT NULL,
   status   INTEGER,
   ttfb_ms  INTEGER,
@@ -64,25 +61,17 @@ CREATE INDEX IF NOT EXISTS idx_checks_ok_ts_site ON checks(ok, ts, site);
 --    last_checked_ts  调度用：上次「自动探测」完成的时刻，决定下次是否到期
 --    last_ts          展示用：最后一次结果的时刻（**含**后台手动「测」）
 --    手动测试刻意不更新前者（否则会把自动调度往后推），但会更新后者以便图表能看到。
---
--- `alerted` 是「本次连续故障是否已经发过 down 告警」的标志位，存在的理由：
---   告警判定若写成「consecutive_fail === fail_threshold」，就只在**跨越那一刻**成立 ——
---   一旦用户在故障持续期间把阈值调小（5 → 2），已有的计数早已越过新阈值，
---   从此**永远不会再触发**，站点会一直故障而不通知。
---   用独立标志位表达「已告过警」后，判定变成「达到阈值 且 尚未告警」，
---   与阈值怎么变都无关；恢复条件也同样只看这个标志，不再依赖计数回落到某个值。
 CREATE TABLE IF NOT EXISTS state (
   site             TEXT PRIMARY KEY,
   consecutive_fail INTEGER NOT NULL DEFAULT 0,
-  alerted          INTEGER NOT NULL DEFAULT 0,  -- 1 = 已就本次连续故障发过 down 告警
   last_checked_ts  TEXT,
   -- ↓ 最后一次探测结果的快照（含手动测试）
   last_ok          INTEGER,  -- 1 正常 / 0 故障
   last_status      INTEGER,
   last_ttfb_ms     INTEGER,
   last_total_ms    INTEGER,
-  last_source      TEXT,     -- 'cf:apac' / 'gp:CN+datacenter-network'
-  last_probe       TEXT,     -- 机房代码(colo) 或 city/asn
+  last_source      TEXT,     -- 'gp:CN+datacenter-network'
+  last_probe       TEXT,     -- city/asn
   last_ts          TEXT,
   last_error       TEXT
 );
@@ -98,8 +87,9 @@ CREATE TABLE IF NOT EXISTS pending (
 );
 
 -- ── SSL 证书 ──────────────────────────────────────────────
--- 单独存且低频查：Worker 的 fetch 不暴露对端证书，而 Globalping 的 HTTP 结果带完整
--- 证书链信息。所以证书统一走 Globalping，每站点每天查一次即可（证书不会 5 分钟变一次）。
+-- Worker 的 fetch 不暴露对端证书，但 Globalping 的 http 测量结果里带完整
+-- 证书链（result.tls.expiresAt / authorized / issuer）。所以**不单独发检测请求**，
+-- 每次可用性探测顺带把证书写进这张表 —— 零额外额度，且比「每天查一次」更新鲜。
 CREATE TABLE IF NOT EXISTS ssl (
   site       TEXT PRIMARY KEY,
   checked_ts TEXT,
@@ -109,6 +99,8 @@ CREATE TABLE IF NOT EXISTS ssl (
   subject    TEXT,
   key_type   TEXT,
   expires_at TEXT,
+  -- ⚠️ 保留列只为兼容旧库，**写侧恒为 NULL**：剩余天数是相对时间，落库即过期。
+  --    读侧一律 `julianday(expires_at) - julianday('now')` 现算（见 db.sslDaysLeftSql）。
   days_left  INTEGER,
   error      TEXT
 );

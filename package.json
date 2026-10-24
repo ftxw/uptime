@@ -2,14 +2,11 @@
   "name": "uptime",
   "version": "1.0.0",
   "private": true,
-  "description": "站点可用性监控：Cloudflare Workers + D1 + Durable Object",
+  "description": "站点可用性监控：Cloudflare Workers + D1 + Globalping",
   "scripts": {
     "setup": "node scripts/setup-d1.mjs production",
-    "setup:preview": "node scripts/setup-d1.mjs preview",
-    "sw:bump": "node scripts/bump-sw.mjs",
-    "dev": "node scripts/setup-d1.mjs local && node scripts/bump-sw.mjs && wrangler dev",
-    "deploy": "node scripts/setup-d1.mjs production && node scripts/bump-sw.mjs && wrangler deploy",
-    "deploy:preview": "node scripts/setup-d1.mjs preview && node scripts/bump-sw.mjs && wrangler deploy --env preview"
+    "dev": "node scripts/setup-d1.mjs local && wrangler dev",
+    "deploy": "node scripts/setup-d1.mjs production && wrangler deploy"
   },
   "devDependencies": {
     "wrangler": "^4.136.3"

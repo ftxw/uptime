@@ -7,10 +7,9 @@
  *
  * 用法：
  *   node scripts/setup-d1.mjs                    # 准备生产库
- *   node scripts/setup-d1.mjs preview            # 准备预览库
- *   node scripts/setup-d1.mjs production preview # 两个都准备
+ *   node scripts/setup-d1.mjs local               # 只给本地 .wrangler/state 建表
  *
- * 环境变量：D1_NAME / D1_NAME_PREVIEW / D1_LOCATION
+ * 环境变量：D1_NAME / D1_LOCATION
  */
 import { execFileSync } from "node:child_process";
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
@@ -23,17 +22,13 @@ const SCHEMA = join(ROOT, "schema.sql");
 const LOCATION = process.env.D1_LOCATION || "apac"; // 亚太：离中国大陆最近的 D1 主区域提示
 
 /**
- * 每个部署目标对应 wrangler.toml 里的一段 [[d1_databases]]。
- * 生产与预览必须是**两个库**：共用会让预览上的任何写操作直接落到生产数据上。
+ * 部署目标 → wrangler.toml 里对应的 [[d1_databases]] 段。
+ * 本项目只保留一套生产绑定：预览环境已移除，避免两个库之间误写。
  */
 const TARGETS = {
   production: {
     section: "[[d1_databases]]",
     name: process.env.D1_NAME || "uptime-db",
-  },
-  preview: {
-    section: "[[env.preview.d1_databases]]",
-    name: process.env.D1_NAME_PREVIEW || "uptime-db-preview",
   },
 };
 
@@ -84,7 +79,7 @@ function listD1() {
   }
 }
 
-/** 定位 [[d1_databases]] / [[env.preview.d1_databases]] 段的起止行号 */
+/** 定位 [[d1_databases]] 段的起止行号 */
 function findSection(section) {
   const raw = readFileSync(CONFIG, "utf8");
   const eol = raw.includes("\r\n") ? "\r\n" : "\n";

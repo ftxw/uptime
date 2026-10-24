@@ -15,6 +15,52 @@
 export const UNGROUPED = "未分组";
 
 /**
+ * D1 硬上限：**单条语句最多 100 个绑定参数**（官方 limits 页）。
+ * 站点数一旦过百，任何 `IN (?,?,...)` 都会直接报错 —— 留 10 个余量，按 90 分片。
+ *
+ * 为什么必须留余量而不是正好 100：以后若在这条语句里再加一个固定参数
+ * （比如 `AND enabled = ?`），正好 100 的写法会在同一批站点数下突然越界。
+ */
+export const BIND_CHUNK = 90;
+
+/**
+ * `d.batch()` 里语句条数的软上限。
+ *
+ * batch 本身不限制长度，但它是**一次**往返里排队的语句集合：条数越多，单次耗时越长。
+ * 站点很多时按 50 条一组发，既避免单次超时，也把失败范围限制在一组内。
+ */
+export const BATCH_CHUNK = 50;
+
+/** 把数组按固定长度切片成若干组 */
+export function chunk(arr, size) {
+  const out = [];
+  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+  return out;
+}
+
+/**
+ * 「证书还剩几天」的**唯一算法** —— 读的时候现算，绝不落库。
+ *
+ * 为什么：days_left 是相对时间，写进库里那一刻就开始过期，而证书每天才复核一次。
+ * 原先把它存成列，于是「今天到期」的证书要等到第二天的检测跑完才会变红，
+ * 中间那 24 小时页面一直显示"剩余 1 天"—— 监控工具在证书这件事上恰好不可信。
+ * 现在统一用 expires_at 现算：只要 expires_at 是真的，剩余天数永远是真的。
+ *
+ * 用 julianday 而不是在 JS 里算：overview / site / admin 三条读路径都走 SQL，
+ * 放同一句表达式里才不会出现"某个页面用的是旧值"。
+ *
+ * @param {string} alias 表别名（含结尾的点），如 "ss."
+ */
+export const sslDaysLeftSql = (alias = "") =>
+  `CAST(julianday(${alias}expires_at) - julianday('now') AS INTEGER)`;
+
+/** ssl 表的显式列清单（含现算的 days_left）—— 供 `SELECT *` 的路径替换用 */
+export const SSL_COLUMNS_SQL = (alias = "") =>
+  `${alias}site, ${alias}checked_ts, ${alias}authorized, ${alias}protocol, ` +
+  `${alias}issuer, ${alias}subject, ${alias}key_type, ${alias}expires_at, ` +
+  `${sslDaysLeftSql(alias)} AS days_left, ${alias}error`;
+
+/**
  * 分类列表 = 显式分类 ∪ 站点上出现的 group_name（并集，各带站点计数）。
  * 抽出来是因为 /api/categories 与 /api/admin 都要用，避免两处逻辑漂移。
  */
@@ -99,6 +145,46 @@ export async function saveSetting(env, key, value) {
   }
 }
 
+/**
+ * 批量写设置（一次往返）。
+ *
+ * 保存后台设置原先是「18 个键 → 18 次 `saveSetting()` → 18 个完整 D1 往返」，
+ * 跨国链路上就是十几秒的纯等待，而且中途失败会留下「改了一半」的设置。
+ * `d.batch()` 是原子的，一次落库要么全成要么全不成。
+ *
+ * entries: [[key, value], ...]；value 为空串/null/undefined 表示删除该键。
+ */
+export async function saveSettings(env, entries) {
+  if (!entries || !entries.length) return 0;
+  const d = await db(env);
+  const upsert = d.prepare(
+    "INSERT INTO meta (key, value) VALUES (?, ?) " +
+      "ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+  );
+  const del = d.prepare("DELETE FROM meta WHERE key = ?");
+  const stmts = entries.map(([k, v]) =>
+    v === null || v === undefined || v === "" ? del.bind(k) : upsert.bind(k, String(v))
+  );
+  // ⚠️ batch 里每条都必须 .bind() 过 —— 未绑定的语句 D1 会直接报错
+  await d.batch(stmts);
+  return stmts.length;
+}
+
+/**
+ * 删除站点的全部痕迹（一次批量、原子）。
+ *
+ * ① 原先 4 条 DELETE 是**逐条** `run()`：中途失败会留下「state 还在、sites 没了」
+ *    这种半删状态，而 `d.batch()` 天然是原子的。
+ * ② 原先**漏了 checks**：被删站点的历史行会在保留期内继续计入首页
+ *    「24h 可用率」的分子分母，而「监控总数」已经不含它了 —— 两个数字互相矛盾，
+ *    且删得越多偏得越远。
+ */
+export async function deleteSite(env, id) {
+  const d = await db(env);
+  const tables = ["checks", "ssl", "state", "pending", "sites"];
+  await d.batch(tables.map((t) => d.prepare(`DELETE FROM ${t} WHERE ${t === "sites" ? "id" : "site"} = ?`).bind(id)));
+}
+
 /** 探测用：只取启用的站点。后台要显示全部（含禁用）时走 buildAdminPayload。 */
 export async function loadSites(env) {
   const d = await db(env);
@@ -115,7 +201,7 @@ export async function insertChecks(env, rows) {
     `INSERT INTO checks (ts, site, source, probe, ok, status, ttfb_ms, total_ms, error)
      VALUES (?,?,?,?,?,?,?,?,?)`
   );
-  const batch = rows.map((r) =>
+  const stmts = rows.map((r) =>
     stmt.bind(
       r.ts,
       r.site,
@@ -128,30 +214,25 @@ export async function insertChecks(env, rows) {
       r.error || null
     )
   );
-  await d.batch(batch);
-  return { stored: batch.length };
+  // 分组发送：单条语句只有 9 个参数（远低于 100 的绑定上限），
+  // 但 batch 的长度没有上限，站点多时一次塞进去会让单次往返变长、失败范围也变大。
+  for (const part of chunk(stmts, BATCH_CHUNK)) await d.batch(part);
+  return { stored: stmts.length };
 }
 
 /**
- * state 的 upsert 语句 —— 一次写完「计数 / 告警标志」与「最后一次结果快照」。
+ * state 的 upsert 语句 —— 一次写完「连续失败计数」与「最后一次结果快照」。
  *
- * ⚠️ `alerted` 由 bumpState 算好后传入，**不能**写成 `CASE WHEN fail >= ? THEN ...`：
- *    阈值只在 bumpState 里比较，SQL 里再比一次会让"阈值改了怎么办"出现第二套答案。
- *
- * 早先这里还有 `last_ok_ts` 与 `last_alert_ts` 两列，都已从表里删掉：
- *   last_ok_ts     —— 语义是"上一次成功的时刻"，但全项目没有任何读者；
- *                     `last_ts`（最后一次检查）+ `last_ok`（是否成功）已能表达展示所需的一切。
- *   last_alert_ts  —— 由 sendAlerts 逐条 UPDATE 写入，但 ① 无读者 ② 每条一次 D1 往返
- *                     ③ 每次 STATE_UPSERT 都会把它置回 null，写了等于白写。
- *                     它想表达的"是否已告警"现在由 `alerted` 正确承担。
+ * 一次测量同时更新两样东西，所以只需要一次 batch：
+ *   ① consecutive_fail —— 跨轮次累积，必须落库（不能靠查 checks 现算）
+ *   ② last_* —— 最后一次结果的快照，让首页/后台不必为「每站最新一条」去扫 checks
  */
 const STATE_UPSERT =
-  `INSERT INTO state (site, consecutive_fail, alerted, last_checked_ts,
+  `INSERT INTO state (site, consecutive_fail, last_checked_ts,
      last_ok, last_status, last_ttfb_ms, last_total_ms, last_source, last_probe, last_ts, last_error)
-   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+   VALUES (?,?,?,?,?,?,?,?,?,?,?)
    ON CONFLICT(site) DO UPDATE SET
      consecutive_fail = excluded.consecutive_fail,
-     alerted          = excluded.alerted,
      last_checked_ts  = excluded.last_checked_ts,
      last_ok          = excluded.last_ok,
      last_status      = excluded.last_status,
@@ -189,50 +270,70 @@ function lastResultFields(info, nowIso) {
 export async function bumpState(env, perSite) {
   const d = await db(env);
   const ids = Object.keys(perSite);
-  if (!ids.length) return [];
+  if (!ids.length) return;
 
-  const ph = ids.map(() => "?").join(",");
-  const cur = await d
-    .prepare(`SELECT site, consecutive_fail, alerted FROM state WHERE site IN (${ph})`)
-    .bind(...ids)
-    .all();
-  const prev = {};
-  for (const r of cur.results || []) prev[r.site] = r;
+  // ⚠️ 必须分片：`IN (?,?,…)` 的绑定参数上限是 100，站点过百就直接报错。
+  //    报错发生在 UPDATE 之前 —— 于是「checks 写进去了、state 一个没更新、
+  //    告警一条没发」，页面继续显示旧状态，而且没有任何地方会把这件事说出来。
+  const prev = await selectPrevState(d, ids);
 
   const nowIso = new Date().toISOString();
-  const toAlert = [];
   const batch = [];
 
   for (const site of ids) {
     const info = perSite[site];
-    const p = prev[site] || {};
-    const before = Number(p.consecutive_fail || 0);
-    const wasAlerted = Number(p.alerted || 0) === 1;
+    const before = Number(prev[site]?.consecutive_fail || 0);
     const fail = info.ok ? 0 : before + 1;
 
-    // 告警判定只问两件事：「到阈值了吗」+「这次故障告过警了吗」——
-    // 与阈值本身怎么变无关，所以不再出现"调小阈值就永远不告警"的漏洞。
-    //   故障：达到阈值且尚未告过 → 发一次 down，置位
-    //   恢复：本次成功且此前告过 → 发一次 recovered，清位
-    // （旧写法是 `fail === info.threshold`，只在**跨越那一刻**成立。）
-    let alerted = wasAlerted;
-    if (info.ok) {
-      alerted = 0;
-      if (wasAlerted) toAlert.push({ site, kind: "recovered", failCount: before, info });
-    } else if (fail >= info.threshold) {
-      if (!wasAlerted) toAlert.push({ site, kind: "down", failCount: fail, info });
-      alerted = 1;
-    }
-
     batch.push(
-      d
-        .prepare(STATE_UPSERT)
-        .bind(site, fail, alerted, nowIso, ...lastResultFields(info, nowIso))
+      d.prepare(STATE_UPSERT).bind(site, fail, nowIso, ...lastResultFields(info, nowIso))
     );
   }
 
-  await d.batch(batch);
-  return toAlert;
+  for (const part of chunk(batch, BATCH_CHUNK)) await d.batch(part);
+}
+
+/**
+ * 批量取回「上一轮的连续失败计数」，按 BIND_CHUNK 分片查询。
+ *
+ * 抽成函数是因为它需要分片，而分片逻辑不该散在调用点 ——
+ * 否则以后再加一个「按 id 批量读」的地方，很容易又写回一次 `IN (${N个?})`。
+ */
+async function selectPrevState(d, ids) {
+  const prev = {};
+  for (const part of chunk(ids, BIND_CHUNK)) {
+    const ph = part.map(() => "?").join(",");
+    const r = await d
+      .prepare(`SELECT site, consecutive_fail FROM state WHERE site IN (${ph})`)
+      .bind(...part)
+      .all();
+    for (const row of r.results || []) prev[row.site] = row;
+  }
+  return prev;
+}
+
+/**
+ * 按站点批量删除（同样受 100 个绑定参数限制）。
+ *
+ * 用于收完 Globalping 结果后清 pending：逐条 DELETE × N 会多出 N 次 D1 往返，
+ * 而一次 IN 又不允许超过 100 个参数 —— 折中是分片 IN。
+ */
+export async function deleteBySites(env, table, ids) {
+  if (!ids.length) return 0;
+  const d = await db(env);
+  // 表名来自代码常量（只有 pending / state 这类内部表），不接受外部输入
+  const allowed = new Set(["pending", "state"]);
+  if (!allowed.has(table)) throw new Error(`deleteBySites: 不支持的表 ${table}`);
+  let n = 0;
+  for (const part of chunk(ids, BIND_CHUNK)) {
+    const ph = part.map(() => "?").join(",");
+    const r = await d
+      .prepare(`DELETE FROM ${table} WHERE site IN (${ph})`)
+      .bind(...part)
+      .run();
+    n += Number(r?.meta?.changes ?? r?.changes ?? 0);
+  }
+  return n;
 }
 
 /**
@@ -296,7 +397,9 @@ export async function saveSsl(env, siteId, r) {
       r.subject ?? null,
       r.key_type ?? null,
       r.expires_at ?? null,
-      r.days_left ?? null,
+      // ⚠️ 刻意恒写 NULL：`days_left` 是相对时间，落库即过期（见 sslDaysLeftSql 注释）。
+      //    列保留只为兼容旧库（不删列，避免一次无谓的表重建），读侧一律现算。
+      null,
       r.error ?? null
     )
     .run();

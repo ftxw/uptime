@@ -362,7 +362,7 @@ function renderRecent(recent) {
     .map((r) => {
       const cls = r.ok ? "b-up" : "b-down";
       const label = r.ok ? "正常" : "故障";
-      // 来源标签由服务端算好（origin，格式 GP:CN · Beijing/9808 / CF:APAC · SJC）——
+      // 来源标签由服务端算好（origin，格式 GP:CN · Beijing/9808）——
       // 以前这里直接吐 source 原文（`gp:CN+datacenter-network · Beijing/45090`），
       // 与首页 / 后台的写法各不相同。取不到 origin 时退回 source 原文，不显示空白。
       const src = r.origin || r.source || "";
@@ -464,22 +464,9 @@ function render(d) {
 
   const w = d.window || {};
   qs("#bucket").textContent = w.bucket_label ? `每个点 = ${w.bucket_label}聚合` : "";
-  // 「谁在哪跑的」唯一口径由服务端算好（origin，格式 CF:APAC · SJC / GP:CN · Beijing/9808）
-  // —— 前端不再按 probe_kind 自己拼后端名：那样 cn 会掉进 else 被显示成
-  // 「Cloudflare（APAC）」，正是 src/origin.js 顶部点名的"三处各自拼、必然漂移"的老毛病。
-  //
-  // ⚠️ 下面 `|| d.recent[0].origin` 的退回是**有意保留、别当冗余删掉**：
-  //   ① 跨版本窗口：/api/site 走边缘缓存（READ_CACHE，stale-while-revalidate=120）。
-  //      即便后端给 site 对象加上了 origin，边缘仍可能先吐出一份"加字段之前生成的
-  //      旧副本"，那 120 秒里若只认 d.site.origin，页脚会空一块 —— 退回正好兜住。
-  //   ② 它并不是"前端自己拼"：site 级 origin 本就用 last_source/last_probe 算，
-  //      与 recent[0]（同一张 checks 表 ORDER BY ts DESC LIMIT 1）同源同值，口径不分叉。
-  // 两者都没有（从未检查过）时省略该句，绝不回落成写死的「Cloudflare」。
-  const backend = d.site.origin || (d.recent && d.recent[0] && d.recent[0].origin) || "";
   qs("#foot").textContent =
-    `窗口：最近 ${w.hours} 小时 · 共 ${w.checks} 次检查（失败 ${w.failures} 次）` +
-    (backend ? ` · 探测后端 ${backend}` : "") +
-    ` · SSL 证书每站点每日检测一次`;
+    `窗口：最近 ${w.hours} 小时 · 共 ${w.checks} 次检查（失败 ${w.failures} 次）· ` +
+    `探测位置 ${d.site.gp_magic || "默认筛选"} · SSL 随探测顺带采集`;
 }
 
 async function load() {

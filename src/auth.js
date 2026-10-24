@@ -76,14 +76,28 @@ async function signSession(payload, secret) {
   return `${p}.${b64urlEncode(sig)}`;
 }
 
-/** 签发管理员会话（默认 30 天） */
-export async function issueSession(secret, maxAgeSec, now = Date.now()) {
+/**
+ * 签发管理员会话（默认 30 天）。
+ *
+ * `epoch` 是「会话纪元」：每次「登出所有设备」把它 +1，所有旧 token 立即失效。
+ *
+ * 为什么需要它而不是只轮换签名密钥：签名密钥可能来自环境变量 `ADMIN_SECRET`，
+ * 此时它是**只读**的（改不了环境变量），轮换 D1 里那份 secret 对验签毫无影响 ——
+ * 于是"登出所有设备"在那套配置下是个假按钮：提示成功，别的设备照旧能用。
+ * 把纪元写进 token 载荷后，吊销能力就与"密钥从哪来"解耦了。
+ */
+export async function issueSession(secret, maxAgeSec, now = Date.now(), epoch = 0) {
   const iat = Math.floor(now / 1000);
-  return signSession({ sub: "admin", iat, exp: iat + maxAgeSec }, secret);
+  return signSession({ sub: "admin", iat, exp: iat + maxAgeSec, ep: epoch }, secret);
 }
 
-/** 验签失败 / 过期 / 格式非法一律返回 null（不区分原因，避免信息泄漏） */
-export async function verifySession(token, secret) {
+/**
+ * 验签失败 / 过期 / 格式非法 / 纪元不匹配一律返回 null（不区分原因，避免信息泄漏）。
+ *
+ * ⚠️ `ep` 缺失按 0 处理：这样本改动上线**不会**把所有人的现存会话一起踢掉
+ *    （纪元默认就是 0，旧 token 等价于 ep=0）。
+ */
+export async function verifySession(token, secret, epoch = 0) {
   if (typeof token !== "string" || token.length === 0) return null;
   const idx = token.indexOf(".");
   if (idx <= 0 || idx === token.length - 1) return null;
@@ -100,6 +114,7 @@ export async function verifySession(token, secret) {
   }
   if (!payload || typeof payload.exp !== "number") return null;
   if (payload.exp * 1000 < Date.now()) return null;
+  if (Number(payload.ep || 0) !== Number(epoch || 0)) return null;
   return payload;
 }
 

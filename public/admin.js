@@ -24,7 +24,8 @@ let DRAG_CAT = null;     // 正在拖拽的分类名
 let DRAG_SITE = null;    // 正在拖拽的站点 id
 let AUTHED = false;
 let SETTINGS = null;     // /admin 一次性带回的设置，用于设置面板预填
-let SSL_MAP = {};        // /admin 一次性带回的证书结果（site → 记录）
+// 证书结果不再单独一张 map：/admin 已把 ssl_* 摊平在**每个站点行**里（见 sslCell）。
+// 原先既发整张 map 又发扁平字段，同一份证书在一个响应里出现两遍，体积近乎翻倍。
 
 const UNGROUPED = "未分组";
 const ALL = "__all__";
@@ -323,30 +324,6 @@ function fillIntervalSelect(current) {
 }
 
 /**
- * 探测后端决定「正文关键字」是否可用。
- *
- * Globalping 的 HTTP 测量**不返回响应正文**，`gpCollect` 产出的结果里也没有
- * `keywordHit` 字段 —— 于是 `judge()` 里 `r.keywordHit === false` 永远不成立，
- * 关键字校验对 GP 站点是**静默空转**：表单写着「必须包含，防 200 假页面」，
- * 实际一个字节都不看，用户以为配了保护、其实没有。这项能力没法补
- * （补就得自己 fetch 正文，也就失去了"从国内探针看"的意义），
- * 所以直接禁用输入并写明原因；保存时服务端也会把该值清掉。
- *
- * ⚠️ 只有 globalping 需要禁用：`cn`（大陆探测臂）跑在大陆云函数的 Node 运行时里，
- *    能拿到完整响应正文，关键字校验**真实生效** —— 绝不能把这个限制错误地扩展过去。
- */
-function syncKindUi() {
-  const kind = qs("#f-kind").value;
-  const gp = kind === "globalping";
-  qs("#f-keyword").disabled = gp;
-  qs("#f-keyword-hint").textContent = gp
-    ? "Globalping 后端不返回正文，此项无法生效（保存时会清空）"
-    : kind === "cn"
-    ? "大陆探测臂返回正文，此项真实生效（防 200 假页面）"
-    : "必须包含，防 200 假页面";
-}
-
-/**
  * 证书降级阈值（天）—— **跟随后台设置**，不写死。
  *
  * 原实现是硬编码 `d <= 14`，而 `ssl_warn_days` 是可配置项（默认 14）。
@@ -358,37 +335,24 @@ function warnDays() {
   return Number.isFinite(n) && n > 0 ? n : 14;
 }
 
-function sslCell(ssl) {
-  if (!ssl || !ssl.checked_ts) return `<span class="muted">未检测</span>`;
-  if (ssl.error) return `<span class="ssl ssl-warn">未知</span>`;
-  const d = ssl.days_left;
+/**
+ * 证书单元格。入参是**站点行**（/admin 已把 ssl 表的列摊平成 ssl_* 前缀），
+ * 不再是单独一张 site→证书 的 map —— 同一份数据在响应里只出现一次。
+ */
+function sslCell(s) {
+  if (!s || !s.ssl_checked_ts) return `<span class="muted">未检测</span>`;
+  if (s.ssl_error) return `<span class="ssl ssl-warn">未知</span>`;
+  const d = s.ssl_days_left;
   let cls = "ssl-ok";
-  if (ssl.authorized === 0) cls = "ssl-bad";
+  if (s.ssl_authorized === 0) cls = "ssl-bad";
   else if (d !== null && d <= warnDays()) cls = "ssl-warn";
   const text = d === null ? "有效" : d < 0 ? "已过期" : `${d} 天`;
-  return `<span class="ssl ${cls}" title="${escapeHtml(ssl.issuer || "")} · ${escapeHtml(
-    ssl.protocol || ""
-  )} · 到期 ${escapeHtml(ssl.expires_at || "")}">${text}</span>`;
-}
-
-/** 后端标签。后端现在是站点级必选项，直接显示解析结果 */
-/**
- * 后端显示名（后台下拉、表格列共用）。
- * 不再直接吐 `cf` / `globalping` 这种内部标识 —— 界面上统一叫 Cloudflare / Globalping，
- * 与「添加站点 → 探测后端」下拉里的写法一致（见 admin.html 的 #f-kind）。
- * ⚠️ 传进来的通常是 resolved_kind（服务端已归一化过），非法值一律按 Cloudflare 显示。
- * ⚠️ `cn` 必须单独分支：漏了就会落到 `else` 被显示成 Cloudflare，
- *    用户以为站点是走 CF 边缘测的，实际走的是大陆探测臂 —— 是"看错后端"的严重误导。
- */
-function backendLabel(s) {
-  if (s.resolved_kind === "globalping") return "Globalping";
-  if (s.resolved_kind === "cn") return "大陆探测臂";
-  return "Cloudflare";
+  return `<span class="ssl ${cls}" title="${escapeHtml(s.ssl_issuer || "")} · ${escapeHtml(
+    s.ssl_protocol || ""
+  )} · 到期 ${escapeHtml(s.ssl_expires_at || "")}">${text}</span>`;
 }
 
 async function renderRows() {
-  const sslMap = SSL_MAP;
-
   const list = visibleSites();
   const title = FILTER || "全部";
   // 拖拽排序只在**具体分类**视图下开放：「全部」视图里列表混着多个分类，而 sort
@@ -400,7 +364,7 @@ async function renderRows() {
   )} · ${list.length} 个 · ${canDrag ? "可拖拽排序" : "选择分类后可拖拽排序"}</span>`;
 
   if (!list.length) {
-    qs("#rows").innerHTML = `<tr><td colspan="6" class="empty">${
+    qs("#rows").innerHTML = `<tr><td colspan="5" class="empty">${
       SITES.length ? "该分类下还没有站点" : "还没有站点，点右上角「添加站点」"
     }</td></tr>`;
     return;
@@ -438,18 +402,16 @@ async function renderRows() {
           <div style="font-weight:500">${escapeHtml(s.name)}${
         s.enabled ? "" : ' <span class="muted" style="font-size:11px">已暂停</span>'
       }</div>
+          <div class="muted" style="font-size:11px;opacity:.65"${
+            s.origin ? ` title="${escapeHtml(s.origin)}"` : ""
+          }>${fmtInterval(s.interval_min)}</div>
         </td>
         <td><span class="mono" style="font-size:12px">${escapeHtml(s.url)}</span>${
         // 后台看到的永远是明文地址（否则没法编辑），所以额外标一个「已隐藏」——
         // 不然前台不显示时，运营会以为是前端出了 bug
         s.hide_url ? ' <span class="muted" style="font-size:11px">已隐藏</span>' : ""
       }</td>
-        <td class="muted" style="font-size:12px"${
-          s.origin ? ` title="${escapeHtml(s.origin)}"` : ""
-        }>${backendLabel(s)}<div style="font-size:11px;opacity:.65">${fmtInterval(
-          s.interval_min
-        )}</div></td>
-        <td>${sslCell(sslMap[s.id])}</td>
+        <td>${sslCell(s)}</td>
         <td><span class="badge ${cls}"${stTitle}>${st}</span><div class="muted" style="font-size:11px">${relTime(
         s.last_ts
       )}</div></td>
@@ -501,7 +463,6 @@ async function loadAll() {
 
   SITES = sortSites(d.sites || []);
   CATS = d.categories || [];
-  SSL_MAP = d.ssl || {}; // 已有证书结果（只读），渲染不再单独发 /api/ssl
   if (d.settings) SETTINGS = d.settings; // 供设置面板预填，打开时不必先等网络
   applyBrandTitle(SETTINGS);
 
@@ -836,6 +797,10 @@ function openForm(site) {
   qs("#dlg-title").textContent = site ? "编辑站点" : "添加站点";
   qs("#f-id").value = site?.id || "";
   qs("#f-id").readOnly = Boolean(site);
+  // ⚠️ 必须清掉「用户手动改过 ID」的标记：它挂在 DOM 元素上，会跟着弹窗活到下一次打开。
+  //    不清的话，第一次新建时手动改过一次 ID，此后每次「添加站点」输名称都不再联动生成 ID，
+  //    看起来就像"自动生成功能坏了"。编辑态由 readOnly 挡住，不需要这个标记。
+  delete qs("#f-id").dataset.touched;
   qs("#f-name").value = site?.name || "";
   qs("#f-url").value = site?.url || "";
   // 勾选框 = 布尔开关，默认不勾（与数据库默认值 0 一致）
@@ -844,23 +809,13 @@ function openForm(site) {
   fillGroupSelect(
     site?.group_name || (FILTER && FILTER !== UNGROUPED ? FILTER : UNGROUPED)
   );
-  // probe_kind 是必选项（表单里没有空选项）；服务端也会归一化，这里只做预设。
-  // ⚠️ 必须逐一列出合法值：漏掉 cn 会让编辑一个 cn 站点时下拉静默回落成 cf，
-  //    用户点一下「保存」就把后端改掉了（而且页面不报错）。
-  const kind = site?.probe_kind;
-  qs("#f-kind").value = kind === "globalping" ? "globalping" : kind === "cn" ? "cn" : "cf";
   qs("#f-codes").value = site?.expect_codes || "";
-  qs("#f-keyword").value = site?.keyword || "";
   qs("#f-threshold").value = site?.fail_threshold ?? 3;
   fillIntervalSelect(site?.interval_min ?? 5);
   qs("#f-enabled").value = String(site?.enabled ?? 1);
-  syncKindUi();
   qs("#dlg-err").hidden = true;
   dlg.showModal();
 }
-
-// 切换后端时同步「正文关键字」的可用性（GP 后端用不上这个字段）
-qs("#f-kind").addEventListener("change", syncKindUi);
 
 qs("#form").addEventListener("submit", async (e) => {
   // 只处理「保存」（`submitter` 为空时也按保存走，做一层防御）。
@@ -880,9 +835,7 @@ qs("#form").addEventListener("submit", async (e) => {
     name: qs("#f-name").value.trim(),
     url: qs("#f-url").value.trim(),
     group_name: currentGroupValue(),
-    probe_kind: qs("#f-kind").value || null,
     expect_codes: qs("#f-codes").value.trim(),
-    keyword: qs("#f-keyword").value.trim() || null,
     hide_url: qs("#f-hideurl").checked,
     fail_threshold: Number(qs("#f-threshold").value || 3),
     interval_min: Number(qs("#f-interval").value || 5),
@@ -901,13 +854,7 @@ qs("#form").addEventListener("submit", async (e) => {
     const d = await post("/sites", body);
     if (!d.ok) throw new Error(d.error || "保存失败");
     dlg.close();
-    // 服务端在 GP 后端下会清掉 keyword 并回一条 warning —— 必须让用户看到，
-    // 否则就变成"填了没生效"的静默失败（这正是本次要修掉的那类问题）。
-    // 这是**部分成功**：站点已经存下来了，只是某个字段没按预期生效
-    //（典型：Globalping 后端下"正文关键字"被忽略）。用 warn 级的中性琥珀色，
-    // 用红色 error 会被读成"保存失败"，反而误导。
-    if (d.warning) banner(d.warning, "warn");
-    else banner("已保存", "info");
+    banner("已保存", "info");
     await loadAll();
   } catch (err) {
     const el = qs("#dlg-err");
@@ -951,8 +898,7 @@ document.addEventListener("click", async (e) => {
       // 这样手动测的点会出现在详情页折线与「最近检查」里。
       // ⚠️ 必须是 POST：这个接口会落库并可能消耗 Globalping 额度，
       //    GET 语义的幂等前提不成立（也避免被导航/预取意外触发）。
-      const kind = site?.resolved_kind || "cf";
-      const d = await post("/test", { kind, site: site.id });
+      const d = await post("/test", { site: site.id });
       const res = (d.results || [])[0] || {};
       // 来源标签由服务端算好（origin），与前台首页 / 详情页同一口径 ——
       // 以前这里自己拼「机房 SJC」，与前台写法不一致。
@@ -1008,42 +954,10 @@ qs("#checkall").addEventListener("click", async () => {
 
 const setdlg = qs("#setdlg");
 
-/**
- * CF 区域组下拉的预设值（必须与 admin.html 里 #s-hint 的 <option value> 一致）。
- * ⚠️ [0] 被当作「内置默认值」（见 writeHint）—— 必须等于 `src/settings.js` 的
- *    `SETTING_META.cf_hint.def`（`apac`），否则"库里没这一行"时回显的选中项会与
- *    服务端实际生效的区域组不一致。
- */
-const HINT_PRESETS = [
-  "apac",
-  "apac-se",
-  "apac-ne",
-  "oc",
-  "wnam",
-  "enam",
-  "weur",
-  "eeur",
-  "me",
-  "afr",
-  "sam",
-];
-
-/**
- * 写 CF 区域组。
- *
- * 下拉里**没有「不指定」这一项**（按要求移除）—— 因为"不指定"在探测层压根没有语义：
- * `cfHintOf()` 对空值/非法值一律回落到内置默认，`dispatch` 时总会带上一个 locationHint。
- * 于是"不指定"只是"回落到 apac"的另一种说法，却会让人以为自己能控制"让 CF 自己选"。
- * 现在空值一律映射成预设里的默认项，界面永远有确定选中项。
- */
-function writeHint(v) {
-  qs("#s-hint").value = HINT_PRESETS.includes(v) ? v : HINT_PRESETS[0];
-}
-
 /** 位置筛选下拉里的「自定义…」哨兵值 */
 const MAGIC_CUSTOM = "__custom__";
 /**
- * 预设选项（必须与 admin.html 里 `#s-magic` / `#s-sslmagic` 的 <option> 一致，顺序也一致）。
+ * 预设选项（必须与 admin.html 里 `#s-magic` 的 <option> 一致，顺序也一致）。
  * ⚠️ **[0] 被当作「内置默认值」使用**（见 writeMagicLike）—— 它必须等于
  *    `src/settings.js` 的 `SETTING_META.gp_magic.def`（两者同值），否则"库里没这一行"时
  *    回显的选中项会与服务端实际生效的筛选不一致。改默认值要三处一起改。
@@ -1059,9 +973,6 @@ const MAGIC_PRESETS = [
 
 /**
  * 读「预设 + 自定义」型下拉：选中预设就取预设值，选中「自定义」则取旁边的输入框。
- *
- * `#s-magic`（站点位置筛选）与 `#s-sslmagic`（证书检测筛选）共用这一对函数 ——
- * 两个下拉的选项集完全一样，只是作用对象不同，没必要各写一份（写两份必然漂移）。
  */
 function readMagicLike(selId, customId) {
   const v = qs(selId).value;
@@ -1086,20 +997,12 @@ function writeMagicLike(selId, customId, v) {
   qs(customId).hidden = qs(selId).value !== MAGIC_CUSTOM;
 }
 
-/** `#s-magic`：对所有用 globalping 后端的站点的**可用性探测**生效 */
+/** `#s-magic`：对全部站点的**可用性探测**生效 */
 function readMagic() {
   return readMagicLike("#s-magic", "#s-magic-custom");
 }
 function writeMagic(v) {
   writeMagicLike("#s-magic", "#s-magic-custom", v);
-}
-
-/** `#s-sslmagic`：证书检测专用，与站点自己的筛选解耦（避免窄筛选连带失败） */
-function readSslMagic() {
-  return readMagicLike("#s-sslmagic", "#s-sslmagic-custom");
-}
-function writeSslMagic(v) {
-  writeMagicLike("#s-sslmagic", "#s-sslmagic-custom", v);
 }
 
 async function openSettings() {
@@ -1137,8 +1040,6 @@ function fillSettingsForm(s) {
   qs("#s-title").value = s.site_title || "";
   qs("#s-theme").value = s.default_theme || "auto";
   qs("#s-utc").value = s.utc_offset_min ?? "";
-  writeHint(s.cf_hint || "");
-  qs("#s-timeout").value = s.timeout_ms || "";
   writeMagic(s.gp_magic || "");
   // 回填 gp_limit。取值**只**由这个下拉的 <option> 定义（服务端刻意不做校验），
   // 但库里仍可能是下拉之外的值 —— 环境变量 GP_LIMIT=7，或早期用数字框存下的值。
@@ -1151,28 +1052,16 @@ function fillSettingsForm(s) {
   }
   if (limitVal) limitSel.value = limitVal;
   qs("#s-gptimeout").value = s.gp_timeout_sec || "";
-  writeSslMagic(s.gp_ssl_magic || "");
-  qs("#s-per-tick").value = s.ssl_per_tick || "";
   qs("#s-warn").value = s.ssl_warn_days || "";
   qs("#s-ipver").value = s.gp_ip_version || "4";
   qs("#s-budget").value = s.subreq_budget || "";
   qs("#s-keep").value = s.check_keep_days || "";
   qs("#s-recent").value = s.recent_limit || "";
   qs("#s-incident").value = s.incident_limit || "";
-  qs("#s-webhook").value = s.alert_webhook || "";
   qs("#s-gp-token").value = "";
   qs("#s-gp-token-hint").textContent = s.has_globalping_token
     ? `已配置：${s.globalping_token_masked}（留空则保留）`
     : "未配置（额度 250 次/小时；配置后 500 次/小时）";
-  // 大陆探测臂：端点（逗号分隔字符串，原样回显）、超时、令牌掩码。
-  // ⚠️ 令牌与 Globalping 同款 —— 输入框永远清空，只把掩码写进 hint，
-  //    绝不把明文回填进 value（否则任何能打开设置的人都看得到令牌）。
-  qs("#s-cn-probes").value = s.cn_probes || "";
-  qs("#s-cn-timeout").value = s.cn_timeout_ms || "";
-  qs("#s-cn-token").value = "";
-  qs("#s-cn-token-hint").textContent = s.has_cn_token
-    ? `已配置：${s.cn_token_masked}（留空则保留）`
-    : "未配置（留空表示不使用令牌）";
 }
 
 qs("#settings-open").addEventListener("click", openSettings);
@@ -1202,84 +1091,8 @@ qs("#s-gp-token-clear").addEventListener("click", async () => {
   }
 });
 
-/**
- * 「清除探测臂令牌」—— 删除已配置 cn_token 的唯一入口，与上面的 GP 清除同一套逻辑。
- * 输入框留空只会走"保留旧值"（发 `__KEEP__`），没有这个按钮就永远撤不回配错的令牌。
- * 破坏性操作，先确认一次。
- */
-qs("#s-cn-token-clear").addEventListener("click", async () => {
-  if (!confirm("清除已保存的探测臂令牌？\n清除后大陆探测臂将以无令牌方式调用（若端点要求鉴权会失败）。")) return;
-  const btn = qs("#s-cn-token-clear");
-  btn.disabled = true;
-  try {
-    const r = await post("/settings", { clear_cn_token: true });
-    if (!r.ok) throw new Error(r.error || "清除失败");
-    qs("#s-cn-token").value = "";
-    qs("#s-cn-token-hint").textContent = "未配置（留空表示不使用令牌）";
-    banner("探测臂令牌已清除", "info");
-    await loadAll();
-  } catch (err) {
-    if (!isMasked(err)) banner("清除失败：" + err.message, "error");
-  } finally {
-    btn.disabled = false;
-  }
-});
-
-/**
- * 「验证」—— 调探测臂的 /api/ping 做接入自检。
- *
- * 验的是**已保存**的设置，不是输入框里还没提交的值 —— 否则验的是"你以为配的"，
- * 不是"系统实际在用的"。所以要先保存再点。
- *
- * 结论只看 egressVerdict（实测出网 IP 归属），platformRegion 仅作参考：
- * 探测臂同时配了大陆与海外地域时，平台会按调用方位置做地理路由，
- * 自报的城市会说谎 —— 上一版就因此把境外测量当境内数据用了很久。
- */
-const VERDICT_TEXT = {
-  match: "出口在期望国家境内，可以正常用于国内站点探测",
-  mismatch: "出口不在期望国家 —— 测量数据不可用于国内站点，请检查部署地域",
-  unknown: "未能判定出口归属（探测臂查不到外部 IP 归属服务），无法证明出口在境内",
-  unchecked: "探测臂未配置期望国家，已跳过校验",
-};
-
-qs("#s-cn-verify").addEventListener("click", async () => {
-  const btn = qs("#s-cn-verify");
-  const out = qs("#s-cn-verify-out");
-  btn.disabled = true;
-  out.textContent = "验证中…";
-  try {
-    const r = await post("/cn-verify");
-    if (r.hint) {
-      out.textContent = r.hint;
-      banner(r.hint, "error");
-      return;
-    }
-    const lines = (r.results || []).map((x) => {
-      if (!x.ok) return `${x.base} → 请求失败：${x.error}`;
-      const d = x.data || {};
-      const where = d.egress ? `${d.egress.ip || "?"}（${d.egress.country || "归属未知"}）` : "?";
-      const verdict = d.egressVerdict || "unknown";
-      const notes = Array.isArray(d.notes) && d.notes.length ? ` — ${d.notes.join("；")}` : "";
-      return `${x.base} → ${VERDICT_TEXT[verdict] || verdict}｜出口 ${where}${notes}`;
-    });
-    out.textContent = lines.join("；") || "没有可验证的端点";
-    const bad = (r.results || []).some(
-      (x) => !x.ok || (x.data && x.data.egressVerdict && x.data.egressVerdict !== "match")
-    );
-    banner(bad ? "探测臂验证发现问题，请看下方提示" : "探测臂验证通过", bad ? "error" : "info");
-  } catch (err) {
-    out.textContent = "验证失败：" + err.message;
-    if (!isMasked(err)) banner("验证失败：" + err.message, "error");
-  } finally {
-    btn.disabled = false;
-  }
-});
-
-// 位置筛选类下拉选到「自定义…」时展开旁边的输入框（#s-magic 与 #s-sslmagic 同样处理）
-for (const [selId, customId] of [
-  ["#s-magic", "#s-magic-custom"],
-  ["#s-sslmagic", "#s-sslmagic-custom"],
-]) {
+// 位置筛选下拉选到「自定义…」时展开旁边的输入框
+for (const [selId, customId] of [["#s-magic", "#s-magic-custom"]]) {
   qs(selId).addEventListener("change", () => {
     const custom = qs(selId).value === MAGIC_CUSTOM;
     qs(customId).hidden = !custom;
@@ -1311,27 +1124,17 @@ qs("#setform").addEventListener("submit", async (e) => {
     site_title: qs("#s-title").value.trim(),
     default_theme: qs("#s-theme").value,
     utc_offset_min: qs("#s-utc").value.trim(),
-    cf_hint: qs("#s-hint").value,
-    timeout_ms: qs("#s-timeout").value.trim(),
     gp_magic: readMagic(),
     gp_limit: qs("#s-limit").value.trim(),
     gp_timeout_sec: qs("#s-gptimeout").value.trim(),
-    gp_ssl_magic: readSslMagic(),
-    ssl_per_tick: qs("#s-per-tick").value.trim(),
     ssl_warn_days: qs("#s-warn").value.trim(),
     gp_ip_version: qs("#s-ipver").value,
     subreq_budget: qs("#s-budget").value.trim(),
     check_keep_days: qs("#s-keep").value.trim(),
     recent_limit: qs("#s-recent").value.trim(),
     incident_limit: qs("#s-incident").value.trim(),
-    alert_webhook: qs("#s-webhook").value.trim(),
     // 留空 = 不修改已有 token（后端识别 __KEEP__）
     globalping_token: qs("#s-gp-token").value.trim() || "__KEEP__",
-    // 大陆探测臂：端点原样提交（后端负责按逗号切分）；超时原样提交；
-    // 令牌与 Globalping 同款 —— 留空 = 不修改（__KEEP__），只有「清除」能删。
-    cn_probes: qs("#s-cn-probes").value.trim(),
-    cn_timeout_ms: qs("#s-cn-timeout").value.trim(),
-    cn_token: qs("#s-cn-token").value.trim() || "__KEEP__",
   };
 
   try {

@@ -243,11 +243,9 @@ function render(data) {
     ` · 更新于 ${t.toLocaleTimeString("zh-CN")}`;
   // 阈值从服务端设置取 —— 后台改了 ssl_warn_days 后这里的文案必须跟着变
   const warnDays = Number(data.settings?.ssl_warn_days ?? 14);
-  // 三个探测后端并列 —— 不再只点名两个，也不把 SSL 检测方写死
-  // （SSL 现在可能由大陆探测臂承担，见 src 侧改造）。
   qs("#foot").textContent =
-    "点击站点名称进入详情页（趋势 / 证书 / 故障记录）。探测由 Cloudflare 边缘、Globalping 探针与大陆探测臂执行；" +
-    `SSL 证书每站点每日检测一次，剩余 ≤ ${warnDays} 天判定为降级。`;
+    "点击站点名称进入详情页（趋势 / 证书 / 故障记录）。探测由 Globalping 探针执行；" +
+    `SSL 证书信息随探测顺带采集，剩余 ≤ ${warnDays} 天判定为降级。`;
 }
 
 /* ── 数据 ──────────────────────────────────────────────── */
