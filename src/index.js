@@ -113,6 +113,8 @@ async function buildHealth(env, pwdConfigured, pretty, schema) {
     out.schema.statements = schema.statements;
     // -1 = 全新库，0 = 旧库无版本标记，N = 从 N 升上来
     out.schema.from_version = schema.from;
+    // v2 的数据回填结果：done=true 已回填 / false 因明细过多跳过（历史色条会是空的）
+    if (schema.backfill) out.schema.backfill = schema.backfill;
   }
   if (schema && !schema.ok) {
     out.schema.error = schema.error;
@@ -417,7 +419,7 @@ async function effectiveEnv(env, S) {
   return merged;
 }
 
-/** 「一天」从哪一刻起算：30 天色条与按天聚合的唯一时区来源。 */
+/** 「一天」从哪一刻起算：色条格子与按天汇总的唯一时区来源（写入侧见 db.js 的 dayKey）。 */
 function dayOffsetMs(env) {
   const min = clampInt(
     env?.UTC_OFFSET_MIN ?? SETTING_META.utc_offset_min.def,
@@ -426,32 +428,6 @@ function dayOffsetMs(env) {
     SETTING_META.utc_offset_min.def
   );
   return min * 60000;
-}
-/** SQLite date() 的修饰符，如 '+480 minutes' */
-function dayMod(env) {
-  const min = Math.round(dayOffsetMs(env) / 60000);
-  return `${min < 0 ? "-" : "+"}${Math.abs(min)} minutes`;
-}
-
-/** 按天算最长连续失败段：两次失败间隔 ≤ 1.3 倍间隔视为相邻，跨天切断（宁可少标红）。 */
-function maxFailRunPerDay(rows, intervalMin) {
-  const tol = Math.max(1, Number(intervalMin) || 5) * 60 * 1.3; // 秒，见上方容差说明
-  const out = {};
-  let day = null;
-  let prevS = null;
-  let run = 0;
-  for (const r of rows || []) {
-    if (r.d !== day) {
-      day = r.d;
-      prevS = null;
-      run = 0;
-    }
-    const s = Date.parse(r.ts) / 1000;
-    run = prevS !== null && s - prevS <= tol ? run + 1 : 1;
-    prevS = s;
-    if (out[day] === undefined || run > out[day]) out[day] = run;
-  }
-  return out;
 }
 
 /**
@@ -1140,10 +1116,17 @@ export default {
         const keyUrl = `${url.origin}/api/overview?days=${days}&pretty=${pretty ? 1 : 0}&v=${ver}`;
         return await withEdgeCache(request, ctx, 30, async () => {
           const d = await db(env);
-          const since30 = new Date(Date.now() - days * 86400000).toISOString();
           const since24 = new Date(Date.now() - 86400000).toISOString();
 
-          const [siteRows, dayRows, h24, u24, failRows] = await Promise.all([
+          // 30 天日期轴。最左是今天，最右是最早；"今天"按 utc_offset_min 起算，
+          // 必须与写入侧 dayKey 用同一个偏移，否则格子会错位一格。
+          const axis = [];
+          for (let i = 0; i < days; i++) {
+            const t = new Date(Date.now() - i * 86400000 + dayOffsetMs(env));
+            axis.push(t.toISOString().slice(0, 10));
+          }
+
+          const [siteRows, dayRows, u24] = await Promise.all([
             // ⚠️ 刻意不用窗口函数取"每个站点的最新一条"（那是对 checks 全表分区排序）。
             //    最后一行的结果快照由落库路径同步写进 state（见 STATE_UPSERT），
             //    这里只是主键 LEFT JOIN —— 代价与历史数据量无关。
@@ -1171,61 +1154,41 @@ export default {
               )
               .bind(UNGROUPED)
               .all(),
+            // 30 天色条读按天物化表：每站每格 1 行，与明细量无关。
             d
               .prepare(
-                `SELECT site, date(ts, '${dayMod(env)}') AS d,
-                        COUNT(*) AS n, SUM(ok) AS ok
-                 FROM checks WHERE ts > ?
-                 GROUP BY site, d`
+                `SELECT site, day, n, ok, max_fail_run
+                 FROM checks_daily WHERE day >= ?`
               )
-              .bind(since30)
+              .bind(axis[axis.length - 1])
               .all(),
-            d
-              .prepare(
-                `SELECT COUNT(*) AS n, SUM(ok) AS ok FROM checks WHERE ts > ?`
-              )
-              .bind(since24)
-              .first(),
-            // 每站点近 24h 可用率（前台要显示"可用率"一列）
+            // 每站点近 24h 可用率（前台要显示"可用率"一列）。总计数由这里在内存里加总。
+            // 必须 INDEXED BY：默认优化器会为了省掉排序而选 (site, ts) 扫全表，
+            // 实测 1 站 30 天数据时是 43,201 行读；强制走 (ts, site, ok) 的覆盖索引后
+            // 只读窗口内的 4,689 行（含 GROUP BY 的临时表），差 9 倍。
             d
               .prepare(
                 `SELECT site, COUNT(*) AS n, SUM(ok) AS ok
-                 FROM checks WHERE ts > ? GROUP BY site`
+                 FROM checks INDEXED BY idx_checks_ts_site_ok
+                 WHERE ts > ? GROUP BY site`
               )
               .bind(since24)
               .all(),
-            // 失败明细的时间戳（30 天、全站点）—— 判断"某天是否真的连续故障"。
-            // 走 idx_checks_ok_ts_site，读失败行而非全部检查；正常情况只有个位数。
-            d
-              .prepare(
-                `SELECT site, date(ts, '${dayMod(env)}') AS d, ts
-                 FROM checks WHERE ts > ? AND ok = 0
-                 ORDER BY site, ts`
-              )
-              .bind(since30)
-              .all(),
           ]);
 
-          // 30 天日期轴。最左是今天，最右是最早；"今天"按 utc_offset_min 起算，
-          // 必须与上面 SQL 的 date(ts, dayMod) 用同一个偏移，否则会因跨 UTC 日而错位。
-          const axis = [];
-          for (let i = 0; i < days; i++) {
-            const t = new Date(Date.now() - i * 86400000 + dayOffsetMs(env));
-            axis.push(t.toISOString().slice(0, 10));
-          }
           const bySite = {};
           for (const r of dayRows.results || []) {
-            (bySite[r.site] = bySite[r.site] || {})[r.d] = r;
+            (bySite[r.site] = bySite[r.site] || {})[r.day] = r;
           }
 
           const u24map = {};
+          let n24 = 0;
+          let ok24 = 0;
           for (const r of u24.results || []) {
             u24map[r.site] = r.n ? Math.round((Number(r.ok) / Number(r.n)) * 1000) / 10 : null;
+            n24 += Number(r.n || 0);
+            ok24 += Number(r.ok || 0);
           }
-
-          // 失败行按站点归堆（SQL 已按 site, ts 排好，故站点内 ts 仍是有序的）
-          const failBySite = {};
-          for (const r of failRows.results || []) (failBySite[r.site] = failBySite[r.site] || []).push(r);
 
           const groups = {};
           const seen = new Set();
@@ -1233,13 +1196,12 @@ export default {
             const map = bySite[s.id] || {};
             // 色条颜色与「故障记录」同一口径：当天出现「连续失败 ≥ fail_threshold」
             // 的段才标红（fault）；只有零星抖动的天标黄（blip）。
-            const runMap = maxFailRunPerDay(failBySite[s.id], s.interval_min);
             const thr = Number(s.fail_threshold || 3);
             const bars = axis.map((dkey) => {
               const c = map[dkey];
               if (!c || !c.n) return { d: dkey, st: "none" };
               if (c.ok >= c.n) return { d: dkey, st: "up" };
-              return { d: dkey, st: Number(runMap[dkey] || 0) >= thr ? "fault" : "blip" };
+              return { d: dkey, st: Number(c.max_fail_run || 0) >= thr ? "fault" : "blip" };
             });
 
             // 三态判定：up / down / degraded（规则见 stateOf）
@@ -1285,8 +1247,7 @@ export default {
             }
           }
           const total = seen.size;
-          const uptime =
-            h24 && h24.n ? Math.round((Number(h24.ok) / Number(h24.n)) * 1000) / 10 : 100;
+          const uptime = n24 ? Math.round((ok24 / n24) * 1000) / 10 : 100;
 
           return json(
             {
@@ -1359,10 +1320,13 @@ export default {
           const hours = hoursFor;
           const days = daysFor;
           const since = new Date(Date.now() - hours * 3600 * 1000).toISOString();
-          const sinceD = new Date(Date.now() - days * 86400000).toISOString();
+          // 色条最早那一格（最右）：与下面 dkey 的生成方式同一个偏移
+          const oldestDay = new Date(Date.now() - (days - 1) * 86400000 + dayOffsetMs(env))
+            .toISOString()
+            .slice(0, 10);
           const bkt = bucketFor(hours);
 
-          const [meta, agg, seriesRows, recentRows, changeRows, dayRows, failRows] =
+          const [meta, agg, seriesRows, recentRows, changeRows, dayRows] =
             await Promise.all([
               // 配置 + 状态 + 最近一次 + SSL；最后一次结果只读 state，不再扫 checks。
               d
@@ -1431,24 +1395,13 @@ export default {
                 )
                 .bind(id, since)
                 .all(),
-              // ⑥ 按天聚合。偏移必须取 utc_offset_min，与首页色条口径一致
+              // ⑥ 按天汇总来自物化表 checks_daily，不再扫明细（30 天从 4 万行降到 30 行）。
               d
                 .prepare(
-                  `SELECT date(ts, '${dayMod(env)}') AS d, COUNT(*) AS n, SUM(ok) AS ok
-                   FROM checks WHERE site = ?1 AND ts > ?2
-                   GROUP BY d`
+                  `SELECT day, n, ok, max_fail_run
+                   FROM checks_daily WHERE site = ?1 AND day >= ?2`
                 )
-                .bind(id, sinceD)
-                .all(),
-              // ⑦ 失败明细的时间戳（30 天窗口）—— 只为判断「某天有没有真的连续故障」。
-              //    走 idx_checks_ok_ts_site，读的是失败行而不是全部检查。
-              d
-                .prepare(
-                  `SELECT date(ts, '${dayMod(env)}') AS d, ts
-                   FROM checks WHERE site = ?1 AND ts > ?2 AND ok = 0
-                   ORDER BY ts`
-                )
-                .bind(id, sinceD)
+                .bind(id, oldestDay)
                 .all(),
             ]);
 
@@ -1508,9 +1461,8 @@ export default {
           // 30 天色条（最左最新 → 最右最早，与首页一致）
           // 颜色语义与「故障记录」一致：只有出现「连续失败 ≥ fail_threshold」的段才算
           // 真故障（红，fault）；只有零星抖动的天是黄（blip），不再一律涂红。
-          const runMap = maxFailRunPerDay(failRows.results, intervalMin);
           const dayMap = {};
-          for (const r of dayRows.results || []) dayMap[r.d] = r;
+          for (const r of dayRows.results || []) dayMap[r.day] = r;
           const bars = [];
           for (let i = 0; i < days; i++) {
             const dkey = new Date(Date.now() - i * 86400000 + dayOffsetMs(env))
@@ -1524,7 +1476,7 @@ export default {
                   ? "none"
                   : Number(c.ok) >= Number(c.n)
                   ? "up"
-                  : Number(runMap[dkey] || 0) >= failThreshold
+                  : Number(c.max_fail_run || 0) >= failThreshold
                   ? "fault"
                   : "blip",
               n: c ? Number(c.n) : 0,

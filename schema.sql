@@ -4,7 +4,7 @@
 -- `src/schema.js` 供代码 import，那份是生成物不要手改。
 --
 -- 改结构时：版本号 +1，并在 src/migrations.js 补一条增量迁移（旧库才需要）。
--- schema-version: 1
+-- schema-version: 2
 
 CREATE TABLE IF NOT EXISTS sites (
   id             TEXT PRIMARY KEY,
@@ -34,9 +34,21 @@ CREATE TABLE IF NOT EXISTS checks (
 );
 -- 查询只有两种形态：「按站点取一段」与「按站点取最新」，故以 (site, ts) 为主力索引。
 CREATE INDEX IF NOT EXISTS idx_checks_site_ts ON checks(site, ts DESC);
-CREATE INDEX IF NOT EXISTS idx_checks_ts ON checks(ts DESC);
--- 取失败行专用：ok 放最左，让这类查询只读稀疏的失败行而非整段时间。
-CREATE INDEX IF NOT EXISTS idx_checks_ok_ts_site ON checks(ok, ts, site);
+-- 跨站点的按时间查询（清理过期行、近 24h 聚合）与详情页时间序列。
+-- 带上 site/ok 让 24h 聚合变成覆盖索引扫描，不回表 —— 少读一半。
+CREATE INDEX IF NOT EXISTS idx_checks_ts_site_ok ON checks(ts DESC, site, ok);
+
+-- 按天物化汇总：色条与按天统计的唯一数据源。
+-- 每次检查增量累加（每站每天 1 行），把「30 天色条」的读代价从
+-- 每站 4 万行（扫 checks）压到 30 行。max_fail_run 是当天最长连续失败段。
+CREATE TABLE IF NOT EXISTS checks_daily (
+  site         TEXT NOT NULL,
+  day          TEXT NOT NULL,        -- YYYY-MM-DD，按 utc_offset_min 划分
+  n            INTEGER NOT NULL DEFAULT 0,
+  ok           INTEGER NOT NULL DEFAULT 0,
+  max_fail_run INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (site, day)
+);
 
 -- 运行态。last_* 是最后一次结果的反范式缓存，避免每次展示都对 checks 跑窗口函数。
 -- last_checked_ts 供调度（只记自动探测）；last_ts 供展示（含手动测试）。

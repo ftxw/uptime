@@ -73,6 +73,14 @@ export async function cleanupOldChecks(env, keepDays = 30) {
   const d = await db(env);
   const cutoff = new Date(Date.now() - keepDays * 86400_000).toISOString();
   const r = await d.prepare("DELETE FROM checks WHERE ts < ?").bind(cutoff).run();
+  // 按天汇总每站每天只有 1 行，保留期给足 400 天（色条最多 90 天），
+  // 免得改小 check_keep_days 后历史色条也跟着消失。
+  const dayCutoff = new Date(Date.now() - 400 * 86400_000).toISOString().slice(0, 10);
+  await d
+    .prepare("DELETE FROM checks_daily WHERE day < ?")
+    .bind(dayCutoff)
+    .run()
+    .catch(() => {});
   return Number(r?.meta?.changes ?? r?.changes ?? 0);
 }
 
@@ -143,10 +151,17 @@ async function applySchema(env) {
   }
 
   // have === -1 是全新库，全量 DDL 已建出最新结构，再跑迁移只会撞 duplicate column。
+  let backfill = null;
   if (have >= 0) {
+    let tokens = null; // 只有语句里真带占位符才去读 meta，否则白多一次读
     for (const m of MIGRATIONS) {
       if (m.v <= have) continue;
-      for (const stmt of m.stmts) {
+      for (const raw of m.stmts) {
+        let stmt = raw;
+        if (raw.includes("{{")) {
+          tokens = tokens || (await migrationTokens(d));
+          stmt = raw.replace(/\{\{(\w+)\}\}/g, (all, k) => tokens[k] ?? all);
+        }
         try {
           await d.prepare(stmt).run();
         } catch (e) {
@@ -158,6 +173,10 @@ async function applySchema(env) {
         statements++;
       }
     }
+    // v2 的按天汇总回填。失败不能阻断自举：结构已经就位，色条先空白也比整站 500 好。
+    if (have < 2) {
+      backfill = await backfillDaily(d).catch((e) => ({ error: String((e && e.message) || e) }));
+    }
   }
 
   await d
@@ -168,7 +187,7 @@ async function applySchema(env) {
     .bind(SCHEMA_KEY, String(SCHEMA_VERSION))
     .run();
 
-  return { version: SCHEMA_VERSION, migrated: true, statements, from: have };
+  return { version: SCHEMA_VERSION, migrated: true, statements, from: have, backfill };
 }
 
 /**
@@ -183,6 +202,55 @@ async function readSchemaVersion(d) {
   } catch {
     return -1;
   }
+}
+
+/** 迁移语句里的占位符取值（迁移是静态声明，拿不到运行时设置，只能在这里补）。 */
+async function migrationTokens(d) {
+  let offsetMin = 480;
+  try {
+    const r = await d.prepare("SELECT value FROM meta WHERE key = 'utc_offset_min'").first();
+    const n = Number(r?.value);
+    if (Number.isFinite(n) && r?.value !== null && r?.value !== undefined && r?.value !== "") {
+      offsetMin = n;
+    }
+  } catch {
+    /* 读不到就用默认值：回填的历史格子可能偏一格，新数据不受影响 */
+  }
+  return {
+    DAY_MOD: `${offsetMin < 0 ? "-" : "+"}${Math.abs(offsetMin)} minutes`,
+    SINCE_31D: new Date(Date.now() - 31 * 86400_000).toISOString(),
+  };
+}
+
+/**
+ * 回填上限：超过这个行数就不做历史回填，只让新数据开始累积。
+ * 理由 —— 这条 SQL 要扫 6 遍明细（读约 6 倍行数），10 万行 ≈ 60 万行读，
+ * 占免费日额度 12%；不限的话一个 20 站的库升级当天就会把读额度打穿，
+ * 结果是整库拒绝查询（监控与后台一起挂），比「历史色条变灰」严重得多。
+ */
+const BACKFILL_MAX_ROWS = 100_000;
+
+/** v1 → v2：把明细分组成按天汇总。连续段用 gaps-and-islands，跨天切断。 */
+const backfillSql = (dayMod) => `WITH base AS (
+   SELECT site, ts, ok, date(ts, '${dayMod}') AS d FROM checks WHERE ts > '{{SINCE_31D}}'
+ ),
+ grp AS (SELECT site, d, ok, SUM(ok) OVER (PARTITION BY site, d ORDER BY ts) AS g FROM base),
+ runs AS (SELECT site, d, COUNT(*) AS run FROM grp WHERE ok = 0 GROUP BY site, d, g),
+ mx AS (SELECT site, d, MAX(run) AS m FROM runs GROUP BY site, d),
+ agg AS (SELECT site, d, COUNT(*) AS n, SUM(ok) AS ok FROM base GROUP BY site, d)
+ INSERT OR REPLACE INTO checks_daily (site, day, n, ok, max_fail_run)
+ SELECT agg.site, agg.d, agg.n, agg.ok, COALESCE(mx.m, 0)
+ FROM agg LEFT JOIN mx ON mx.site = agg.site AND mx.d = agg.d`;
+
+/** 返回 { rows, done }: rows 是明细行数，done=false 表示因规模超限被跳过。 */
+async function backfillDaily(d) {
+  const t = await migrationTokens(d);
+  const c = await d.prepare("SELECT COUNT(*) AS n FROM checks WHERE ts > ?").bind(t.SINCE_31D).first();
+  const rows = Number(c?.n || 0);
+  if (!rows) return { rows: 0, done: true };
+  if (rows > BACKFILL_MAX_ROWS) return { rows, done: false };
+  await d.prepare(backfillSql(t.DAY_MOD).replace("{{SINCE_31D}}", t.SINCE_31D)).run();
+  return { rows, done: true };
 }
 
 export async function loadSettings(env) {
@@ -300,7 +368,7 @@ function lastResultFields(info, nowIso) {
 }
 
 /**
- * 更新连续失败计数 + 最后一次结果快照。
+ * 更新连续失败计数 + 最后一次结果快照 + 当天的按天汇总。
  * 必须批量（否则一轮 N 站就是 2N 次往返），且每条都要 .bind() 后入 batch。
  */
 export async function bumpState(env, perSite) {
@@ -310,28 +378,54 @@ export async function bumpState(env, perSite) {
 
   const prev = await selectPrevState(d, ids);
   const nowIso = new Date().toISOString();
+  const offsetMs = dayOffsetMs(env);
+  const today = dayKey(nowIso, offsetMs);
   const batch = [];
 
   for (const site of ids) {
     const info = perSite[site];
-    const before = Number(prev[site]?.consecutive_fail || 0);
+    const p = prev[site];
+    const before = Number(p?.consecutive_fail || 0);
     const fail = info.ok ? 0 : before + 1;
 
-    batch.push(
-      d.prepare(STATE_UPSERT).bind(site, fail, nowIso, ...lastResultFields(info, nowIso))
-    );
+    batch.push(d.prepare(STATE_UPSERT).bind(site, fail, nowIso, ...lastResultFields(info, nowIso)));
+
+    // 当天连续段：跨过日界就从头数（宁可少标红），否则沿用全局连续数 ——
+    // 这样色条与圆点用的是同一个定义，不会出现「圆点红、色条黄」。
+    const sameDay = p?.last_checked_ts ? dayKey(p.last_checked_ts, offsetMs) === today : false;
+    const runToday = info.ok ? 0 : sameDay ? fail : 1;
+    batch.push(d.prepare(DAY_UPSERT).bind(site, today, info.ok ? 1 : 0, runToday));
   }
 
   for (const part of chunk(batch, BATCH_CHUNK)) await d.batch(part);
 }
 
-/** 批量取上一轮的连续失败计数（受 100 参数上限约束，需分片）。 */
+/** 当天的按天汇总：次数与成功数累加，连续失败段取当天最大。 */
+const DAY_UPSERT =
+  `INSERT INTO checks_daily (site, day, n, ok, max_fail_run) VALUES (?,?,1,?,?)
+   ON CONFLICT(site, day) DO UPDATE SET
+     n = n + 1,
+     ok = ok + excluded.ok,
+     max_fail_run = MAX(max_fail_run, excluded.max_fail_run)`;
+
+/** 日界：与 SQL 的 date(ts, '+480 minutes') 必须用同一偏移，否则格子会错位一格。 */
+function dayOffsetMs(env) {
+  const n = Number(env?.UTC_OFFSET_MIN);
+  const min = Number.isFinite(n) ? n : 480;
+  return min * 60000;
+}
+
+function dayKey(iso, offsetMs) {
+  return new Date(Date.parse(iso) + offsetMs).toISOString().slice(0, 10);
+}
+
+/** 批量取上一轮的连续失败计数与上次检查时间（受 100 参数上限约束，需分片）。 */
 async function selectPrevState(d, ids) {
   const prev = {};
   for (const part of chunk(ids, BIND_CHUNK)) {
     const ph = part.map(() => "?").join(",");
     const r = await d
-      .prepare(`SELECT site, consecutive_fail FROM state WHERE site IN (${ph})`)
+      .prepare(`SELECT site, consecutive_fail, last_checked_ts FROM state WHERE site IN (${ph})`)
       .bind(...part)
       .all();
     for (const row of r.results || []) prev[row.site] = row;
@@ -404,11 +498,21 @@ const SSL_UPSERT =
      expires_at=excluded.expires_at,
      error=excluded.error`;
 
+/**
+ * 自动探测用：同一站点的证书最多每 6 小时落库一次。
+ * 证书是分钟级几乎不变的数据，每次探测都写等于白白消耗写额度（每分钟 1 条 × 每站）。
+ * 条件放在 UPSERT 的 WHERE 里，不满足时 UPDATE 影响 0 行 —— 不产生写入、也不用额外读。
+ */
+const SSL_UPSERT_THROTTLED = `${SSL_UPSERT} WHERE ssl.checked_ts IS NULL OR ssl.checked_ts < ?`;
+const SSL_REFRESH_MS = 6 * 3600_000;
+
 function sslParams(siteId, r, ts) {
   return [
     siteId,
     ts,
-    r.authorized ?? null,
+    // 归一化成 0/1：布尔值不是所有 SQLite 绑定层都接受，一旦绑不上，
+    // 证书写入会被上层 catch 吞掉，表现为「证书永远不更新」。
+    r.authorized === null || r.authorized === undefined ? null : Number(r.authorized) ? 1 : 0,
     r.protocol ?? null,
     r.issuer ?? null,
     r.subject ?? null,
@@ -423,13 +527,14 @@ export async function saveSslBatch(env, entries) {
   if (!entries || !entries.length) return 0;
   const d = await db(env);
   const ts = new Date().toISOString();
-  const stmt = d.prepare(SSL_UPSERT);
-  const stmts = entries.map(([siteId, r]) => stmt.bind(...sslParams(siteId, r, ts)));
+  const cutoff = new Date(Date.now() - SSL_REFRESH_MS).toISOString();
+  const stmt = d.prepare(SSL_UPSERT_THROTTLED);
+  const stmts = entries.map(([siteId, r]) => stmt.bind(...sslParams(siteId, r, ts), cutoff));
   for (const part of chunk(stmts, BATCH_CHUNK)) await d.batch(part);
   return stmts.length;
 }
 
-/** 单个站点的证书结果（后台手动测试等单点场景） */
+/** 单个站点的证书结果（后台手动测试）：用户主动要看，跳过 6 小时节流。 */
 export async function saveSsl(env, siteId, r) {
   const d = await db(env);
   await d.prepare(SSL_UPSERT).bind(...sslParams(siteId, r, new Date().toISOString())).run();
