@@ -456,22 +456,32 @@ function stateOf(s, env) {
 }
 
 /**
- * 趋势图：窗口上限 24 小时，**节点就落在真实检查上**。
+ * 趋势图：窗口上限 24 小时，**每小时一个聚合值，用 25 个点画出 24 段**。
  *
- * 三条规则叠加：
+ * 为什么是 25 个点而不是 24：n 个 1 小时的槽有 n+1 个边界。只要两端都要精确 ——
+ * 首点 = 窗口左边界、末点 = 最后一次检查 —— 就必须有 n+1 个点。用 24 个点的话，
+ * 必然有一个边界空着：要么首点晚一小时（把最左那小时并进第二点），
+ * 要么末点早一小时（把最右那小时挂在左边点上）。
+ *
+ * 三条规则：
  *  ① 窗口右端 = 最后一次检查（不是 now），左端 = 再往前 24 小时（不超过首条记录）。
- *     用 now 收尾会让最后一条记录"缩"到右侧留白里，看着像数据停了。
- *  ② 每个点的横坐标 = 该桶**最后一条记录的时间**（SQL 的 MAX(ts)），
- *     不是桶起点 —— 桶起点会把 15:58 的检查画到 15:00 上。
- *  ③ 桶宽 = max(监测间隔, 跨度/24)，点数 ≤ 24：
- *     · 跨度/24 保证点数上限；
- *     · 不小于监测间隔保证桶里通常有记录，不会出现一串"节点没数据"的空格；
- *     · 记录数少于 24 时（如间隔 2 小时），点数就如实少于 24 —— 不补空点。
- *  桶序号从右端往回数（b=0 是最新一桶），这样最后一条记录天然落在 b=0，
- *  不会因为"正好在右端"被夹进上一桶而把最后一段间隔撑成 1.5 倍。
+ *     用 now 收尾会让最后一条记录"缩"在右侧留白里，看着像数据停了。
+ *  ② 每个点站在槽的边界上，值取它**右边**那个槽的聚合值；最后一个边界沿用最右槽，
+ *     于是最右 1 小时是平的 —— 那正是这一段的数据。
+ *  ③ 槽宽 = max(监测间隔, 跨度/24)，槽数 ≤ 24：
+ *     · 跨度/24 保证槽数上限（满窗口时正好 24 个 1 小时槽）；
+ *     · 不小于监测间隔保证槽里通常有记录，不会出现一串空槽；
+ *     · 数据不足 24 小时时槽宽变小、槽数变少，整段区间被平分。
+ *
+ * 槽序号从右端往回数（b=0 是最新一槽）：正向数时最后一条记录恰好落在窗口右端，
+ * (ts-start)/槽宽 会等于槽数，只能夹进最后一槽 —— 那一槽白吃两倍宽度，
+ * 最后一段的间隔会变成 1.5 倍。
+ *
+ * 空槽**保留**（n=0、v=null）：时间轴长度恒定，停测显示成断口，
+ * 而不是把两侧的数据点直接连起来假装这段时间有数据。
  */
 const TREND_HOURS = 24;
-/** 窗口满 24 小时时每个桶的宽度（秒）。不满时由 span/24 与监测间隔现算。 */
+/** 满窗口时每个槽的宽度（秒）。数据不足 24 小时时由 跨度/槽数 现算。 */
 const TREND_BUCKET_SEC = 3600;
 
 /** 色条最多能要几天 = min(90, 明细保留天数)，超出的格子必然永远是空的。 */
@@ -1617,36 +1627,36 @@ export default {
             firstSec > 0
               ? Math.max(endSec - TREND_HOURS * TREND_BUCKET_SEC, firstSec) // 老站点仍按 24h
               : endSec - TREND_HOURS * TREND_BUCKET_SEC; // 一条记录都没有
-          const spanSec = Math.max(60, endSec - startSec);
-          // 桶宽：满足两个约束
-          //  ① 不超过「跨度 / 24」→ 点数 ≤ 24；
-          //  ② 不小于该站点的监测间隔 → 每个桶里通常都有记录，不会出现一串"节点没数据"的空格。
-          //     （间隔 5 分钟 + 只有 40 分钟数据时，若按 span/24 切是 100 秒/桶，
-          //       8 条记录会散落在 24 个桶里，16 个桶是空的 —— 那条曲线看着就是断的。）
+          // 真实跨度：0 表示只有一条记录（或一条都没有），此时不该虚构时间轴
+          const realSpanSec = Math.max(0, endSec - startSec);
+          const spanSec = Math.max(60, realSpanSec);
+          // 槽宽：满足两个约束
+          //  ① 不超过「跨度 / 24」→ 槽数 ≤ 24（左端随后正好落在窗口起点）；
+          //  ② 不小于该站点的监测间隔 → 每个槽里通常都有记录，不会出现一串"节点没数据"的空格。
+          //     （间隔 5 分钟 + 只有 40 分钟数据时，若按 span/24 切是 100 秒/槽，
+          //       8 条记录会散落在 24 个槽里，16 个槽是空的 —— 那条曲线看着就是断的。）
           const ivSec = Math.max(60, Math.round(Number(meta.interval_min || 5) * 60));
           const bucketSec = Math.max(ivSec, Math.ceil(spanSec / TREND_HOURS));
           const nBuckets = Math.max(1, Math.min(TREND_HOURS, Math.ceil(spanSec / bucketSec)));
           const since = new Date(startSec * 1000).toISOString();
 
           const [seriesRows, recentRows, changeRows, dayRows] = await Promise.all([
-              // ② 延迟时间序列：按桶聚合，**桶从窗口右端（最后一次检查）往回数**。
+              // ② 延迟按槽聚合，**槽从窗口右端（最后一次检查）往回数**。
               //    窗口合计（n / 成功数 / 平均响应）也从这里在内存里加总 —— 同一个窗口
               //    只扫一遍，可用率与曲线天然同源。
-              //    SUM(ttfb) 让总体均值保持精确（不是"各桶均值的平均"）。
-              //    MAX(ts) AS t_end：这一桶最后一条记录的真实时间，直接当横坐标用 ——
-              //    桶起点只是聚合边界，拿它当坐标会把「15:58 的检查」画到 15:00 上。
-              //    为什么反向数：正向（从 startSec 数）时，最后一条记录恰好落在窗口右端，
-              //    (ts-start)/bucketSec 正好等于 nBuckets，只能夹进最后一桶 ——
-              //    那一桶就白吃了两倍宽度，图上最后一段的间隔会变成 1.5 倍。
-              //    以 endSec 为 0 往回数，最后一条记录天然是 b=0，间隔严格等于桶宽。
+              //    SUM(ttfb) 让总体均值保持精确（不是"各槽均值的平均"）。
+              //    MIN(?4, ...) 夹取：首条记录可能落在第 nBuckets 格里（跨度不是槽宽整数倍），
+              //    不夹会凭空多出一槽。
+              //    为什么反向数：正向时最后一条记录恰好落在窗口右端，
+              //    (ts-start)/bucketSec 正好等于槽数，只能夹进最后一槽 ——
+              //    那一槽白吃两倍宽度，图上最后一段的间隔会变成 1.5 倍。
               d
                 .prepare(
                   `SELECT MIN(?4, CAST((?5 - strftime('%s', substr(ts,1,19))) / ?3 AS INTEGER)) AS b,
                           COUNT(*) AS n, SUM(ok) AS okl,
                           CAST(AVG(CASE WHEN ok=1 THEN ttfb_ms END) AS INTEGER) AS av,
                           MAX(CASE WHEN ok=1 THEN ttfb_ms END) AS mx,
-                          SUM(CASE WHEN ok=1 THEN ttfb_ms END) AS tsum,
-                          MAX(ts) AS t_end
+                          SUM(CASE WHEN ok=1 THEN ttfb_ms END) AS tsum
                    FROM checks WHERE site = ?1 AND ts >= ?2
                    GROUP BY b ORDER BY b DESC`
                 )
@@ -1686,29 +1696,60 @@ export default {
 
           const { state, degrade_reason, ssl } = stateOf(meta, env);
 
-          // 每个桶 → 一个点，横坐标取该桶**最后一条真实检查**的时间（r.t_end）。
-          // 不再补空桶：空桶没有时间戳可站，补出来的点只会让曲线在"没测的时段"上凭空画一段。
-          // 窗口合计在这同一次扫描里累加 —— 曲线、可用率、平均响应三者必然同源。
-          const series = [];
+          // ── 槽 → 边界点：nBuckets 个 1 小时槽 → nBuckets + 1 个点 ──
+          // 点站在槽的边界上，值取它右边那个槽；最后一个点（窗口右端）沿用最右槽，
+          // 所以最右 1 小时是平的 —— 那正是这一段的数据，不是补出来的。
+          // 空槽保留成 n=0 / v=null：时间轴长度恒定，停测画成断口，
+          // 而不是把两侧的数据点直接连起来假装这段时间测过。
+          // 窗口合计仍按槽累加（每个槽只算一次，与点数无关）。
+          const byB = new Map();
+          for (const r of seriesRows.results || []) byB.set(Number(r.b), r);
+
           let n = 0;
           let okl = 0;
           let tsum = 0;
           for (const r of seriesRows.results || []) {
-            const bn = Number(r.n || 0);
-            const bok = Number(r.okl || 0);
-            n += bn;
-            okl += bok;
+            n += Number(r.n || 0);
+            okl += Number(r.okl || 0);
             tsum += Number(r.tsum || 0);
-            series.push({
-              t: r.t_end,
-              n: bn,
-              ok: bok,
-              // v 为成功请求的平均延迟；整桶都失败时为 null（前端在此断开折线）
-              v: r.av === null || r.av === undefined ? null : Number(r.av),
-              max: r.mx,
-            });
           }
-          // 均值 = Σ(成功请求的 ttfb) / 成功次数 —— 精确，不是"各桶均值的平均"
+
+          // 端点用**精确时间**（带毫秒）：末点必须和 window.last_check_ts 完全一致，
+          // 否则前端写「截至 HH:MM:SS」与末点会差几百毫秒。
+          const startMs = startSec * 1000;
+          const endMs =
+            lastSec > 0
+              ? Math.min(Date.now(), Date.parse(meta.last_check))
+              : nowSec * 1000;
+          const stepMs = realSpanSec > 0 ? (endMs - startMs) / nBuckets : 0;
+          const mkPoint = (tMs, r) => ({
+            t: new Date(tMs).toISOString(),
+            n: r ? Number(r.n || 0) : 0,
+            ok: r ? Number(r.okl || 0) : 0,
+            // v = 该槽成功请求的平均延迟；整槽全失败或空槽为 null（前端在此断线）
+            v: r && r.av != null ? Number(r.av) : null,
+            max: r && r.mx != null ? Number(r.mx) : null,
+          });
+
+          const series = [];
+          if (lastSec > 0) {
+            if (realSpanSec <= 0) {
+              // 只有一条记录：就画一个点。为了凑时间轴而虚构 24 小时的跨度，
+              // 会让一个点孤零零贴在左边或右边，反而像数据丢了。
+              series.push(mkPoint(endMs, byB.get(0)));
+            } else {
+              for (let i = 0; i <= nBuckets; i++) {
+                // i 从左端往右；槽从左到右是 b = nBuckets-1 … 0。
+                // 最后一个边界右边没有槽了，沿用最右槽（b=0），所以最右 1 小时是平的
+                // —— 那正是这一段的数据，不是补出来的。
+                const b = i === nBuckets ? 0 : nBuckets - 1 - i;
+                series.push(mkPoint(Math.round(startMs + i * stepMs), byB.get(b)));
+              }
+            }
+          }
+          // 一条记录都没有时 series 为空，前端显示「暂无数据」——
+          // 不下发一排 n=0 的假点，那只会让人以为"测过但全挂了"。
+          // 均值 = Σ(成功请求的 ttfb) / 成功次数 —— 精确，不是"各槽均值的平均"
           const avgTtfb = okl ? Math.round(tsum / okl) : null;
 
           const intervalMin = Number(meta.interval_min || 5);
@@ -1818,7 +1859,7 @@ export default {
                 hours: TREND_HOURS,
                 // 实际跨度：满 24 小时就是 86400；不满则等于「首条记录 → 最后一次检查」
                 span_sec: spanSec,
-                // 实际点数（每点 = 一个桶，横坐标是该桶最后一条检查的时间）
+                // 实际点数 = 槽数 + 1（要含两端边界，满窗口时正好 25）
                 points: series.length,
                 // 窗口右端 = 最后一次检查。前端据此写「截至 HH:MM:SS」，
                 // 让"曲线为什么停在那里"有解释（而不是让人以为数据丢了）。

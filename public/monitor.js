@@ -148,8 +148,9 @@ function renderKpis(d) {
 
 function renderChart(series, hours) {
   const box = qs("#chart");
-  // 服务端只下发「有记录」的桶（每点的 t = 该桶最后一条检查的时间），
-  // 所以长度即点数，最多 24 个；空时段不会伪造出节点。
+  // 服务端下发「槽的边界点」：n 个 1 小时槽 → n+1 个点（满窗口 25 个）。
+  // 首点 = 窗口左边界，末点 = 最后一次检查，两端由服务端算好，这里只按坐标画。
+  // 空槽（n=0）保留下来，v 为 null → 折线断开，时间轴长度恒定。
   const pts = series || [];
   if (!pts.length || !pts.some((p) => p.n > 0)) {
     box.innerHTML = '<div class="chart-empty">暂无数据 —— 该窗口内还没有检查记录</div>';
@@ -201,13 +202,11 @@ function renderChart(series, hours) {
     }" text-anchor="${anchor}">${fmtAxis(t, hours)}</text>`;
   }
 
-  // 折线 + 面积：全失败的桶（v 为 null）处断开，不虚构数值。
-  // 服务端只会给出「有记录」的桶，所以这里不必再处理空桶 —— 没有测过的时段
-  // 本来就没有节点，连起来才是编造数据。
+  // 折线 + 面积：v 为 null 时断开 —— 包括「整槽全失败」和「空槽（停测）」两种情况，
+  // 两者都不该用一条直线连过去假装这段时间有数据。
   const segs = [];
   let cur = [];
   for (const p of pts) {
-    if (!p.n) continue;
     if (p.v == null) {
       if (cur.length) {
         segs.push(cur);
@@ -462,9 +461,9 @@ const TREND_HOURS = 24;
 // 带版本号：缓存里含站点 URL，而 hide_url 改完就不该再让访客看到 ——
 // 换 key 让旧副本（url 还是明文的那份）一次作废，避免首帧抢先渲染出地址。
 // 与 app.js 的 CACHE_KEY 同一处理，改缓存字段语义时两处一起 bump。
-// v4：series 的点改为「桶内最后一条检查的时间」（不再是桶起点），且只含有数据的桶，
-//     旧副本会把节点画在整点边界上，整份作废。
-const cacheKey = () => `uptime:site:v4:${SITE_ID}`;
+// v7：series 从「每槽一个点（只含有数据的槽）」改成「槽的边界点」（n 个槽 → n+1 个点，
+//     含空槽）。旧副本点数与首末位置都不同，整份作废。
+const cacheKey = () => `uptime:site:v7:${SITE_ID}`;
 
 function render(d) {
   if (!d || !d.ok) return;
