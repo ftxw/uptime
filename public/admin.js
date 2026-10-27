@@ -397,6 +397,8 @@ async function loadAll() {
 
   renderCats();
   await renderRows();
+  // 额度账随「站点数 / 间隔 / 是否配 Token」变，这三者都由 /admin 带回，故在这里统一重算
+  renderQuota();
 }
 
 /* ── 分类：切换 / 新建 / 改名 / 删除 / 排序 ─────────────── */
@@ -936,47 +938,130 @@ function fmtEta(iso) {
 }
 
 /**
- * 设置面板的探针状态行，两件事：
- *  ① 额度估算：Σ(60 / 间隔) × 每次点数 vs 上限（令牌 500、匿名 250 点/小时）。
- *     这是本项目最容易踩的坑 —— 默认 1 分钟间隔 + 3 点，匿名额度只够 1 个站点。
- *     把账当场算给用户看，比让他从"所有站点都变黄"倒推原因强得多。
- *  ② 最近一次成功 / 失败 / 是否在退避窗口 —— 站点显示"探针无结论"时能立刻分清原因。
+ * 设置面板的探针状态行：最近一次成功 / 失败 / 是否在 429 退避窗口内。
+ * 站点显示「探针连续 N 轮无结论」时，这一行能立刻分清是 GP 挂了、凭据错了，还是额度用光。
+ * （额度估算不在这里 —— 它按站点与间隔算，挪到列表底部常驻，见 renderQuota）
  */
 function renderProbeInfo() {
   const el = qs("#s-probe");
   if (!el) return;
+  const p = PROBE || {};
+  let text;
+  let warn = false;
+  if (p.blocked_until) {
+    text = `探针状态：额度退避中，${fmtEta(p.blocked_until)}后恢复`;
+    warn = true;
+  } else if (p.last_error) {
+    text = `探针状态：最近一次发起失败（${relTime(p.last_error_ts)}）｜${p.last_error}`;
+    warn = true;
+  } else if (p.last_ok_ts) {
+    text = `探针状态：最近一次发起成功 ${relTime(p.last_ok_ts)}`;
+  } else {
+    text = "探针状态：还没有发起过测量";
+  }
+  el.textContent = text;
+  el.style.color = warn ? "hsl(var(--destructive))" : "";
+}
+
+/**
+ * Globalping 额度账：按当前**启用站点 × 各自监测间隔 × 每次探测点数**折算消耗，
+ * 再和额度（配了 Token 500 点/小时，否则 250）比，算出「这套配置能连续跑多久」。
+ *
+ * 单位说明：Globalping 的额度按探测点数计费（一次测量 limit 点 = limit 点额度），
+ * 所以「每小时消耗 = Σ(60 / 间隔分钟) × limit」。这也是本项目最容易踩的坑：
+ * 默认 1 分钟间隔 + 3 点，匿名额度只够 1 个站点。
+ *
+ * @param limitOverride 设置面板里刚改动、尚未保存的 gp_limit（不写回 SETTINGS，取消即失效）
+ */
+function quotaStats(limitOverride) {
   const s = SETTINGS || {};
-  const limit = Number(s.gp_limit) || 3;
-  const cap = s.has_globalping_token ? 500 : 250;
+  const limit = Number(limitOverride ?? s.gp_limit) || 3;
+  const token = Boolean(s.has_globalping_token);
+  const cap = token ? 500 : 250;
 
   let n = 0;
-  let points = 0;
+  let need = 0;
   for (const site of SITES) {
     if (site.enabled === 0 || site.enabled === false) continue;
+    const iv = Math.max(1, Number(site.interval_min) || 5);
     n++;
-    points += (60 / Math.max(1, Number(site.interval_min) || 5)) * limit;
+    need += (60 / iv) * limit;
   }
-  const need = Math.round(points);
-  const over = need > cap * 0.9;
 
-  const parts = [`额度估算：${n} 个站点 × 每次 ${limit} 点 → 约 ${need} 点/小时，上限 ${cap}`];
-  if (over) parts.push("已接近/超出上限，站点会开始排队");
+  const perSite = n ? need / n : 0;
+  return {
+    n,
+    need: Math.round(need),
+    limit,
+    cap,
+    token,
+    // 额度被耗尽所需分钟数。need > cap 时必然 < 60，即「一小时里只跑得动一段」
+    minutes: need > 0 ? (60 * cap) / need : Infinity,
+    // 这套额度长期能养活的站点数（按当前平均消耗）
+    fit: perSite > 0 ? Math.floor(cap / perSite) : 0,
+  };
+}
 
-  const p = PROBE || {};
-  if (p.blocked_until) parts.push(`额度退避中，${fmtEta(p.blocked_until)}重试`);
-  else if (p.last_error) parts.push(`最近错误：${p.last_error}`);
-  else if (p.last_ok_ts) parts.push(`最近一次发起成功：${relTime(p.last_ok_ts)}`);
+/** 把额度账写成一句话，贴在站点列表底部（常驻，不必打开设置面板）。 */
+function renderQuota(limitOverride) {
+  const el = qs("#quota");
+  if (!el) return;
+  const q = quotaStats(limitOverride);
+  const fmt = (x) => Math.round(x).toLocaleString("zh-CN");
 
-  el.textContent = parts.join(" · ");
-  el.style.color = over || p.blocked_until || p.last_error ? "hsl(var(--destructive))" : "";
+  if (!q.n) {
+    el.textContent = "Globalping 额度：暂无启用中的站点，不会消耗额度。";
+    el.style.color = "";
+    return;
+  }
+
+  const capText = q.token
+    ? `额度 ${q.cap} 点/小时（已配置 Token）`
+    : `额度 ${q.cap} 点/小时（未配置 Token，配置后可翻倍到 500）`;
+  const head = `Globalping 额度：${q.n} 个站点、每次 ${q.limit} 点，合计约 ${fmt(
+    q.need
+  )} 点/小时；${capText}`;
+
+  if (q.need <= q.cap) {
+    const pct = Math.round((q.need / q.cap) * 100);
+    const spare = q.fit - q.n;
+    const tail =
+      spare > 0
+        ? `，还能再加约 ${spare} 个站点（按当前平均消耗算）`
+        : "，已接近上限，再加站点就会开始排队";
+    el.textContent = `${head} → 占 ${pct}%，可以一直按设定间隔跑${tail}。`;
+    // ≥90% 就提前标红：等真的撞上 429 再提示，站点已经黄了一片
+    el.style.color = pct >= 90 ? "hsl(var(--destructive))" : "";
+    return;
+  }
+
+  // 超额：额度会在 X 分钟后耗尽，之后整段时间被拉长 —— 这才是用户问的「能跑多久」
+  const mins = Math.max(1, Math.round(q.minutes));
+  const factor = (q.need / q.cap).toFixed(1);
+  const fitText =
+    q.fit >= 1
+      ? `这套额度长期只够 ${q.fit} 个同配置站点`
+      : "单站就已超出，建议调大间隔或把每次点数改成 1";
+  el.textContent =
+    `${head} → 约 ${mins} 分钟就会耗尽，之后要等额度窗口重置；` +
+    `期间实际监测间隔会被拉长到约 ${factor} 倍（${fitText}）。`;
+  el.style.color = "hsl(var(--destructive))";
 }
 
 qs("#settings-open").addEventListener("click", openSettings);
 
-// 改「每次探测点数」时当场重算额度（不必先保存再看结果）
+// 改「每次探测点数」时当场重算额度（不必先保存再看结果）。
+// 不写回 SETTINGS：取消对话框后，列表底部那行仍按已保存的值显示。
 qs("#s-limit").addEventListener("change", () => {
-  if (SETTINGS) SETTINGS.gp_limit = qs("#s-limit").value;
+  const v = qs("#s-limit").value;
   renderProbeInfo();
+  renderQuota(v);
+});
+
+// 关掉设置面板（含「取消」）：丢掉未保存的 gp_limit，底部额度行回到已保存的口径
+setdlg.addEventListener("close", () => {
+  renderProbeInfo();
+  renderQuota();
 });
 
 /** 「清除 Token」是删除已配置 Token 的唯一入口。 */

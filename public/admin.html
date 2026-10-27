@@ -105,6 +105,10 @@
     站点顺序、分类顺序都在列表里直接拖动调整（站点需先在左侧选中一个分类）。
     删除站点会同时清掉它的探测明细、证书与状态（不可撤销）。
   </p>
+
+  <!-- 额度估算：按「当前启用站点 × 各自间隔 × 每次探测点数」反推 Globalping 额度能撑多久。
+       由 admin.js 的 renderQuota() 填充；站点/间隔/Token 任一变化都会重算。 -->
+  <p id="quota" style="font-size:12px;margin:8px 0 0;line-height:1.6"></p>
 </main>
 
 <!-- ══════════ 站点表单 ══════════ -->
@@ -266,8 +270,8 @@
       </div>
 
       <h3 class="set-group">探测</h3>
-      <!-- 探针健康 + 额度估算：由 admin.js 的 renderProbeInfo() 填充。
-           站点变黄"探针连续 N 轮无结论"时，这一行能立刻分清是 GP 挂了、额度用光了，还是配置太密。 -->
+      <!-- 探针健康（最近一次成功/失败/429 退避），由 admin.js 的 renderProbeInfo() 填充。
+           额度估算不在这里 —— 它随站点与间隔变化，常驻在站点列表底部（#quota）。 -->
       <p class="hint" id="s-probe" style="margin:-4px 0 12px"></p>
       <div class="grid-2">
         <div class="field">
