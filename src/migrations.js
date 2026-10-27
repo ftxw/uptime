@@ -17,4 +17,9 @@ export const MIGRATIONS = [
     v: 2,
     stmts: ["DROP INDEX IF EXISTS idx_checks_ok_ts_site"],
   },
+  {
+    // 探针「无结论」计数。旧库补列后全部为 0，等价于「目前没有观察到静默」。
+    v: 3,
+    stmts: ["ALTER TABLE state ADD COLUMN void_streak INTEGER NOT NULL DEFAULT 0"],
+  },
 ];

@@ -6,7 +6,8 @@ const API = "/api/overview";
 // ⚠️ 带版本号：这份缓存里含站点 URL，而 hide_url 是"改完就不该再让访客看到"的东西 ——
 //    老缓存（改之前抓的、url 还是明文）会在首帧抢先渲染出来。换 key 让旧副本一次作废，
 //    代价只是老访客多等一次网络（新访客不受影响）。改缓存里的字段语义时就 bump 这里。
-const CACHE_KEY = "uptime:overview:v2";
+//    v4：可用率口径回到"最近 24 小时（滚动）"，与详情页趋势图同源；旧副本整份作废。
+const CACHE_KEY = "uptime:overview:v4";
 
 /* 分类：GROUPS 为接口返回的全部分组，FILTER 为空表示"全部" */
 let GROUPS = [];
@@ -56,7 +57,8 @@ function renderStats(s) {
     { label: "运行中", value: s.up, icon: "up", cls: "i-success" },
     { label: "离线", value: s.down, icon: "down", cls: "i-destructive" },
     {
-      label: "可用率",
+      // 口径是「最近 24 小时（滚动）」—— 与详情页趋势图同一个窗口、同一批行。
+      label: "24 小时可用率",
       value: (s.uptime_24h ?? 100).toFixed(1) + "%",
       icon: "shield",
       cls: "i-primary",
@@ -149,7 +151,7 @@ function monitorRow(m) {
         <span class="k">SSL</span>
         <span class="v">${svg("shield", sslIcon)}${sslText}</span>
       </div>
-      <div class="metric">
+      <div class="metric" title="最近 24 小时">
         <span class="k">可用率</span>
         <span class="v">${m.uptime_24h != null ? m.uptime_24h.toFixed(1) + "%" : "--"}</span>
       </div>

@@ -30,6 +30,12 @@ export function randomHex(bytes = 32) {
   return toHex(buf);
 }
 
+/** SHA-256 十六进制摘要。登录失败计数用它把来源 IP 变成不可逆的短键（不落明文地址）。 */
+export async function sha256Hex(input) {
+  const buf = await crypto.subtle.digest("SHA-256", encoder.encode(String(input ?? "")));
+  return toHex(new Uint8Array(buf));
+}
+
 /* ───────────────────────── 会话 ───────────────────────── */
 
 function b64urlEncode(bytes) {

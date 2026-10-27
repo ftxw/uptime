@@ -4,7 +4,7 @@
 -- `src/schema.js` 供代码 import，那份是生成物不要手改。
 --
 -- 改结构时：版本号 +1，并在 src/migrations.js 补一条增量迁移（旧库才需要）。
--- schema-version: 2
+-- schema-version: 3
 
 CREATE TABLE IF NOT EXISTS sites (
   id             TEXT PRIMARY KEY,
@@ -55,6 +55,10 @@ CREATE TABLE IF NOT EXISTS checks_daily (
 CREATE TABLE IF NOT EXISTS state (
   site             TEXT PRIMARY KEY,
   consecutive_fail INTEGER NOT NULL DEFAULT 0,
+  -- 「拿不到结论」的连续轮数：探针全灭 / 平台故障 / 收取失败时 +1，成功落一条记录时清零。
+  -- 没有它的话，Globalping 挂掉的所有站点都会永远停在最后一次的「正常」，
+  -- 页面只是「X 分钟前」越变越大 —— 用户无法区分「站点好了」和「我们瞎了」。
+  void_streak      INTEGER NOT NULL DEFAULT 0,
   last_checked_ts  TEXT,
   last_ok          INTEGER,  -- 1 正常 / 0 故障
   last_status      INTEGER,

@@ -266,6 +266,9 @@
       </div>
 
       <h3 class="set-group">探测</h3>
+      <!-- 探针健康 + 额度估算：由 admin.js 的 renderProbeInfo() 填充。
+           站点变黄"探针连续 N 轮无结论"时，这一行能立刻分清是 GP 挂了、额度用光了，还是配置太密。 -->
+      <p class="hint" id="s-probe" style="margin:-4px 0 12px"></p>
       <div class="grid-2">
         <div class="field">
           <label for="s-gp-token">Globalping Token</label>

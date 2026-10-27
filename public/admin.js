@@ -16,6 +16,7 @@ let DRAG_CAT = null;     // 正在拖拽的分类名
 let DRAG_SITE = null;    // 正在拖拽的站点 id
 let AUTHED = false;
 let SETTINGS = null;     // /admin 一次性带回的设置，用于设置面板预填
+let PROBE = null;        // /admin 带回的探针健康（最近一次成功/失败/额度退避窗口）
 // 证书结果不再单独一张 map：/admin 已把 ssl_* 摊平在每个站点行里（见 sslCell）。
 // 原先既发整张 map 又发扁平字段，同一份证书在一个响应里出现两遍，体积近乎翻倍。
 
@@ -391,6 +392,7 @@ async function loadAll() {
   SITES = sortSites(d.sites || []);
   CATS = d.categories || [];
   if (d.settings) SETTINGS = d.settings; // 供设置面板预填，打开时不必先等网络
+  PROBE = d.probe || null;
   applyBrandTitle(SETTINGS);
 
   renderCats();
@@ -922,9 +924,60 @@ function fillSettingsForm(s) {
   qs("#s-gp-token-hint").textContent = s.has_globalping_token
     ? `已配置：${s.globalping_token_masked}（留空则保留）`
     : "未配置（额度 250 次/小时；配置后 500 次/小时）";
+  renderProbeInfo();
+}
+
+/** 倒计时文案（用于额度退避截止时间）。relTime 会把未来时间夹成"0 秒前"。 */
+function fmtEta(iso) {
+  const s = Math.round((new Date(iso).getTime() - Date.now()) / 1000);
+  if (!Number.isFinite(s)) return "—";
+  if (s <= 0) return "即将恢复";
+  return s < 60 ? `${s} 秒后` : `${Math.ceil(s / 60)} 分钟后`;
+}
+
+/**
+ * 设置面板的探针状态行，两件事：
+ *  ① 额度估算：Σ(60 / 间隔) × 每次点数 vs 上限（令牌 500、匿名 250 点/小时）。
+ *     这是本项目最容易踩的坑 —— 默认 1 分钟间隔 + 3 点，匿名额度只够 1 个站点。
+ *     把账当场算给用户看，比让他从"所有站点都变黄"倒推原因强得多。
+ *  ② 最近一次成功 / 失败 / 是否在退避窗口 —— 站点显示"探针无结论"时能立刻分清原因。
+ */
+function renderProbeInfo() {
+  const el = qs("#s-probe");
+  if (!el) return;
+  const s = SETTINGS || {};
+  const limit = Number(s.gp_limit) || 3;
+  const cap = s.has_globalping_token ? 500 : 250;
+
+  let n = 0;
+  let points = 0;
+  for (const site of SITES) {
+    if (site.enabled === 0 || site.enabled === false) continue;
+    n++;
+    points += (60 / Math.max(1, Number(site.interval_min) || 5)) * limit;
+  }
+  const need = Math.round(points);
+  const over = need > cap * 0.9;
+
+  const parts = [`额度估算：${n} 个站点 × 每次 ${limit} 点 → 约 ${need} 点/小时，上限 ${cap}`];
+  if (over) parts.push("已接近/超出上限，站点会开始排队");
+
+  const p = PROBE || {};
+  if (p.blocked_until) parts.push(`额度退避中，${fmtEta(p.blocked_until)}重试`);
+  else if (p.last_error) parts.push(`最近错误：${p.last_error}`);
+  else if (p.last_ok_ts) parts.push(`最近一次发起成功：${relTime(p.last_ok_ts)}`);
+
+  el.textContent = parts.join(" · ");
+  el.style.color = over || p.blocked_until || p.last_error ? "hsl(var(--destructive))" : "";
 }
 
 qs("#settings-open").addEventListener("click", openSettings);
+
+// 改「每次探测点数」时当场重算额度（不必先保存再看结果）
+qs("#s-limit").addEventListener("change", () => {
+  if (SETTINGS) SETTINGS.gp_limit = qs("#s-limit").value;
+  renderProbeInfo();
+});
 
 /** 「清除 Token」是删除已配置 Token 的唯一入口。 */
 qs("#s-gp-token-clear").addEventListener("click", async () => {

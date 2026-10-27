@@ -67,12 +67,9 @@
   <div class="card glass">
     <div class="sec-head">
       <h2>响应时间趋势</h2>
-      <div class="seg" id="range">
-        <button data-h="6">6 小时</button>
-        <button data-h="24" class="on">24 小时</button>
-        <button data-h="168">7 天</button>
-        <button data-h="720">30 天</button>
-      </div>
+      <!-- 窗口由服务端决定：上限 24 小时，不满 24 小时则从首条记录算起，
+           把这段区间均分成 24 个点（所以桶宽会随数据量变大，直到稳定在 1 小时）。 -->
+      <span class="muted" style="font-size:12px">最近 24 小时 · 24 个点</span>
     </div>
     <div class="sec-body">
       <div class="chart-wrap" id="chart"></div>
@@ -82,7 +79,6 @@
            以后调主色或故障色时必然出现"图例是旧色、图上是新色"。 -->
       <span><i style="background:hsl(var(--primary))"></i>平均响应时间</span>
       <span><i style="background:hsl(var(--destructive))"></i>该时段存在失败</span>
-      <span class="muted" id="bucket"></span>
     </div>
   </div>
 
@@ -148,14 +144,17 @@
     return '<div style="min-width:0">' + lines + "</div>";
   };
 
-  // 5 张指标卡（顺序与 renderKpis 完全一致：可用率 / SSL 证书 / 检查间隔 / 平均响应 / 失败次数）
-  put("kpis", ["可用率", "SSL 证书", "检查间隔", "平均响应", "失败次数"].map(function (label) {
-    return card(
-      '<div class="stat-icon i-muted"></div>' +
-        body('<p class="stat-label">' + sk(label) + '</p><p class="stat-value">' + sk("000 ms") + "</p>"),
-      "stat"
-    );
-  }).join(""));
+  // 4 张指标卡（顺序与 renderKpis 完全一致：可用率 / 检查间隔 / SSL 证书 / 平均响应）
+  put(
+    "kpis",
+    ["可用率", "检查间隔", "SSL 证书", "平均响应"].map(function (label) {
+      return card(
+        '<div class="stat-icon i-muted"></div>' +
+          body('<p class="stat-label">' + sk(label) + '</p><p class="stat-value">' + sk("000 ms") + "</p>"),
+        "stat"
+      );
+    }).join("")
+  );
 
   // 图表：整块灰底（高度由 .chart-wrap 的 min-height:260px 兜住）
   put("chart", '<div class="chart-skel" aria-hidden="true"></div>');

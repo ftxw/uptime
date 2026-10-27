@@ -51,6 +51,22 @@ function gpTimeoutSec(env) {
 }
 
 /**
+ * Retry-After 可能是秒数也可能是 HTTP 日期。统一换成毫秒，并夹到 [30s, 1h]：
+ * 平台偶尔回一个很小的值，照着它重试等于继续撞墙；回一个超大值又会让站点停摆一整天。
+ */
+function retryAfterMs(raw) {
+  const s = String(raw ?? "").trim();
+  let ms = NaN;
+  if (/^\d+$/.test(s)) ms = Number(s) * 1000;
+  else if (s) {
+    const t = Date.parse(s);
+    if (Number.isFinite(t)) ms = t - Date.now();
+  }
+  if (!Number.isFinite(ms)) ms = 60_000;
+  return Math.min(3_600_000, Math.max(30_000, Math.round(ms)));
+}
+
+/**
  * 发起一次测量，返回 measurement id（不等待结果）。
  * 额度按探测点数计费（X-Request-Cost === limit），默认 3 是为了有多张票互相兜底。
  */
@@ -96,7 +112,27 @@ export async function gpCreate(env, site) {
       },
     }),
   });
-  const data = await res.json();
+  const data = await res.json().catch(() => null);
+
+  // 429 = 额度用尽。必须带 Retry-After 给调度层做退避，否则接下来每分钟都会
+  // 再撞一次 429：日志被刷满、站点却一条记录都产不出来（看上去还是一片绿）。
+  if (res.status === 429) {
+    const ra = retryAfterMs(res.headers.get("retry-after"));
+    const err = new Error(`Globalping 额度用尽（429），${Math.round(ra / 1000)} 秒后重试`);
+    err.code = "rate_limit";
+    err.retryAfterMs = ra;
+    throw err;
+  }
+  // 其它非 2xx（401 token 失效 / 422 参数不合法 / 5xx）必须显式失败：
+  // 原先一律报 "create failed"，把"token 配错了"和"平台抖了一下"混成一类，没法修。
+  if (!res.ok) {
+    const err = new Error(
+      `globalping create failed: HTTP ${res.status} ` + JSON.stringify(data).slice(0, 160)
+    );
+    err.code = "http";
+    err.status = res.status;
+    throw err;
+  }
   if (!data || !data.id) {
     throw new Error("globalping create failed: " + JSON.stringify(data).slice(0, 200));
   }
@@ -106,6 +142,10 @@ export async function gpCreate(env, site) {
     quota: {
       limit: res.headers.get("x-ratelimit-limit"),
       remaining: res.headers.get("x-ratelimit-remaining"),
+      // 实际计费的点数：与 limit 相等时说明"3 个探测点 = 3 点额度"，
+      // 用它反推"每小时还能测几次"比猜准。
+      cost: res.headers.get("x-request-cost"),
+      ts: Date.now(),
     },
   };
 }

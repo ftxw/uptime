@@ -295,7 +295,9 @@ export async function saveSettings(env, entries) {
 /** 删除站点的全部痕迹（一次原子 batch；早先漏了 checks，会让 24h 可用率分母虚高）。 */
 export async function deleteSite(env, id) {
   const d = await db(env);
-  const tables = ["checks", "ssl", "state", "pending", "sites"];
+  // checks_daily 同样要清：漏了它，按天汇总会一直留在库里（读侧看不到，但白占空间，
+  // 而且同名 id 重建后会把旧数据当成本站点的历史）。
+  const tables = ["checks", "checks_daily", "ssl", "state", "pending", "sites"];
   await d.batch(
     tables.map((t) =>
       d.prepare(`DELETE FROM ${t} WHERE ${t === "sites" ? "id" : "site"} = ?`).bind(id)
@@ -338,11 +340,12 @@ export async function insertChecks(env, rows) {
 
 /** state 的 upsert：一次写完连续失败计数与最后一次结果快照。 */
 const STATE_UPSERT =
-  `INSERT INTO state (site, consecutive_fail, last_checked_ts,
+  `INSERT INTO state (site, consecutive_fail, void_streak, last_checked_ts,
      last_ok, last_status, last_ttfb_ms, last_total_ms, last_source, last_probe, last_ts, last_error)
-   VALUES (?,?,?,?,?,?,?,?,?,?,?)
+   VALUES (?,?,0,?,?,?,?,?,?,?,?,?)
    ON CONFLICT(site) DO UPDATE SET
      consecutive_fail = excluded.consecutive_fail,
+     void_streak      = 0,
      last_checked_ts  = excluded.last_checked_ts,
      last_ok          = excluded.last_ok,
      last_status      = excluded.last_status,
@@ -352,6 +355,14 @@ const STATE_UPSERT =
      last_probe       = excluded.last_probe,
      last_ts          = excluded.last_ts,
      last_error       = excluded.last_error`;
+
+/**
+ * 「这一轮没拿到结论」的计数 +1。不碰 last_* 与 consecutive_fail ——
+ * 我们确实不知道站点当前状态，改写任何结果字段都等于编造数据。
+ */
+const VOID_BUMP =
+  `INSERT INTO state (site, void_streak) VALUES (?, 1)
+   ON CONFLICT(site) DO UPDATE SET void_streak = MIN(void_streak + 1, 999)`;
 
 /** perSite 的 info → 落库数值（缺字段给安全默认值） */
 function lastResultFields(info, nowIso) {
@@ -368,15 +379,21 @@ function lastResultFields(info, nowIso) {
 }
 
 /**
- * 更新连续失败计数 + 最后一次结果快照 + 当天的按天汇总。
+ * 更新连续失败计数 + 最后一次结果快照 + 当天的按天汇总，并给「本轮无结论」的站点 +
+ * 一次 void_streak。
+ *
+ * @param perSite  { [siteId]: info } 本轮真正拿到结论的站点
+ * @param voidSites string[] 本轮发起了测量但拿不到结论的站点（探针全灭 / 平台故障 / 收取失败）
+ *
  * 必须批量（否则一轮 N 站就是 2N 次往返），且每条都要 .bind() 后入 batch。
  */
-export async function bumpState(env, perSite) {
+export async function bumpState(env, perSite, voidSites = []) {
   const d = await db(env);
   const ids = Object.keys(perSite);
-  if (!ids.length) return;
+  const voids = (voidSites || []).filter((s) => s && !perSite[s]);
+  if (!ids.length && !voids.length) return;
 
-  const prev = await selectPrevState(d, ids);
+  const prev = ids.length ? await selectPrevState(d, ids) : {};
   const nowIso = new Date().toISOString();
   const offsetMs = dayOffsetMs(env);
   const today = dayKey(nowIso, offsetMs);
@@ -396,6 +413,9 @@ export async function bumpState(env, perSite) {
     const runToday = info.ok ? 0 : sameDay ? fail : 1;
     batch.push(d.prepare(DAY_UPSERT).bind(site, today, info.ok ? 1 : 0, runToday));
   }
+
+  // 无结论的站点：只累加 void_streak，不写 checks_daily（那天没有「检查结果」可统计）。
+  for (const site of voids) batch.push(d.prepare(VOID_BUMP).bind(site));
 
   for (const part of chunk(batch, BATCH_CHUNK)) await d.batch(part);
 }
@@ -459,9 +479,9 @@ export async function upsertLastResult(env, row) {
   const d = await db(env);
   await d
     .prepare(
-      `INSERT INTO state (site, consecutive_fail, last_ok, last_status, last_ttfb_ms,
+      `INSERT INTO state (site, consecutive_fail, void_streak, last_ok, last_status, last_ttfb_ms,
                           last_total_ms, last_source, last_probe, last_ts, last_error)
-       VALUES (?, 0, ?,?,?,?,?,?,?,?)
+       VALUES (?, 0, 0, ?,?,?,?,?,?,?,?)
        ON CONFLICT(site) DO UPDATE SET
          last_ok      = excluded.last_ok,
          last_status  = excluded.last_status,
@@ -470,7 +490,9 @@ export async function upsertLastResult(env, row) {
          last_source  = excluded.last_source,
          last_probe   = excluded.last_probe,
          last_ts      = excluded.last_ts,
-         last_error   = excluded.last_error`
+         last_error   = excluded.last_error,
+         -- 手动测出结论就证明「探针链路是通的」，之前攒下的无结论计数当即清零。
+         void_streak  = 0`
     )
     .bind(
       row.site,
@@ -484,6 +506,27 @@ export async function upsertLastResult(env, row) {
       row.error ?? null
     )
     .run();
+}
+
+/**
+ * 手动测试也要进「按天汇总」，否则同一个站点会有两套口径：
+ * 24h 可用率包含手动测试，而 30 天色条不包含 —— 手动测失败会让可用率掉，色条却不变。
+ *
+ * 只写 checks_daily，不动 consecutive_fail / last_checked_ts（那是调度用的）。
+ */
+export async function bumpDailyManual(env, site, ok) {
+  const d = await db(env);
+  const p = await d
+    .prepare("SELECT consecutive_fail, last_checked_ts FROM state WHERE site = ?")
+    .bind(site)
+    .first();
+  const offsetMs = dayOffsetMs(env);
+  const nowIso = new Date().toISOString();
+  const today = dayKey(nowIso, offsetMs);
+  // 与 bumpState 同一套「当天连续段」口径：跨日从头数，同日沿用全局连续数 + 1。
+  const sameDay = p?.last_checked_ts ? dayKey(p.last_checked_ts, offsetMs) === today : false;
+  const run = ok ? 0 : sameDay ? Number(p?.consecutive_fail || 0) + 1 : 1;
+  await d.prepare(DAY_UPSERT).bind(site, today, ok ? 1 : 0, run).run();
 }
 
 /** 证书整体覆盖写：证书是一次握手的完整快照，拼旧值反而会半新半旧。 */
@@ -543,7 +586,7 @@ export async function saveSsl(env, siteId, r) {
 /** 清掉站点已不存在的孤儿行（用 NOT IN 子查询，不占绑定参数）。 */
 export async function cleanupOrphans(env) {
   const d = await db(env);
-  const stmts = ["state", "ssl", "pending"].map((t) =>
+  const stmts = ["state", "ssl", "pending", "checks_daily"].map((t) =>
     d.prepare(`DELETE FROM ${t} WHERE site NOT IN (SELECT id FROM sites)`)
   );
   const res = await d.batch(stmts);

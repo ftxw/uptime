@@ -58,6 +58,15 @@ function fmtDur(sec) {
 const fmtInterval = (min) => (min >= 60 ? `${min / 60} 小时` : `${min} 分钟`);
 const ms = (v) => (v === null || v === undefined ? "--" : `${v} ms`);
 
+/** 小时数 → 人话（168 → "7 天"，24 → "24 小时"）。故障记录窗口用得上 */
+function fmtHours(h) {
+  const n = Number(h);
+  if (!n) return "";
+  // 24 小时说成"1 天"反而别扭：窗口上限就是 24 小时，这里优先按小时表达
+  if (n < 48 || n % 24 !== 0) return `${n} 小时`;
+  return `${n / 24} 天`;
+}
+
 /** y 轴上界取整到 1/2/2.5/5×10^n，避免刻度出现 1237 这种数字 */
 function nice(v) {
   if (!v || v <= 0) return 100;
@@ -139,8 +148,9 @@ function renderKpis(d) {
 
 function renderChart(series, hours) {
   const box = qs("#chart");
-  const pts = (series || []).filter((p) => p.n > 0);
-  if (!pts.length) {
+  // 服务端固定返回 24 个桶（含空桶），所以不能再用 "长度>0" 判断有没有数据
+  const pts = series || [];
+  if (!pts.length || !pts.some((p) => p.n > 0)) {
     box.innerHTML = '<div class="chart-empty">暂无数据 —— 该窗口内还没有检查记录</div>';
     return;
   }
@@ -188,10 +198,13 @@ function renderChart(series, hours) {
     }" text-anchor="${anchor}">${fmtAxis(t, hours)}</text>`;
   }
 
-  // 折线 + 面积：全失败的桶（v 为 null）处断开，不虚构数值
+  // 折线 + 面积：全失败的桶（v 为 null）处断开，不虚构数值。
+  // 但"空桶"（n===0，那一刻根本没测）只是跳过，不切断 —— 否则新站点（数据不满 24 小时、
+  // 桶宽被压得比监测间隔还窄）会画成一串互不相连的点，看起来像图表坏了。
   const segs = [];
   let cur = [];
   for (const p of pts) {
+    if (!p.n) continue;
     if (p.v == null) {
       if (cur.length) {
         segs.push(cur);
@@ -287,11 +300,15 @@ function renderChart(series, hours) {
       hiDot.style.opacity = 0;
     }
 
-    tip.innerHTML =
-      `<b>${fmtFull(best.t)}</b><br>` +
-      (best.v != null ? `平均 ${best.v} ms<br>` : `<span class="muted">该时段全部失败</span><br>`) +
-      `成功 ${best.ok}/${best.n}` +
-      (best.max != null ? `<br>最高 ${best.max} ms` : "");
+    const detail =
+      best.n === 0
+        ? `<span class="muted">该时段无检查记录</span>`
+        : (best.v != null
+            ? `平均 ${best.v} ms<br>`
+            : `<span class="muted">该时段全部失败</span><br>`) +
+          `成功 ${best.ok}/${best.n}` +
+          (best.max != null ? `<br>最高 ${best.max} ms` : "");
+    tip.innerHTML = `<b>${fmtFull(best.t)}</b><br>` + detail;
     tip.classList.add("show");
     const tw = tip.offsetWidth;
     const th = tip.offsetHeight;
@@ -383,16 +400,21 @@ function renderRecent(recent) {
     .join("");
 }
 
-function renderIncidents(incidents) {
+function renderIncidents(incidents, winHours) {
   const el = qs("#incidents");
   const list = incidents || [];
   const ongoing = list.filter((i) => i.ongoing).length;
+  // 窗口写进标题：服务端只回看最近 168 小时（更长的窗口对"最近 N 条故障记录"没有意义，
+  // 却要逐行扫完整个窗口），不写出来会让人以为 30 天视图里这份列表也覆盖 30 天。
+  const win = fmtHours(winHours);
   qs("#incsum").textContent = list.length
-    ? `${list.length} 次记录${ongoing ? ` · ${ongoing} 次未恢复` : ""}`
+    ? `${win ? `最近 ${win} · ` : ""}${list.length} 次记录${ongoing ? ` · ${ongoing} 次未恢复` : ""}`
     : "";
   if (!list.length) {
     el.innerHTML = `<div class="empty">暂无故障记录<br>
-      <span style="font-size:12px">连续失败达到阈值（判为真实故障）才会记录</span></div>`;
+      <span style="font-size:12px">连续失败达到阈值（判为真实故障）才会记录${
+        win ? ` · 仅统计最近 ${win}` : ""
+      }</span></div>`;
     return;
   }
   el.innerHTML = list
@@ -431,18 +453,14 @@ function renderFailed(msg) {
 
 const params = new URLSearchParams(location.search);
 const SITE_ID = params.get("id") || "";
-// 窗口小时数，与服务端 /api/site 的钳制（1–720）一致；非法值回落 24。
-let HOURS = (() => {
-  const raw = params.get("hours");
-  const n = Number(raw);
-  if (raw === null || raw.trim() === "" || !Number.isFinite(n)) return 24;
-  return Math.min(720, Math.max(1, Math.trunc(n)));
-})();
+// 趋势窗口固定在服务端决定（上限 24 小时，不满则从首条记录算起），前端不再有 hours 参数。
+const TREND_HOURS = 24;
 
 // 带版本号：缓存里含站点 URL，而 hide_url 改完就不该再让访客看到 ——
 // 换 key 让旧副本（url 还是明文的那份）一次作废，避免首帧抢先渲染出地址。
 // 与 app.js 的 CACHE_KEY 同一处理，改缓存字段语义时两处一起 bump。
-const cacheKey = () => `uptime:site:v2:${SITE_ID}:${HOURS}`;
+// v3：series 固定 24 个点、window 改为 span_sec/bucket_sec，旧副本结构不同，整份作废。
+const cacheKey = () => `uptime:site:v3:${SITE_ID}`;
 
 function render(d) {
   if (!d || !d.ok) return;
@@ -453,15 +471,19 @@ function render(d) {
   }
   renderHead(d);
   renderKpis(d);
-  renderChart(d.series, HOURS);
+  renderChart(d.series, TREND_HOURS);
   renderBars(d.bars);
   renderRecent(d.recent);
-  renderIncidents(d.incidents);
+  renderIncidents(d.incidents, d.window && d.window.incident_hours);
 
   const w = d.window || {};
-  qs("#bucket").textContent = w.bucket_label ? `每个点 = ${w.bucket_label}聚合` : "";
+  // 跨度写实际值：新站点数据不足 24 小时时，窗口就是"首条记录到现在"，
+  // 不能笼统写"最近 24 小时"，否则用户会以为中间缺了一大段。
+  const span = Number(w.span_sec || 0);
   qs("#foot").textContent =
-    `窗口：最近 ${w.hours} 小时 · 共 ${w.checks} 次检查（失败 ${w.failures} 次）· ` +
+    `窗口：最近 ${span >= 86400 ? "24 小时" : fmtDur(span)}` +
+    `${span >= 86400 ? "" : "（监测时长短于 24 小时，24 个点均分这段区间）"}` +
+    ` · 共 ${w.checks} 次检查（失败 ${w.failures} 次）· ` +
     `探测位置 ${d.site.gp_magic || "默认筛选"} · SSL 随探测顺带采集`;
 }
 
@@ -481,7 +503,7 @@ async function load() {
 
   qs("#refresh").disabled = true;
   try {
-    const r = await fetch(`/api/site?id=${encodeURIComponent(SITE_ID)}&hours=${HOURS}`, {
+    const r = await fetch(`/api/site?id=${encodeURIComponent(SITE_ID)}`, {
       headers: { accept: "application/json" },
     });
     const data = await r.json();
@@ -504,19 +526,6 @@ async function load() {
     qs("#refresh").disabled = false;
   }
 }
-
-/* 时间范围切换 —— 用 URL 记录，便于分享某个窗口的链接 */
-qs("#range").addEventListener("click", (e) => {
-  const btn = e.target.closest("button[data-h]");
-  if (!btn) return;
-  HOURS = Number(btn.dataset.h);
-  [...qs("#range").children].forEach((b) => b.classList.toggle("on", b === btn));
-  const u = new URL(location.href);
-  u.searchParams.set("hours", String(HOURS));
-  history.replaceState(null, "", u);
-  qs("#chart").innerHTML = '<div class="chart-empty">加载中…</div>';
-  load();
-});
 
 qs("#refresh").addEventListener("click", load);
 
@@ -556,18 +565,13 @@ addEventListener("resize", () => {
         return null;
       }
     })();
-    if (c && c.series) renderChart(c.series, HOURS);
+    if (c && c.series) renderChart(c.series, TREND_HOURS);
   }, 180);
 });
 
 document.addEventListener("visibilitychange", () => {
   if (!document.hidden) load();
 });
-
-/* 初始化范围按钮状态 */
-[...qs("#range").children].forEach((b) =>
-  b.classList.toggle("on", Number(b.dataset.h) === HOURS)
-);
 
 load();
 setInterval(() => {
