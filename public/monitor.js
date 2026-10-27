@@ -148,7 +148,8 @@ function renderKpis(d) {
 
 function renderChart(series, hours) {
   const box = qs("#chart");
-  // 服务端固定返回 24 个桶（含空桶），所以不能再用 "长度>0" 判断有没有数据
+  // 服务端只下发「有记录」的桶（每点的 t = 该桶最后一条检查的时间），
+  // 所以长度即点数，最多 24 个；空时段不会伪造出节点。
   const pts = series || [];
   if (!pts.length || !pts.some((p) => p.n > 0)) {
     box.innerHTML = '<div class="chart-empty">暂无数据 —— 该窗口内还没有检查记录</div>';
@@ -165,13 +166,15 @@ function renderChart(series, hours) {
   const t0 = T(pts[0]);
   const t1 = T(pts[pts.length - 1]);
   const span = Math.max(1, t1 - t0);
+  // 只有一个点（站点刚建好）时 t0===t1，按比例算会贴在左边缘 —— 居中更好看
+  const solo = pts.length === 1;
 
   // y 上界按 95 分位定，避免个别尖峰把整张图压扁；至少留 50ms 视觉空间
   const vals = pts.filter((p) => p.v != null).map((p) => p.v).sort((a, b) => a - b);
   const p95v = vals.length ? vals[Math.min(vals.length - 1, Math.floor(vals.length * 0.95))] : 100;
   const ymax = nice(Math.max(vals.length ? vals[vals.length - 1] : 100, p95v * 1.15, 50));
 
-  const X = (t) => pad.l + ((t - t0) / span) * iw;
+  const X = (t) => (solo ? pad.l + iw / 2 : pad.l + ((t - t0) / span) * iw);
   const Y = (v) => pad.t + ih - (Math.min(Math.max(v, 0), ymax) / ymax) * ih;
 
   // 网格 + y 轴刻度
@@ -199,8 +202,8 @@ function renderChart(series, hours) {
   }
 
   // 折线 + 面积：全失败的桶（v 为 null）处断开，不虚构数值。
-  // 但"空桶"（n===0，那一刻根本没测）只是跳过，不切断 —— 否则新站点（数据不满 24 小时、
-  // 桶宽被压得比监测间隔还窄）会画成一串互不相连的点，看起来像图表坏了。
+  // 服务端只会给出「有记录」的桶，所以这里不必再处理空桶 —— 没有测过的时段
+  // 本来就没有节点，连起来才是编造数据。
   const segs = [];
   let cur = [];
   for (const p of pts) {
@@ -459,8 +462,9 @@ const TREND_HOURS = 24;
 // 带版本号：缓存里含站点 URL，而 hide_url 改完就不该再让访客看到 ——
 // 换 key 让旧副本（url 还是明文的那份）一次作废，避免首帧抢先渲染出地址。
 // 与 app.js 的 CACHE_KEY 同一处理，改缓存字段语义时两处一起 bump。
-// v3：series 固定 24 个点、window 改为 span_sec/bucket_sec，旧副本结构不同，整份作废。
-const cacheKey = () => `uptime:site:v3:${SITE_ID}`;
+// v4：series 的点改为「桶内最后一条检查的时间」（不再是桶起点），且只含有数据的桶，
+//     旧副本会把节点画在整点边界上，整份作废。
+const cacheKey = () => `uptime:site:v4:${SITE_ID}`;
 
 function render(d) {
   if (!d || !d.ok) return;
@@ -477,12 +481,14 @@ function render(d) {
   renderIncidents(d.incidents, d.window && d.window.incident_hours);
 
   const w = d.window || {};
-  // 跨度写实际值：新站点数据不足 24 小时时，窗口就是"首条记录到现在"，
+  // 跨度写实际值：新站点数据不足 24 小时时，窗口就是「首条记录 → 最后一次检查」，
   // 不能笼统写"最近 24 小时"，否则用户会以为中间缺了一大段。
+  // 同时把右端时间写出来：曲线停在最后一次监测上是刻意的（不是数据丢了），
+  // 不写清楚的话，看到"停在一小时前"的人只会以为图表坏了。
   const span = Number(w.span_sec || 0);
+  const until = w.last_check_ts ? fmtFull(w.last_check_ts) : "";
   qs("#foot").textContent =
-    `窗口：最近 ${span >= 86400 ? "24 小时" : fmtDur(span)}` +
-    `${span >= 86400 ? "" : "（监测时长短于 24 小时，24 个点均分这段区间）"}` +
+    `窗口：${until ? `截至 ${until} 的` : ""}最近 ${span >= 86400 ? "24 小时" : fmtDur(span)}` +
     ` · 共 ${w.checks} 次检查（失败 ${w.failures} 次）· ` +
     `探测位置 ${d.site.gp_magic || "默认筛选"} · SSL 随探测顺带采集`;
 }
