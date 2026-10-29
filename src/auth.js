@@ -1,14 +1,11 @@
 /**
- * 认证：常量时间比较 + HMAC-SHA256 自包含会话 + 内存限速。
- *
- * 密码只来自环境变量 ADMIN_PASSWORD（部署期配置，不入库、不提供后台改密）。
- * 会话是签名 token，服务端不留状态；签名密钥取 ADMIN_SECRET，未设则在 D1 里
- * 生成随机值持久化，保证多机房一致、重启不踢会话。
+ * 认证：常量时间比较 + HMAC-SHA256 无状态会话 + 内存限速。
+ * 密码只来自 ADMIN_PASSWORD；签名密钥优先 ADMIN_SECRET，未设则用 D1 里的随机值。
  */
 
 const encoder = new TextEncoder();
 
-/** 常量时间比较：长度不同也走满全程，绝不提前返回（否则会泄漏匹配了多少位）。 */
+/** 常量时间比较：长度不同也走满全程，不提前返回。 */
 export function constantTimeEqual(a, b) {
   const ab = encoder.encode(String(a ?? ""));
   const bb = encoder.encode(String(b ?? ""));

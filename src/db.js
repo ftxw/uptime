@@ -106,15 +106,8 @@ const SCHEMA_KEY = "schema_v";
 const schemaReady = new WeakMap();
 
 /**
- * 确保库结构就位。
- *
- * 必须在运行时做：建表原先只在 `npm run deploy` 的 setup 脚本里，而控制台连
- * GitHub 部署时该脚本不会执行 —— Worker 部署成功但每个接口都报 no such table。
- *
- * 代价：每个 isolate 生命周期内多一次单行 D1 读，建表只在库缺结构时发生一次。
- *
- * @returns {Promise<{version:number, migrated:boolean, statements:number, from:number}>}
- *          `from` 是动作之前的版本：-1 = 全新库，0 = 有表但无版本标记的旧库。
+ * 确保库结构就位（运行时自举，历史原因见 README）。
+ * @returns {{version, migrated, statements, from}} from: -1 全新库 / 0 旧库无标记
  */
 export function ensureSchema(env) {
   const d = env && env.DB;
@@ -222,12 +215,7 @@ async function migrationTokens(d) {
   };
 }
 
-/**
- * 回填上限：超过这个行数就不做历史回填，只让新数据开始累积。
- * 理由 —— 这条 SQL 要扫 6 遍明细（读约 6 倍行数），10 万行 ≈ 60 万行读，
- * 占免费日额度 12%；不限的话一个 20 站的库升级当天就会把读额度打穿，
- * 结果是整库拒绝查询（监控与后台一起挂），比「历史色条变灰」严重得多。
- */
+/** 回填上限：超过就不回填，只累积新数据（回填约读 6 倍行数，会打穿日额度）。 */
 const BACKFILL_MAX_ROWS = 100_000;
 
 /** v1 → v2：把明细分组成按天汇总。连续段用 gaps-and-islands，跨天切断。 */
@@ -254,15 +242,8 @@ async function backfillDaily(d) {
 }
 
 /**
- * meta 表全量读的 isolate 级缓存。
- *
- * 为什么要有：`fetch` 每一步（认证、缓存 key、读接口）都要 loadSettings，
- * 于是**即便边缘缓存命中，也照样打一次 D1** —— 被别人刷 overview 就等于刷 D1 读额度。
- * 设置是「读极多、写极少」的数据，在本 isolate 内缓存 30 秒完全不影响语义：
- * 写侧（saveSetting/saveSettings）会主动清缓存，本实例立刻看到新值；
- * 其它机房最迟 30 秒跟上，而它们本来就要靠 config_version 换 key。
- *
- * 不带 env 差异：一个 isolate 只服务一个 Worker，缓存按 D1 绑定的对象身份区分。
+ * meta 全量读的 isolate 级缓存（30s）。
+ * 不加的话即使边缘缓存命中也会打一次 D1。写侧主动失效。
  */
 const SETTINGS_TTL_MS = 30_000;
 let settingsCache = null; // { binding, expires, data }
@@ -407,13 +388,10 @@ function lastResultFields(info, nowIso) {
 }
 
 /**
- * 更新连续失败计数 + 最后一次结果快照 + 当天的按天汇总，并给「本轮无结论」的站点 +
- * 一次 void_streak。
- *
- * @param perSite  { [siteId]: info } 本轮真正拿到结论的站点
- * @param voidSites string[] 本轮发起了测量但拿不到结论的站点（探针全灭 / 平台故障 / 收取失败）
- *
- * 必须批量（否则一轮 N 站就是 2N 次往返），且每条都要 .bind() 后入 batch。
+ * 更新连续失败计数、结果快照与按天汇总；无结论的站点 void_streak +1。
+ * 必须批量，否则一轮 N 站就是 2N 次往返。
+ * @param perSite 本轮拿到结论的站点
+ * @param voidSites 拿不到结论的站点
  */
 export async function bumpState(env, perSite, voidSites = [], checkedAt) {
   const d = await db(env);
@@ -540,28 +518,9 @@ export async function upsertLastResult(env, row) {
 }
 
 /**
- * 手动测试也要进「按天汇总」，否则同一个站点会有两套口径：
- * 24h 可用率包含手动测试，而 30 天色条不包含 —— 手动测失败会让可用率掉，色条却不变。
- *
- * 只写 checks_daily，不动 consecutive_fail / last_checked_ts（那是调度用的）。
- */
-/**
- * 手动测试写「按天汇总」。
- *
- * 与 bumpState 的区别只有一处、但很要紧：**连续失败段不能用全局 consecutive_fail**。
- * 那列只随自动探测递增（upsertLastResult 刻意不碰它），所以在一个暂时正常的站点上
- * 连点 5 次「测」全失败，每次都算出 `0 + 1 = 1`，永远到不了 fail_threshold（默认 3）——
- * 色条一直是黄的，而「最近检查」里明明是 5 条失败。这正是两套口径。
- *
- * 改成直接数「今天最后一次成功之后连续失败了几条」：
- *   run = SELECT COUNT(*) FROM checks WHERE 今天 AND ok=0 AND ts > 今天最后一次成功的 ts
- * 一条按 (site, ts) 索引的查询就能算出来，且**与自动探测的 checks 明细同源**，
- * 所以「今天手动测了几次、红不红」和详情页列表永远对得上。
- *
- * 前提：本函数必须在 insertChecks **之后**调用（本次结果已落库，数得进去）。
- *
- * @param ts 本次记录的 ts（与写入 checks 的那条一致，避免两处各取一次 now 而跨日界）
- * @returns {{ run: number }} 写入的当天连续失败段
+ * 手动测试写按天汇总。
+ * 不能用 consecutive_fail（只随自动探测递增），改为数今天最后一次成功后的连续失败数。
+ * 必须在 insertChecks 之后调用；ts 与写入 checks 的一致，避免跨日界。
  */
 export async function bumpDailyManual(env, site, ok, ts) {
   const d = await db(env);

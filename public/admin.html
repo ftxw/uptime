@@ -58,8 +58,7 @@
     </div>
   </div>
 
-  <!-- 提示区不放在这里：此处属文档流，提示一出现就会把下方卡片整体顶下去。
-       所有提示统一改到 body 末尾的 #toast-host（fixed 定位，从顶部滑出，不占布局）。 -->
+  <!-- 提示统一走 body 末尾的 #toast-host（fixed），不占文档流 -->
 
   <!-- 左右两栏：左 = 分类，右 = 站点 -->
   <div class="adm-grid">
@@ -106,8 +105,7 @@
     删除站点会同时清掉它的探测明细、证书与状态（不可撤销）。
   </p>
 
-  <!-- 额度估算：按「当前启用站点 × 各自间隔 × 每次探测点数」反推 Globalping 额度能撑多久。
-       由 admin.js 的 renderQuota() 填充；站点/间隔/Token 任一变化都会重算。 -->
+  <!-- 额度估算，由 renderQuota() 填充 -->
   <p id="quota" style="font-size:12px;margin:8px 0 0;line-height:1.6"></p>
 </main>
 
@@ -125,9 +123,7 @@
       <div class="grid-2">
         <div class="field">
           <label for="f-id">标识（唯一，字母/数字/点/下划线/短横线）</label>
-          <!-- pattern 必须与后端 SITE_ID_RE（src/index.js）逐字符一致 ——
-               两处不同的字符集就是"前端放行、后端 400"的第三种口径。
-               readonly（编辑态）元素不参与约束校验，所以历史 id 仍可正常保存。 -->
+          <!-- pattern 必须与后端 SITE_ID_RE 一致 -->
           <input id="f-id" required pattern="[A-Za-z0-9._-]{1,64}" maxlength="64" placeholder="my-site">
         </div>
         <div class="field">
@@ -140,9 +136,7 @@
         <label for="f-url">监控地址（完整 URL）</label>
         <div class="input-row">
           <input id="f-url" required type="url" placeholder="https://example.com/health">
-          <!-- 与地址框同一行：它是这个字段的显示开关，不该另起一行。
-               用 checkbox 而不是两个选项的 select —— 布尔量，
-               下拉会让人误以为还有第三种状态。 -->
+          <!-- 与地址框同行，布尔量用 checkbox -->
           <label class="check-row" for="f-hideurl">
             <input id="f-hideurl" type="checkbox">
             <span>URL隐藏</span>
@@ -170,8 +164,7 @@
         </div>
       </div>
 
-      <!-- 没有「显示顺序」输入框：顺序由列表拖拽决定（左侧选好分类后即可拖）。
-           手填数字既要求用户心算、又和分类内的相对位置两套口径并存（见 admin.js 的 saveSiteOrder） -->
+      <!-- 顺序由拖拽决定，不提供输入框 -->
       <div class="grid-2">
         <div class="field">
           <label for="f-interval">监测间隔</label>
@@ -182,8 +175,7 @@
             <option value="30">30 分钟</option>
             <option value="60">1 小时</option>
           </select>
-          <!-- 1 分钟档位受两阶段模型限制：本轮发起、下一轮收取，所以真实间隔约 2 分钟。
-               不写清楚的话，用户会按 1 分钟算额度，却拿到 2 分钟一次的结果。 -->
+          <!-- 1 分钟档位实际约 2 分钟，见 dueSites -->
           <span class="hint">每隔多久探测一次；1 分钟档位受调度模型限制，实际约 2 分钟</span>
         </div>
         <div class="field">

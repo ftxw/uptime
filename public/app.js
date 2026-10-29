@@ -1,12 +1,7 @@
-/* 前台状态页 —— 零框架、零外部依赖
-   策略：先用 localStorage 里的上次数据立刻渲染（首屏不等网络），再后台拉 /api/overview 覆盖。
-   布局对齐 ftxw/uptime-monitor：分组一张卡 + 组内分隔行 + 「响应时间 / SSL / 可用率」三列。 */
+/* 前台状态页。先渲染 localStorage 缓存，再拉 /api/overview 覆盖。 */
 
 const API = "/api/overview";
-// ⚠️ 带版本号：这份缓存里含站点 URL，而 hide_url 是"改完就不该再让访客看到"的东西 ——
-//    老缓存（改之前抓的、url 还是明文）会在首帧抢先渲染出来。换 key 让旧副本一次作废，
-//    代价只是老访客多等一次网络（新访客不受影响）。改缓存里的字段语义时就 bump 这里。
-//    v4：可用率口径回到"最近 24 小时（滚动）"，与详情页趋势图同源；旧副本整份作废。
+// 带版本号：缓存含站点 URL，hide_url 改了要让旧副本立刻失效。改字段语义时 bump。
 const CACHE_KEY = "uptime:overview:v4";
 
 /* 分类：GROUPS 为接口返回的全部分组，FILTER 为空表示"全部" */

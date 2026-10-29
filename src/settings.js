@@ -1,19 +1,16 @@
 /**
- * 运行参数的元信息与默认值唯一来源。
- *
- * key = meta 表键名兼后台表单字段；env = 对应环境变量（空则只存 meta）；def = 兜底值。
- * 取值优先级：D1 meta（后台设置） > 环境变量 > def。
+ * 运行参数定义。key 即 meta 键名与表单字段；取值优先级：meta > 环境变量 > def。
  */
 export const SETTING_META = {
   default_theme:    { env: "",                 def: "auto" },                  // auto | light | dark
   site_title:       { env: "",                 def: "站点状态" },
   gp_magic:         { env: "GP_MAGIC",         def: "CN+datacenter-network" }, // Globalping 位置筛选
-  gp_limit:         { env: "GP_LIMIT",         def: "3" },                     // 每次测量的探测点数（额度按此计费；三档 1/3/5，见后台下拉）
+  gp_limit:         { env: "GP_LIMIT",         def: "3" },                     // 探测点数，额度按此计费（1/3/5）
   gp_timeout_sec:   { env: "GP_TIMEOUT_SEC",   def: "15" },                    // 探针端墙钟超时（整数秒，5–30）
   gp_ip_version:    { env: "GP_IP_VERSION",    def: "4" },
   ssl_warn_days:    { env: "SSL_WARN_DAYS",    def: "14" },                    // 剩余 ≤ N 天判为降级
   slow_ms:          { env: "SLOW_MS",          def: "2000" },                   // 响应时间 > N 毫秒判为降级；0 = 关闭
-  subreq_budget:    { env: "SUBREQ_BUDGET",    def: "30" },                    // 本轮出网子请求额度（D1 另计，见 normalizeSetting 说明）
+  subreq_budget:    { env: "SUBREQ_BUDGET",    def: "30" },                    // 单轮出网子请求上限（与 Globalping 额度无关）
   check_keep_days:  { env: "CHECK_KEEP_DAYS",  def: "30" },                    // 探测明细保留天数
   recent_limit:     { env: "RECENT_LIMIT",     def: "20" },                    // 详情页「最近检查」最多显示几条
   incident_limit:   { env: "INCIDENT_LIMIT",   def: "10" },                    // 详情页「故障记录」最多显示几条

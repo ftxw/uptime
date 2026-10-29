@@ -16,9 +16,7 @@ let DRAG_CAT = null;     // 正在拖拽的分类名
 let DRAG_SITE = null;    // 正在拖拽的站点 id
 let AUTHED = false;
 let SETTINGS = null;     // /admin 一次性带回的设置，用于设置面板预填
-let PROBE = null;        // /admin 带回的探针健康（最近一次成功/失败/额度退避窗口）
-// 证书结果不再单独一张 map：/admin 已把 ssl_* 摊平在每个站点行里（见 sslCell）。
-// 原先既发整张 map 又发扁平字段，同一份证书在一个响应里出现两遍，体积近乎翻倍。
+let PROBE = null;        // 探针健康：最近成功 / 失败 / 额度退避
 
 const UNGROUPED = "未分组";
 const ALL = "__all__";
@@ -185,12 +183,7 @@ qs("#logout").addEventListener("click", async () => {
 
 const cmps = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
 
-/**
- * 分组排序必须跟前台 / 左侧目录一致：按 categories.sort 的**显式顺序**，
- * 而不是分组名的码点顺序。否则用户在左边把「生产环境」拖到第一位，
- * 右边的分组块仍按拼音/Unicode 排，看起来像“只改了左边一项”。
- * 不在 CATS 里的分组（站点上手输的）排到末尾，并按名字稳定排序。
- */
+/** 分组顺序按 CATS 下标，与左侧目录一致；不在 CATS 的排末尾。 */
 function groupRank(name) {
   const i = CATS.findIndex((c) => c.name === name);
   return i < 0 ? Number.MAX_SAFE_INTEGER : i;
@@ -965,11 +958,7 @@ function fmtEta(iso) {
   return s < 60 ? `${s} 秒后` : `${Math.ceil(s / 60)} 分钟后`;
 }
 
-/**
- * 设置面板的探针状态行：最近一次成功 / 失败 / 是否在 429 退避窗口内。
- * 站点显示「探针连续 N 轮无结论」时，这一行能立刻分清是 GP 挂了、凭据错了，还是额度用光。
- * （额度估算不在这里 —— 它按站点与间隔算，挪到列表底部常驻，见 renderQuota）
- */
+/** 探针状态行：区分 GP 挂了 / 凭据错 / 额度用光。 */
 function renderProbeInfo() {
   const el = qs("#s-probe");
   if (!el) return;
@@ -992,14 +981,8 @@ function renderProbeInfo() {
 }
 
 /**
- * Globalping 额度账：按当前**启用站点 × 各自监测间隔 × 每次探测点数**折算消耗，
- * 再和额度（配了 Token 500 点/小时，否则 250）比，算出「这套配置能连续跑多久」。
- *
- * 单位说明：Globalping 的额度按探测点数计费（一次测量 limit 点 = limit 点额度），
- * 所以「每小时消耗 = Σ(60 / 间隔分钟) × limit」。这也是本项目最容易踩的坑：
- * 默认 1 分钟间隔 + 3 点，匿名额度只够 1 个站点。
- *
- * @param limitOverride 设置面板里刚改动、尚未保存的 gp_limit（不写回 SETTINGS，取消即失效）
+ * 额度账：每小时消耗 = Σ(60 / 间隔分钟) × limit，与 250/500 点每小时比较。
+ * @param limitOverride 面板里未保存的 gp_limit
  */
 function quotaStats(limitOverride) {
   const s = SETTINGS || {};
@@ -1176,14 +1159,7 @@ qs("#theme").addEventListener("click", () => {
   } catch (e) {}
 });
 
-// 名称自动生成 id
-/**
- * 名称 → id 的自动推导。
- *
- * ⚠️ 纯中文名（「我的博客」）经下面这串替换会得到**空串**，而空 id 在提交时会被
- * `if (!body.id || !body.url) return;` 静默吞掉：用户点了保存，弹窗不关、没有报错、
- * 什么也没发生。所以中文名必须退化成一个随机 id，而不是留空。
- */
+/** 名称 → id。纯中文名替换后为空，必须退回随机 id，否则保存会被静默丢弃。 */
 function slugifyId(name) {
   const slug = String(name || "")
     .trim()

@@ -67,16 +67,14 @@
   <div class="card glass">
     <div class="sec-head">
       <h2>响应时间趋势</h2>
-      <!-- 窗口与点数都由服务端决定：右端收在最后一次检查上，24 个 1 小时的槽
-           用 25 个边界点画出来（首点 = 窗口左界，末点 = 最后一次检查）。 -->
+      <!-- 窗口与点数由服务端决定 -->
       <span class="muted" style="font-size:12px">最近 24 小时</span>
     </div>
     <div class="sec-body">
       <div class="chart-wrap" id="chart"></div>
     </div>
     <div class="legend">
-      <!-- 颜色一律引用 CSS 变量：写死 hsl 值会让图例与折线/红点各走一套，
-           以后调主色或故障色时必然出现"图例是旧色、图上是新色"。 -->
+      <!-- 颜色一律走 CSS 变量，否则图例与折线会脱节 -->
       <span><i style="background:hsl(var(--primary))"></i>平均响应时间</span>
       <span><i style="background:hsl(var(--destructive))"></i>该时段存在失败</span>
     </div>
@@ -100,8 +98,7 @@
       <h2>最近检查</h2>
       <span class="muted" style="font-size:12px" id="recentsum"></span>
     </div>
-    <!-- 占位与「故障记录」刻意用同一种样式：两张卡片同属一个 /api/site 响应、
-         同一帧写入，加载期间看起来必须一样，否则空白会被误读成"这张更慢"。 -->
+    <!-- 占位样式与「故障记录」一致 -->
     <div class="lst" id="recent"></div>
   </div>
 
@@ -119,14 +116,8 @@
 
 <div class="tip" id="tip" role="tooltip"></div>
 
-<!-- 骨架屏：数据到达前先把每张卡的位置和尺寸搭出来（文字换成灰条）。
-     不占位的实测代价：数据到达的那一帧整页高度 937px → 2168px、CLS 0.74，
-     下面的卡片被整体顶下去一次 —— 观感就是"卡片被内容拖了一下"。
-     占位用的是与真实卡片**同一套 class**（.stat/.lst-row/.inc-row + .sk 灰条），
-     行高由真实字号决定，因此是逐像素等高的占位，不是"估个大概"。
-     （原先这里还给 4 张「站点信息卡」占位；那 4 张卡已整块移除，占位随之删掉。）
-     同步脚本，跑在 defer 的 monitor.js 之前、也跑在首帧之前：
-     有 localStorage 缓存时 monitor.js 会在首帧前就填好真实数据，骨架根本不会露脸。 -->
+<!-- 骨架屏：避免数据到达时整页跳动（CLS）。
+     与真实卡片用同一套 class，行高一致；有缓存时不会显示。 -->
 <script>
 (function () {
   var D = document;

@@ -1,10 +1,7 @@
 /**
- * 探测层：全部经 Globalping 中国探针执行。
- *
- * 不用 CF 边缘探测：它测的是「Cloudflare 机房 -> 站点」，与大陆用户的访问路径
- * 不是一回事，用它判断国内站点快慢方向就错了。
- *
- * 一次 http 测量同时带回延迟（timings.total）、状态码、证书（tls），三项共用一份额度。
+ * 探测层：走 Globalping 探针。
+ * 不用 CF 边缘探测 —— 那是机房到站点，不代表大陆用户的实际路径。
+ * 一次 http 测量同时带回延迟、状态码与证书。
  */
 
 import { defOf, validMagic, gpLimitNum } from "./settings.js";
@@ -38,11 +35,7 @@ export function judge(site, r) {
   return { ok: true, reason: null };
 }
 
-/**
- * 探针端墙钟超时（秒，5–30）。这是给远端探针的规定，不是我们愿意等多久：
- * 中国家宽链路的失败实测恰在 15001ms 被平台切断，压到 8s 等于主动造失败；
- * 调大也没用（失败时 tls 为 null，握手一个字节都没回来）。
- */
+/** 探针端超时（秒，Globalping 限 5–30）。国内链路实测 15s 左右才被判失败。 */
 function gpTimeoutSec(env) {
   const dflt = Number(defOf("gp_timeout_sec"));
   const n = Number((env && env.GP_TIMEOUT_SEC) || dflt);
@@ -50,10 +43,7 @@ function gpTimeoutSec(env) {
   return Math.min(30, Math.max(5, Math.round(n)));
 }
 
-/**
- * Retry-After 可能是秒数也可能是 HTTP 日期。统一换成毫秒，并夹到 [30s, 1h]：
- * 平台偶尔回一个很小的值，照着它重试等于继续撞墙；回一个超大值又会让站点停摆一整天。
- */
+/** Retry-After（秒数或 HTTP 日期）→ 毫秒，夹到 [30s, 1h]。 */
 function retryAfterMs(raw) {
   const s = String(raw ?? "").trim();
   let ms = NaN;
@@ -123,8 +113,7 @@ export async function gpCreate(env, site) {
     err.retryAfterMs = ra;
     throw err;
   }
-  // 其它非 2xx（401 token 失效 / 422 参数不合法 / 5xx）必须显式失败：
-  // 原先一律报 "create failed"，把"token 配错了"和"平台抖了一下"混成一类，没法修。
+  // 非 2xx 显式失败：区分凭据错误与平台抖动
   if (!res.ok) {
     const err = new Error(
       `globalping create failed: HTTP ${res.status} ` + JSON.stringify(data).slice(0, 160)
@@ -150,11 +139,7 @@ export async function gpCreate(env, site) {
   };
 }
 
-/**
- * 单探针状态 → 可读原因。不能直接透传 status（只有 failed/offline 这类单词，
- * 分不清「探针超时」和「站点真挂」）；真正原因在 rawOutput 里。
- * 顺序有意义：更具体的模式必须排在泛化模式前面。
- */
+/** 探针原始原因 → 可读文案。更具体的模式必须排在前面。 */
 const GP_RAW_ZH = [
   ["timed out during the TLS handshake", "TLS 握手超时（链路丢包）"],
   ["timed out during the TCP handshake", "TCP 握手超时"],
@@ -204,19 +189,12 @@ function tlsOf(rr) {
 }
 
 /**
- * 收取测量结果。三种返回必须分别处理：
- *   { done: false }                     还在跑，pending 留到下一轮
- *   { done: true, broken: true }        结果不可用，丢弃 pending 且不记检查
- *   { done: true, results, status }     正常
- *
- * broken 分支不可省：id 失效或 API 返回错误体时响应里没有 status，若当成"还在跑"
- * 就会永远 done:false → pending 永不删除 → dispatch 跳过该站点，静默停摆。
- *
- * 必须显式看 res.ok / res.status —— 这是与 gpCreate 对齐的部分。早先直接 res.json()，
- * 结果查询接口一旦限流，每分钟重试一次、直到 PENDING_TTL 到点，日志刷满却没人知道是额度问题：
- *  · 5xx / 网关 HTML 错误页 → json() 抛 SyntaxError，被上层记成 "throw"，看着像代码 bug；
- *  · 429 → 不触发 gp_blocked_until 退避（发起端退避了，收取端还在打）。
- * 现在把 HTTP 层的失败统一成 broken，并把 Retry-After 交给调度层（见 scheduled 的 noteBlocked）。
+ * 收取结果。三种返回：
+ *   { done:false } 还在跑，留到下一轮
+ *   { done:true, broken:true } 不可用，丢弃 pending 且不记检查
+ *   { done:true, results, status } 正常
+ * broken 分支不能省：否则会永远 done:false，pending 永不删除，该站点静默停摆。
+ * 429 回传 retryAfterMs，由调度层统一退避。
  */
 export async function gpCollect(env, pending) {
   const token = env && env.GLOBALPING_TOKEN;
@@ -279,19 +257,9 @@ export async function gpCollect(env, pending) {
 }
 
 /**
- * 多探针判定 —— 唯一判定口径。
- *
- * 只要有一台成功，站点就是可达的；全灭才判故障。这不是投票：
- * 投票回答「大多数用户能访问吗」，我们要回答「站点是不是挂了」。
- *
- * 实测依据：单点失败率约 25%，「≥2 失败即故障」单轮误判 ≈15.6%，
- * 全灭才判故障只有 ≈1.56%，低一个数量级；站点真挂时 3 台会同时失败，检出能力不减。
- *
- *  ① failureSource === "internal" 的探针不参与判定（平台没测到站点，不能当失败票）。
- *  ② 全失败且有效票只有 1 张时作废（下一轮重发）——但只在本来派了多台时。
- *     探测点数设为 1 是用户选定的采样方式，必须如实判失败，否则该配置永不转红。
- *  ③ 代表值取成功票的中位数：失败票 ttfb 为 0，混进来会拉低响应时间。
- *  ④ 不推断「部分不可达」：1/3 成功仍记 up，票型只在有分歧时标注。
+ * 多探针判定：有一台成功即判可达，全灭才判故障（不是投票）。
+ * 单点失败率约 25%，"≥2 失败即故障"的误判率比"全灭"高一个数量级。
+ * internal 故障票不参与判定；全失败且只剩 1 票时作废重测；代表值取成功票中位数。
  */
 export function gpDecide(site, results) {
   const all = Array.isArray(results) ? results : [];

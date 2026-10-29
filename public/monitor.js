@@ -1,7 +1,5 @@
-/* 二级页面：单站点详情 —— 零框架、零外部依赖
-   数据来自单接口 /api/site（配置 + 状态 + SSL + 统计 + 序列 + 最近检查 + 故障记录）。
-   图表用原生 SVG 手绘（不引任何图表库，国内加载更稳，且体积为 0）。
-   策略与首页一致：先用 localStorage 的上次数据渲染，再后台拉新覆盖 —— 首屏不等网络。 */
+/* 单站点详情。数据来自 /api/site，图表用原生 SVG。
+   与首页一致：先渲染 localStorage 缓存，再拉新覆盖。 */
 
 const ICONS = {
   activity: '<path d="M22 12h-4l-3 9L9 3l-3 9H2"/>',
@@ -148,9 +146,7 @@ function renderKpis(d) {
 
 function renderChart(series, hours) {
   const box = qs("#chart");
-  // 服务端下发「槽的边界点」：n 个 1 小时槽 → n+1 个点（满窗口 25 个）。
-  // 首点 = 窗口左边界，末点 = 最后一次检查，两端由服务端算好，这里只按坐标画。
-  // 空槽（n=0）保留下来，v 为 null → 折线断开，时间轴长度恒定。
+  // 服务端下发槽边界点；v 为 null 表示空槽或全失败，折线在此断开。
   const pts = series || [];
   if (!pts.length || !pts.some((p) => p.n > 0)) {
     box.innerHTML = '<div class="chart-empty">暂无数据 —— 该窗口内还没有检查记录</div>';
@@ -380,8 +376,6 @@ function renderBars(bars) {
 
 /* ── 最近检查 / 故障记录 ───────────────────────────────── */
 
-// 注意：曾经这里是 renderRecent(recent, ssl)，但 ssl 从未被用到 —— 调用点也只传了一个。
-// 多余的形参容易让读者以为"最近检查"里会显示证书信息，删掉以免误导。
 function renderRecent(recent) {
   const el = qs("#recent");
   const list = recent || [];
@@ -394,9 +388,7 @@ function renderRecent(recent) {
     .map((r) => {
       const cls = r.ok ? "b-up" : "b-down";
       const label = r.ok ? "正常" : "故障";
-      // 来源标签由服务端算好（origin，格式 GP:CN · Beijing/9808）——
-      // 以前这里直接吐 source 原文（`gp:CN+datacenter-network · Beijing/45090`），
-      // 与首页 / 后台的写法各不相同。取不到 origin 时退回 source 原文，不显示空白。
+      // 来源标签由服务端统一格式化；取不到就退回 source
       const src = r.origin || r.source || "";
       return `<div class="lst-row">
         <span class="badge ${cls}">${label}</span>
