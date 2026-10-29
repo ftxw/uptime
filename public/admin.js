@@ -1,37 +1,32 @@
-/** 站点管理后台。零依赖，风格与前台共用 app.css。 */
+/** 后台管理 —— 零框架、零外部依赖，风格与前台共用 app.css。 */
 
 const API = "/api";
 const qs = (s) => document.querySelector(s);
 
-let SITES = [];
+/** 间隔的友好显示：60 → "1 小时"，其余 → "N 分钟" */
+const fmtInterval = (min) => {
+  const n = Number(min) || 5;
+  return n >= 60 ? `${n / 60} 小时` : `${n} 分钟`;
+};
+
+let SITES = [];   // 顺序 = 前台渲染顺序（分类 → sort → id）
 let CATS = [];
-let CAT = "";        // 当前分类，"" = 全部
-let Q = "";          // 搜索词
-let STATE = "";      // 状态筛选
-let AUTHD = false;
-let SETTINGS = null;
-let PROBE = null;
-let DRAG_SITE = null;
-let DRAG_CAT = null;
-let CAT_EDITING = null;
+let FILTER = "";  // "" = 全部
+let DRAG_CAT = null;     // 正在拖拽的分类名
+let DRAG_SITE = null;    // 正在拖拽的站点 id
+let AUTHED = false;
+let SETTINGS = null;     // /admin 一次性带回的设置，用于设置面板预填
+let PROBE = null;        // 探针健康：最近成功 / 失败 / 额度退避
 
 const UNGROUPED = "未分组";
+const ALL = "__all__";
 const groupOf = (s) => (s && s.group_name && String(s.group_name).trim()) || UNGROUPED;
 const siteById = (id) => SITES.find((s) => s.id === id);
-const STATE_LABEL = { up: "正常", down: "故障", degraded: "降级", unknown: "未检查" };
 
 const ICON = {
-  edit: '<path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/>',
-  del: '<path d="M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6"/>',
-  test: '<polygon points="6 3 20 12 6 21 6 3"/>',
-  more: '<circle cx="12" cy="5" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="12" cy="19" r="1"/>',
-  plus: '<path d="M12 5v14M5 12h14"/>',
-  x: '<path d="M18 6 6 18M6 6l12 12"/>',
-  pen: '<path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/>',
+  pen: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/></svg>',
+  x: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>',
 };
-const svg = (k, cls = "") =>
-  `<svg class="${cls}" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-    stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${ICON[k]}</svg>`;
 
 function escapeHtml(s) {
   return String(s ?? "").replace(/[&<>"']/g, (c) =>
@@ -48,32 +43,42 @@ function relTime(iso) {
   return `${Math.floor(s / 86400)} 天前`;
 }
 
-const fmtInterval = (min) => {
-  const n = Number(min) || 5;
-  return n >= 60 ? `${n / 60} 小时` : `${n} 分钟`;
-};
-
-/* ── 提示 ───────────────────────────────────────────────── */
-
+/** 顶部滑出 toast：短文案、自动消失。 */
 const TOAST_MS = { info: 3000, warn: 5000, error: 6000 };
 
 function banner(msg, kind) {
   const host = qs("#toast-host");
   if (!host || !msg) return;
+
   const el = document.createElement("div");
   el.className = "alert alert-" + (kind || "info") + " toast";
   el.textContent = msg;
   host.appendChild(el);
+
+  // 先入 DOM 再加 .show：否则首次渲染就已是终态，滑出动画不会播。
   requestAnimationFrame(() => el.classList.add("show"));
+
   setTimeout(() => {
     el.classList.remove("show");
-    setTimeout(() => el.remove(), 320);
+    setTimeout(() => el.remove(), 320); // 等过渡播完再摘掉节点
   }, TOAST_MS[kind] || TOAST_MS.info);
 }
 
+/** 未配置管理员密码时这是唯一界面：服务端 fail-closed，没有任何数据可显示。 */
+function showSetup() {
+  AUTHED = false;
+  // dialog 在 top layer，层级高于遮罩 —— 不关掉的话，用户看到的是
+  // 「设置弹窗」压在「后台已停用」遮罩上面，两个界面叠在一起。
+  for (const d of document.querySelectorAll("dialog[open]")) d.close();
+  qs("#setup-mask").hidden = false;
+  qs("#main").hidden = true;
+  qs("#logout").hidden = true;
+}
+
+/** 整屏遮罩类错误（401 / 403 need_setup）：遮罩已盖住界面，静默即可。 */
 const isMasked = (e) => Boolean(e && (e.needLogin || e.needSetup));
 
-/* ── 请求 ───────────────────────────────────────────────── */
+/* ── 请求封装：401 弹登录、403 need_setup 弹「后台已停用」───────── */
 
 async function api(path, opts = {}) {
   const headers = { accept: "application/json", ...(opts.headers || {}) };
@@ -83,57 +88,62 @@ async function api(path, opts = {}) {
     headers,
     body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
   });
+
+  // 先解析一次响应体：下面两种错误分支都要用它的 error 文案。
+  // （body 只能读一次，所以不能在各分支里各读一遍。）
   let d = null;
   try {
     d = await r.json();
   } catch {
     d = null;
   }
+
+  // 401 = 配了密码但没登录 / 会话过期 → 弹登录框
   if (r.status === 401) {
     showLogin();
     const e = new Error((d && d.error) || "未登录或会话已过期");
     e.needLogin = true;
     throw e;
   }
+
+  // 403 + need_setup = 服务端没配 ADMIN_PASSWORD，后台整体停用。
+  // 这时不能弹登录框 —— 密码根本没配置，输什么都进不去，
+  // 用户只会以为是自己记错了密码。改弹说明页，直接告诉他去设变量。
   if (r.status === 403 && d && d.need_setup) {
     showSetup();
     const e = new Error(d.error || "未设置管理员密码");
     e.needSetup = true;
     throw e;
   }
+
   return d || { ok: false, error: `HTTP ${r.status}` };
 }
 
 const post = (path, body) => api(path, { method: "POST", body });
 const del = (path) => api(path, { method: "DELETE" });
 
-/* ── 登录 ───────────────────────────────────────────────── */
+/* ── 登录 ──────────────────────────────────────────────── */
 
 function showLogin() {
-  AUTHD = false;
-  for (const d of document.querySelectorAll("dialog[open]")) d.close();
+  AUTHED = false;
   qs("#login-mask").hidden = false;
   qs("#main").hidden = true;
+  qs("#logout").hidden = true;
   setTimeout(() => qs("#login-pwd")?.focus(), 50);
 }
 
 function hideLogin() {
-  AUTHD = true;
+  AUTHED = true;
   qs("#login-mask").hidden = true;
   qs("#main").hidden = false;
-}
-
-function showSetup() {
-  AUTHD = false;
-  for (const d of document.querySelectorAll("dialog[open]")) d.close();
-  qs("#setup-mask").hidden = false;
-  qs("#main").hidden = true;
+  qs("#logout").hidden = false; // 已进入后台就常显「退出」
 }
 
 qs("#login-form").addEventListener("submit", async (e) => {
   e.preventDefault();
   const btn = qs("#login-btn");
   const err = qs("#login-err");
+  const pwd = qs("#login-pwd").value;
   err.hidden = true;
   btn.disabled = true;
   btn.textContent = "登录中…";
@@ -141,15 +151,16 @@ qs("#login-form").addEventListener("submit", async (e) => {
     const r = await fetch(`${API}/login`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ password: qs("#login-pwd").value }),
+      body: JSON.stringify({ password: pwd }),
     });
     const d = await r.json();
     if (!d.ok) throw new Error(d.error || "登录失败");
     qs("#login-pwd").value = "";
     hideLogin();
     await loadAll();
-  } catch (e2) {
-    err.textContent = e2.message;
+    banner("已登录", "info");
+  } catch (err2) {
+    err.textContent = err2.message;
     err.hidden = false;
   } finally {
     btn.disabled = false;
@@ -158,60 +169,21 @@ qs("#login-form").addEventListener("submit", async (e) => {
 });
 
 qs("#logout").addEventListener("click", async () => {
-  // all:true 让服务端递增会话纪元，作废所有已签发的会话
+  // all:true —— 让服务端轮换签名密钥，作废这台设备以外可能已经泄露的所有会话。
+  // 会话本身是无状态签名 token，这是唯一能真正"下线"它们的办法。
   await post("/logout", { all: true }).catch(() => {});
   SITES = [];
   CATS = [];
+  qs("#rows").innerHTML = "";
+  qs("#cats").innerHTML = "";
   showLogin();
 });
 
-qs("#setup-reload").addEventListener("click", () => location.reload());
-
-/* ── 概览条 ─────────────────────────────────────────────── */
-
-function renderOverview() {
-  const el = qs("#overview");
-  if (!SITES.length) {
-    el.hidden = true;
-    return;
-  }
-  el.hidden = false;
-  const enabled = SITES.filter((s) => s.enabled);
-  const n = (st) => enabled.filter((s) => s.state === st).length;
-  // 额度按 60/间隔 * 点数 累加（1 分钟档实际约 2 分钟，按 2 计）
-  const limit = Number(SETTINGS?.gp_limit) || 3;
-  const cap = SETTINGS?.has_globalping_token ? 500 : 250;
-  let need = 0;
-  for (const s of enabled) need += (60 / Math.max(2, Number(s.interval_min) || 5)) * limit;
-  const pct = Math.min(999, Math.round((need / cap) * 100));
-
-  el.innerHTML = `
-    <div class="adm-stat">
-      <span class="k">站点</span>
-      <span class="v">${enabled.length}<span class="of">/${SITES.length}</span></span>
-    </div>
-    <div class="adm-stat">
-      <span class="k">正常</span>
-      <span class="v ok">${n("up")}</span>
-    </div>
-    <div class="adm-stat">
-      <span class="k">故障</span>
-      <span class="v bad">${n("down")}</span>
-    </div>
-    <div class="adm-stat">
-      <span class="k">降级</span>
-      <span class="v warn">${n("degraded")}</span>
-    </div>
-    <div class="adm-stat adm-quota" title="按启用站点与间隔估算的 Globalping 额度占用">
-      <span class="k">额度占用</span>
-      <span class="v ${pct >= 90 ? "bad" : pct >= 70 ? "warn" : ""}">${pct}%<span class="of">${Math.round(need)}/${cap}</span></span>
-    </div>`;
-}
-
-/* ── 分类条 ─────────────────────────────────────────────── */
+/* ── 目录 / 列表渲染 ───────────────────────────────────── */
 
 const cmps = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
 
+/** 分组顺序按 CATS 下标，与左侧目录一致；不在 CATS 的排末尾。 */
 function groupRank(name) {
   const i = CATS.findIndex((c) => c.name === name);
   return i < 0 ? Number.MAX_SAFE_INTEGER : i;
@@ -227,170 +199,217 @@ function sortSites(list) {
   );
 }
 
-function renderCats() {
-  const el = qs("#cats");
+const visibleSites = () => (FILTER ? SITES.filter((s) => groupOf(s) === FILTER) : SITES);
+
+/** 左侧分类目录：全部 → 各分类 → 未分组（永远常显，方便把游离站点归拢） */
+function catDir() {
   const counts = new Map();
   for (const s of SITES) {
     const g = groupOf(s);
     counts.set(g, (counts.get(g) || 0) + 1);
   }
+  const list = [{ key: ALL, name: "全部", count: SITES.length, system: true }];
+
   const ungroupedExplicit = CATS.some((c) => c.name === UNGROUPED);
-  const items = [{ key: "", name: "全部", count: SITES.length, system: true }];
-  for (const c of CATS) items.push({ key: c.name, name: c.name, count: counts.get(c.name) || 0 });
-  for (const [g, cnt] of counts) {
-    if (g === UNGROUPED) continue;
-    if (!CATS.some((c) => c.name === g)) items.push({ key: g, name: g, count: cnt });
+
+  // 显式分类（含「未分组」）—— 一律常显，不再因无站点而隐藏
+  for (const c of CATS) {
+    list.push({ key: c.name, name: c.name, count: counts.get(c.name) || 0 });
   }
+  // 站点上出现、但未登记进分类表的分类名（例如直接手输的分类名）
+  for (const [g, n] of counts) {
+    if (g === UNGROUPED) continue; // 未分组单独兜底，避免重复
+    if (!CATS.some((c) => c.name === g)) list.push({ key: g, name: g, count: n });
+  }
+  // 「未分组」兜底项：永远常显（即使没有任何站点落在它名下）
   if (!ungroupedExplicit) {
-    items.push({ key: UNGROUPED, name: UNGROUPED, count: counts.get(UNGROUPED) || 0, system: true });
+    list.push({ key: UNGROUPED, name: UNGROUPED, count: counts.get(UNGROUPED) || 0, system: true });
+  }
+  return list;
+}
+
+function renderCats() {
+  const el = qs("#cats");
+  const dir = catDir();
+  fillGroupSelect();
+  // 与右栏「站点 N 个」对齐：两侧标题都带数量说明（"全部"与"未分组"是系统项，不计入）
+  const cnt = qs("#cats-count");
+  if (cnt) {
+    const real = dir.filter((it) => it.key !== ALL && it.key !== UNGROUPED).length;
+    cnt.textContent = `${real} 个`;
   }
 
-  el.innerHTML =
-    items
-      .map(
-        (it) => `<div class="chip${CAT === it.key ? " on" : ""}${it.system ? " chip-fixed" : ""}"
-          role="listitem" data-cat="${escapeHtml(it.key)}" ${it.system ? "" : 'draggable="true"'}
-          tabindex="0">
-          <span class="nm">${escapeHtml(it.name)}</span>
-          <span class="n">${it.count}</span>
-          ${
-            it.system
-              ? ""
-              : `<span class="ops">
-                   <button data-act="cat-edit" data-name="${escapeHtml(it.key)}" title="重命名">${svg("pen")}</button>
-                   <button data-act="cat-del" data-name="${escapeHtml(it.key)}" title="删除">${svg("x")}</button>
-                 </span>`
-          }
-        </div>`
-      )
-      .join("") +
-    `<button class="chip chip-add" id="cat-add" title="新建分类">${svg("plus")}分类</button>`;
+  el.innerHTML = dir
+    .map((it) => {
+      const on = FILTER === (it.key === ALL ? "" : it.key);
+      const ops = it.system
+        ? ""
+        : `<span class="ops">
+            <button data-act="cat-edit" data-name="${escapeHtml(it.name)}" title="编辑名称">${ICON.pen}</button>
+            <button data-act="cat-del" data-name="${escapeHtml(it.name)}" title="删除分类">${ICON.x}</button>
+          </span>`;
 
-  // 重新绑定（innerHTML 后节点是新的）
-  el.querySelectorAll(".chip-add").forEach((b) => b.addEventListener("click", () => openCatForm(null)));
+      // 「全部」是系统项：不可重命名/删除，也不参与排序
+      return `<div class="cat-item${on ? " on" : ""}" data-cat="${
+        it.key === ALL ? "" : escapeHtml(it.key)
+      }" ${it.system ? "" : 'draggable="true"'} role="button" tabindex="0">
+        <span class="nm">${escapeHtml(it.name)}</span>
+        ${ops}
+        <span class="n">${it.count}</span>
+      </div>`;
+    })
+    .join("");
 }
 
-/* ── 站点列表 ───────────────────────────────────────────── */
-
-function visibleSites() {
-  const q = Q.trim().toLowerCase();
-  return SITES.filter((s) => {
-    if (CAT && groupOf(s) !== CAT) return false;
-    if (STATE === "paused" && s.enabled) return false;
-    if (STATE && STATE !== "paused" && (!s.enabled || s.state !== STATE)) return false;
-    if (!q) return true;
-    return (
-      String(s.name).toLowerCase().includes(q) ||
-      String(s.url).toLowerCase().includes(q) ||
-      String(s.id).toLowerCase().includes(q)
-    );
-  });
+/** 分类下拉只列已有分类；新建/改名统一在左侧分类栏做，避免两个入口状态不一致。 */
+function fillGroupSelect(current) {
+  const sel = qs("#f-group");
+  if (!sel) return;
+  const keep = current ?? sel.value;
+  const names = CATS.map((c) => c.name);
+  // 「未分组」永远作为兜底项 —— 还没建过任何分类时下拉不能是空的
+  if (!names.includes(UNGROUPED)) names.unshift(UNGROUPED);
+  if (keep && !names.includes(keep)) names.push(keep);
+  sel.innerHTML = names
+    .map((n) => `<option value="${escapeHtml(n)}">${escapeHtml(n)}</option>`)
+    .join("");
+  if (keep && names.includes(keep)) sel.value = keep;
 }
 
-function sslText(s) {
-  if (!s.ssl_checked_ts) return { text: "未检测", cls: "" };
-  if (s.ssl_error) return { text: "未知", cls: "warn" };
+/** 间隔下拉动态补项，绝不静默改写站点间隔（服务端允许 1–1440 任意值）。 */
+function fillIntervalSelect(current) {
+  const sel = qs("#f-interval");
+  if (!sel) return;
+  const want = String(current ?? 5);
+  if (![...sel.options].some((o) => o.value === want)) {
+    const o = document.createElement("option");
+    o.value = want;
+    o.textContent = fmtInterval(want);
+    sel.appendChild(o);
+  }
+  sel.value = want;
+}
+
+/** 证书降级阈值跟随后台设置，不写死。 */
+function warnDays() {
+  const n = Number(SETTINGS && SETTINGS.ssl_warn_days);
+  return Number.isFinite(n) && n > 0 ? n : 14;
+}
+
+/** 证书单元格：入参是摊平了 ssl_* 的站点行。 */
+function sslCell(s) {
+  if (!s || !s.ssl_checked_ts) return `<span class="muted">未检测</span>`;
+  if (s.ssl_error) return `<span class="ssl ssl-warn">未知</span>`;
   const d = s.ssl_days_left;
-  if (d === null || d === undefined) return { text: "有效", cls: "ok" };
-  if (d < 0) return { text: "已过期", cls: "bad" };
-  if (s.ssl_authorized === 0) return { text: "无效", cls: "bad" };
-  const warn = Number(SETTINGS?.ssl_warn_days ?? 14);
-  return { text: `${d} 天`, cls: d <= warn ? "warn" : "ok" };
+  let cls = "ssl-ok";
+  if (s.ssl_authorized === 0) cls = "ssl-bad";
+  else if (d !== null && d <= warnDays()) cls = "ssl-warn";
+  const text = d === null ? "有效" : d < 0 ? "已过期" : `${d} 天`;
+  return `<span class="ssl ${cls}" title="${escapeHtml(s.ssl_issuer || "")} · ${escapeHtml(
+    s.ssl_protocol || ""
+  )} · 到期 ${escapeHtml(s.ssl_expires_at || "")}">${text}</span>`;
 }
 
-function siteRow(s) {
-  const st = !s.enabled ? "paused" : s.state || "unknown";
-  const label = st === "paused" ? "已暂停" : STATE_LABEL[st] || "未检查";
-  const ssl = sslText(s);
-  const drag = CAT ? ' draggable="true"' : "";
-  const reason = s.degrade_reason
-    ? `<span class="adm-reason">${escapeHtml(s.degrade_reason)}</span>`
-    : "";
-
-  return `<div class="adm-row st-${st}" data-id="${escapeHtml(s.id)}"${drag}>
-    <div class="adm-status" title="${label}"><i></i></div>
-    <div class="adm-main">
-      <div class="adm-name">
-        <span class="nm">${escapeHtml(s.name)}</span>
-        <span class="badge b-${st === "paused" ? "unknown" : st}">${label}</span>
-        ${reason}
-      </div>
-      <div class="adm-meta">
-        <a class="url" href="${escapeHtml(s.url)}" target="_blank" rel="noopener noreferrer"
-           title="${escapeHtml(s.url)}">${escapeHtml(s.url)}</a>
-        <span class="sep">·</span>
-        <span>${fmtInterval(s.interval_min)}</span>
-        ${s.ssl_checked_ts ? `<span class="sep">·</span><span class="ssl ${ssl.cls}" title="${escapeHtml(s.ssl_issuer || "")}">证书 ${ssl.text}</span>` : ""}
-        ${s.last_ts ? `<span class="sep">·</span><span title="${escapeHtml(s.last_source || "")}">${relTime(s.last_ts)}</span>` : ""}
-        ${s.hide_url ? `<span class="sep">·</span><span class="muted">地址已隐藏</span>` : ""}
-      </div>
-    </div>
-    <div class="adm-actions">
-      <button class="icon-btn" data-act="test" data-id="${escapeHtml(s.id)}" title="立即测试">${svg("test")}</button>
-      <button class="icon-btn" data-act="edit" data-id="${escapeHtml(s.id)}" title="编辑">${svg("edit")}</button>
-      <button class="icon-btn danger" data-act="del" data-id="${escapeHtml(s.id)}" title="删除">${svg("del")}</button>
-    </div>
-  </div>`;
-}
-
-function renderList() {
-  const el = qs("#list");
+async function renderRows() {
   const list = visibleSites();
+  const title = FILTER || "全部";
+  // 拖拽排序只在具体分类视图下开放：「全部」视图里列表混着多个分类，而 sort
+  // 只在同一分类内比较 —— 跨分类拖拽改了 sort 也不改变它所在的位置，表现为
+  // 「拖了没反应」。与其让用户对着一个静默失败的手势猜，不如先要求选个分类。
+  const canDrag = Boolean(FILTER);
+  qs("#sites-title").innerHTML = `站点 <span class="sec-sub">${escapeHtml(title)} · ${list.length} 个 · ${
+    canDrag ? "可拖拽排序" : "选择分类后可拖拽排序"
+  }</span>`;
 
   if (!list.length) {
-    const first = !SITES.length;
-    el.innerHTML = `<div class="card glass empty-lg">
-      ${first ? `<p class="t">还没有站点</p><p class="s">点右上角「添加站点」开始监测。</p>`
-             : `<p class="t">没有匹配的站点</p><p class="s">试试换个关键词或清除筛选。</p>`}
-    </div>`;
-  } else {
-    el.innerHTML = list.map(siteRow).join("");
+    qs("#rows").innerHTML = `<tr><td colspan="5" class="empty">${
+      SITES.length ? "该分类下还没有站点" : "还没有站点，点右上角「添加站点」"
+    }</td></tr>`;
+    return;
   }
 
-  qs("#foot").textContent = CAT
-    ? `在「${CAT}」内可拖拽调整顺序`
-    : "选择分类后可拖拽调整站点顺序";
+  qs("#rows").innerHTML = list
+    .map((s) => {
+      // 三态（与前台同一口径）：后端在 buildAdminPayload 里用 stateOf() 算好，
+      // 这里不能只看 last_ok —— 那会把「证书快过期 / 响应偏慢」的站点显示成绿色「正常」，
+      // 而后台恰恰是最该看到降级的地方。
+      const st =
+        s.state === "up"
+          ? "正常"
+          : s.state === "down"
+          ? "故障"
+          : s.state === "degraded"
+          ? "降级"
+          : "未检查";
+      const cls =
+        s.state === "up"
+          ? "b-up"
+          : s.state === "down"
+          ? "b-down"
+          : s.state === "degraded"
+          ? "b-degraded"
+          : "b-unknown";
+      // 降级原因放在 badge 的 title 里，鼠标悬浮可见（不额外占列宽）
+      const stTitle = s.degrade_reason ? ` title="${escapeHtml(s.degrade_reason)}"` : "";
+      const g = groupOf(s);
+
+      return `<tr data-id="${escapeHtml(s.id)}" data-group="${escapeHtml(g)}"${
+        canDrag ? ' draggable="true"' : ""
+      }>
+        <td>
+          <div class="cell-name">${escapeHtml(s.name)}${
+        s.enabled ? "" : ' <span class="tag">已暂停</span>'
+      }</div>
+          <div class="cell-sub"${s.origin ? ` title="${escapeHtml(s.origin)}"` : ""}>${fmtInterval(s.interval_min)}</div>
+        </td>
+        <td><span class="cell-url mono">${escapeHtml(s.url)}</span>${
+        // 后台看到明文地址才能编辑，所以额外标「已隐藏」
+        s.hide_url ? ' <span class="tag">已隐藏</span>' : ""
+      }</td>
+        <td>${sslCell(s)}</td>
+        <td><span class="badge ${cls}"${stTitle}>${st}</span><div class="cell-sub">${relTime(s.last_ts)}</div></td>
+        <td class="cell-actions">
+          <button class="btn btn-sm" data-act="proxy-test" data-id="${escapeHtml(s.id)}">测</button>
+          <button class="btn btn-sm" data-act="edit" data-id="${escapeHtml(s.id)}">编辑</button>
+          <button class="btn btn-sm btn-danger" data-act="del" data-id="${escapeHtml(s.id)}">删除</button>
+        </td>
+      </tr>`;
+    })
+    .join("");
 }
 
-/* ── 数据加载 ───────────────────────────────────────────── */
+/** 页头品牌名跟随站点标题（数据已由 /admin 带回，不必再单独请求 /api/overview） */
+function applyBrandTitle(st) {
+  const t = st && st.site_title;
+  if (!t) return;
+  document.title = `${t} · 管理`;
+  const b = document.getElementById("brand-name");
+  if (b) b.textContent = t;
+}
 
+/** 后台一次请求拿全：站点 + 最近状态 + 分类 + 设置。 */
+/** 拉取后台全量数据；401/403 必须继续抛，bootstrap 靠异常判断有没有进去。 */
 async function loadAll() {
   const d = await api("/admin");
-  if (!d.ok) throw new Error((d.error || "加载失败") + (d.hint ? `（${d.hint}）` : ""));
-  CATS = d.categories || [];
-  SETTINGS = d.settings || SETTINGS;
-  PROBE = d.probe || null;
-  SITES = sortSites(d.sites || []);
-  if (CAT && !CATS.some((c) => c.name === CAT) && CAT !== UNGROUPED) CAT = "";
-
-  const t = SETTINGS && SETTINGS.site_title;
-  if (t) {
-    document.title = `${t} · 管理`;
-    const b = document.getElementById("brand-name");
-    if (b) b.textContent = t;
+  if (!d.ok) {
+    // 异常必须继续往上抛：否则 bootstrap 会误判加载成功。
+    throw new Error((d.error || "加载失败") + (d.hint ? `｜${d.hint}` : ""));
   }
 
-  renderOverview();
+  // CATS 必须先赋值：sortSites 依赖它算分组顺序。
+  CATS = d.categories || [];
+  SITES = sortSites(d.sites || []);
+  if (d.settings) SETTINGS = d.settings; // 供设置面板预填，打开时不必先等网络
+  PROBE = d.probe || null;
+  applyBrandTitle(SETTINGS);
+
   renderCats();
-  renderList();
+  await renderRows();
+  // 额度账随「站点数 / 间隔 / 是否配 Token」变，这三者都由 /admin 带回，故在这里统一重算
+  renderQuota();
 }
 
-/* ── 筛选交互 ───────────────────────────────────────────── */
-
-qs("#q").addEventListener("input", (e) => {
-  Q = e.target.value;
-  renderList();
-});
-
-qs("#state-filter").addEventListener("click", (e) => {
-  const b = e.target.closest("button[data-state]");
-  if (!b) return;
-  STATE = b.dataset.state;
-  qs("#state-filter")
-    .querySelectorAll("button")
-    .forEach((x) => x.classList.toggle("on", x === b));
-  renderList();
-});
+/* ── 分类：切换 / 新建 / 改名 / 删除 / 排序 ─────────────── */
 
 qs("#cats").addEventListener("click", async (e) => {
   const actBtn = e.target.closest("button[data-act]");
@@ -398,52 +417,70 @@ qs("#cats").addEventListener("click", async (e) => {
     e.stopPropagation();
     return handleCatAction(actBtn);
   }
-  const chip = e.target.closest(".chip[data-cat]");
-  if (!chip) return;
-  CAT = chip.dataset.cat || "";
+  const item = e.target.closest(".cat-item");
+  if (!item) return;
+  FILTER = item.dataset.cat || "";
   renderCats();
-  renderList();
+  renderRows();
 });
 
 qs("#cats").addEventListener("keydown", (e) => {
   if (e.key !== "Enter" && e.key !== " ") return;
+  // 分类项里还嵌着「编辑 / 删除」两个按钮。Enter / Space 在按钮上的默认动作就是"点击"，
+  // 而下面那句 preventDefault() 会把这个默认动作吃掉 —— 不放行按钮的话，
+  // 键盘用户按下去毫无反应（鼠标点击是另一条路径，所以只有键盘会撞上）。
   if (e.target.closest("button")) return;
-  const chip = e.target.closest(".chip[data-cat]");
-  if (!chip) return;
+  const item = e.target.closest(".cat-item");
+  if (!item) return;
   e.preventDefault();
-  CAT = chip.dataset.cat || "";
+  FILTER = item.dataset.cat || "";
   renderCats();
-  renderList();
+  renderRows();
 });
-
-/* ── 分类操作 ───────────────────────────────────────────── */
 
 async function handleCatAction(btn) {
   const act = btn.dataset.act;
   const name = btn.dataset.name;
-  if (act === "cat-edit") return openCatForm(name);
-  if (act !== "cat-del") return;
 
-  const n = SITES.filter((s) => groupOf(s) === name).length;
-  if (!confirm(`删除分类「${name}」？\n其中 ${n} 个站点会移到「${UNGROUPED}」，站点本身不删除。`)) return;
-  try {
-    const d = await post("/categories", { action: "delete", name });
-    if (!d.ok) throw new Error(d.error || "删除失败");
-    if (CAT === name) CAT = "";
-    banner(`已删除「${name}」`, "info");
-    await loadAll();
-  } catch (err) {
-    if (!isMasked(err)) banner("删除失败：" + err.message, "error");
+  if (act === "cat-edit") return openCatForm(name);
+
+  if (act === "cat-del") {
+    const n = CATS.find((c) => c.name === name)?.count ?? 0;
+    if (
+      !confirm(
+        `删除分类「${name}」？\n该分类下的 ${n} 个站点会被移到「${UNGROUPED}」，站点本身不会被删除。`
+      )
+    )
+      return;
+    try {
+      const d = await post("/categories", { action: "delete", name });
+      if (!d.ok) throw new Error(d.error || "删除失败");
+      if (FILTER === name) FILTER = "";
+      banner(`已删除分类「${name}」，${n} 个站点移到「${UNGROUPED}」`, "info");
+      await loadAll();
+    } catch (err) {
+      if (!isMasked(err)) banner("删除失败：" + err.message, "error");
+    }
   }
 }
 
+/** 取消/关闭按钮统一在这里关弹窗；刻意不是 submit，避免隐式提交误触。 */
+for (const b of document.querySelectorAll("[data-close]")) {
+  b.addEventListener("click", () => b.closest("dialog")?.close());
+}
+
+/* ── 分类表单弹窗（新建 / 重命名共用同一个 dialog）───────── */
+
 const catdlg = qs("#catdlg");
+let CAT_EDITING = null; // null = 新建；否则是正在重命名的原分类名
 
 function openCatForm(name) {
   CAT_EDITING = name || null;
-  qs("#catdlg-title").textContent = name ? "重命名分类" : "新建分类";
+  qs("#catdlg-title").textContent = name ? "编辑分类" : "添加分类";
   qs("#c-name").value = name || "";
-  qs("#c-name-hint").textContent = name ? "重命名会同步更新该分类下的所有站点" : "只影响分组展示";
+  qs("#c-name-hint").textContent = name
+    ? "重命名会同步更新该分类下的所有站点"
+    : "分类只用于分组展示，不影响探测行为";
   qs("#catdlg-err").hidden = true;
   catdlg.showModal();
   setTimeout(() => {
@@ -453,18 +490,26 @@ function openCatForm(name) {
   }, 50);
 }
 
+qs("#cat-add-toggle").addEventListener("click", () => openCatForm(null));
+
 qs("#catform").addEventListener("submit", async (e) => {
+  // 只处理 submitter 为 save 的提交；submitter 为空也按保存走。
   if (e.submitter && e.submitter.value !== "save") return;
   e.preventDefault();
+
   const errEl = qs("#catdlg-err");
   const name = qs("#c-name").value.trim();
   errEl.hidden = true;
+
   if (!name) {
     errEl.textContent = "请输入分类名称";
     errEl.hidden = false;
     return;
   }
-  if (CAT_EDITING && name === CAT_EDITING) return catdlg.close();
+  if (CAT_EDITING && name === CAT_EDITING) {
+    catdlg.close();
+    return;
+  }
 
   const btn = qs("#cat-save");
   btn.disabled = true;
@@ -474,8 +519,14 @@ qs("#catform").addEventListener("submit", async (e) => {
       ? await post("/categories", { action: "rename", name: CAT_EDITING, new_name: name })
       : await post("/categories", { action: "create", name });
     if (!d.ok) throw new Error(d.error || "保存失败");
-    if (CAT_EDITING && CAT === CAT_EDITING) CAT = name;
-    else CAT = name;
+
+    if (CAT_EDITING) {
+      if (FILTER === CAT_EDITING) FILTER = name;
+      banner(`已重命名「${CAT_EDITING}」→「${name}」`, "info");
+    } else {
+      FILTER = name; // 新建后直接切过去，方便紧接着往里加站点
+      banner(`已创建分类「${name}」`, "info");
+    }
     CAT_EDITING = null;
     catdlg.close();
     await loadAll();
@@ -488,282 +539,253 @@ qs("#catform").addEventListener("submit", async (e) => {
   }
 });
 
-/* 分类拖拽排序 */
-qs("#cats").addEventListener("dragstart", (e) => {
-  const item = e.target.closest('.chip[draggable="true"]');
+/* ── 分类拖拽排序（与站点拖拽互不干扰：各用独立状态与容器监听）── */
+
+const catList = qs("#cats");
+
+/** 从 DOM 读当前顺序（跳过后台的系统项「全部」）—— 比从 CATS 推更贴合用户所见 */
+function catOrderFromDom() {
+  return [...catList.querySelectorAll(".cat-item[data-cat]")]
+    .map((el) => el.dataset.cat)
+    .filter(Boolean);
+}
+
+/** 拖拽结束后提交新顺序，只提交显式分类。 */
+async function saveCatOrder(names) {
+  const explicit = new Set(CATS.filter((c) => c.explicit).map((c) => c.name));
+  const only = names.filter((n) => explicit.has(n));
+  if (!only.length) return;
+  try {
+    const d = await post("/categories", { action: "reorder", names: only });
+    if (!d.ok) throw new Error(d.error || "排序失败");
+    banner("分类顺序已保存", "info");
+    await loadAll();
+  } catch (err) {
+    if (!isMasked(err)) banner("分类排序失败：" + err.message, "error");
+    await loadAll().catch(() => {}); // 同上：catch 里再抛会变成未处理的 rejection
+  }
+}
+
+catList.addEventListener("dragstart", (e) => {
+  const item = e.target.closest('.cat-item[draggable="true"]');
   if (!item) return;
   DRAG_CAT = item.dataset.cat;
   try {
     e.dataTransfer.effectAllowed = "move";
     e.dataTransfer.setData("text/plain", DRAG_CAT);
-  } catch {}
+  } catch (err) {}
   item.classList.add("dragging");
 });
 
-qs("#cats").addEventListener("dragend", () => {
+catList.addEventListener("dragend", () => {
   DRAG_CAT = null;
-  qs("#cats")
-    .querySelectorAll(".chip")
+  catList
+    .querySelectorAll(".cat-item")
     .forEach((el) => el.classList.remove("dragging", "drag-over"));
 });
 
-qs("#cats").addEventListener("dragover", (e) => {
+catList.addEventListener("dragover", (e) => {
   if (!DRAG_CAT) return;
-  const item = e.target.closest('.chip[draggable="true"]');
+  const item = e.target.closest('.cat-item[draggable="true"]');
   if (!item) return;
   e.preventDefault();
   e.dataTransfer.dropEffect = "move";
-  qs("#cats")
-    .querySelectorAll(".chip.drag-over")
+  catList
+    .querySelectorAll(".cat-item.drag-over")
     .forEach((el) => el.classList.remove("drag-over"));
   item.classList.add("drag-over");
 });
 
-qs("#cats").addEventListener("drop", (e) => {
+catList.addEventListener("drop", (e) => {
   if (!DRAG_CAT) return;
-  const item = e.target.closest('.chip[draggable="true"]');
+  const item = e.target.closest('.cat-item[draggable="true"]');
   if (!item) return;
   e.preventDefault();
+
   const src = DRAG_CAT;
   const target = item.dataset.cat;
   DRAG_CAT = null;
+  catList
+    .querySelectorAll(".cat-item")
+    .forEach((el) => el.classList.remove("dragging", "drag-over"));
   if (!target || target === src) return;
 
-  const names = [...qs("#cats").querySelectorAll(".chip[data-cat]")]
-    .map((el) => el.dataset.cat)
-    .filter(Boolean);
+  const names = catOrderFromDom();
   const si = names.indexOf(src);
   if (si < 0) return;
   names.splice(si, 1);
   const di = names.indexOf(target);
   names.splice(di < 0 ? names.length : di, 0, src);
-
-  const explicit = new Set(CATS.map((c) => c.name));
-  const only = names.filter((n) => explicit.has(n));
-  if (!only.length) return;
-  post("/categories", { action: "reorder", names: only })
-    .then((d) => {
-      if (!d.ok) throw new Error(d.error || "排序失败");
-      return loadAll();
-    })
-    .catch((err) => {
-      if (!isMasked(err)) banner("排序失败：" + err.message, "error");
-      loadAll().catch(() => {});
-    });
+  saveCatOrder(names);
 });
 
-/* ── 站点拖拽排序 ───────────────────────────────────────── */
+/* ── 站点列表拖拽排序 ───────────────────────────────────── */
 
-qs("#list").addEventListener("dragstart", (e) => {
-  const row = e.target.closest('.adm-row[draggable="true"]');
-  if (!row) return;
-  DRAG_SITE = row.dataset.id;
+const rowsEl = qs("#rows");
+
+function clearRowDragUi() {
+  rowsEl
+    .querySelectorAll(".row-dragging, .row-drag-over")
+    .forEach((el) => el.classList.remove("row-dragging", "row-drag-over"));
+}
+
+/** 提交站点新顺序：只传当前视图下全部站点的 id。 */
+async function saveSiteOrder(ids) {
+  try {
+    const d = await post("/sites", { action: "reorder", ids });
+    if (!d.ok) throw new Error(d.error || "排序失败");
+    banner("站点顺序已保存", "info");
+  } catch (err) {
+    if (!isMasked(err)) banner("站点排序失败：" + err.message, "error");
+  }
+  await loadAll().catch(() => {});
+}
+
+rowsEl.addEventListener("dragstart", (e) => {
+  const tr = e.target.closest('tr[draggable="true"]');
+  if (!tr) return;
+  DRAG_SITE = tr.dataset.id;
   try {
     e.dataTransfer.effectAllowed = "move";
     e.dataTransfer.setData("text/plain", DRAG_SITE);
-  } catch {}
-  row.classList.add("dragging");
+  } catch (err) {}
+  tr.classList.add("row-dragging");
 });
 
-qs("#list").addEventListener("dragend", () => {
+rowsEl.addEventListener("dragend", () => {
   DRAG_SITE = null;
-  qs("#list")
-    .querySelectorAll(".adm-row")
-    .forEach((el) => el.classList.remove("dragging", "drag-over"));
+  clearRowDragUi();
 });
 
-qs("#list").addEventListener("dragover", (e) => {
+rowsEl.addEventListener("dragover", (e) => {
   if (!DRAG_SITE) return;
-  const row = e.target.closest('.adm-row[draggable="true"]');
-  if (!row) return;
-  e.preventDefault();
+  const tr = e.target.closest('tr[draggable="true"]');
+  if (!tr) return;
+  e.preventDefault(); // 不 preventDefault 就没有后续的 drop 事件
   e.dataTransfer.dropEffect = "move";
-  qs("#list")
-    .querySelectorAll(".adm-row.drag-over")
-    .forEach((el) => el.classList.remove("drag-over"));
-  row.classList.add("drag-over");
+  rowsEl
+    .querySelectorAll(".row-drag-over")
+    .forEach((el) => el.classList.remove("row-drag-over"));
+  tr.classList.add("row-drag-over");
 });
 
-qs("#list").addEventListener("drop", (e) => {
+rowsEl.addEventListener("drop", (e) => {
   if (!DRAG_SITE) return;
-  const row = e.target.closest('.adm-row[draggable="true"]');
-  if (!row) return;
+  const tr = e.target.closest('tr[draggable="true"]');
+  if (!tr) return;
   e.preventDefault();
+
   const src = DRAG_SITE;
-  const target = row.dataset.id;
+  const target = tr.dataset.id;
   DRAG_SITE = null;
-  qs("#list")
-    .querySelectorAll(".adm-row")
-    .forEach((el) => el.classList.remove("dragging", "drag-over"));
+  clearRowDragUi();
   if (!target || target === src) return;
 
-  const ids = [...qs("#list").querySelectorAll(".adm-row")].map((el) => el.dataset.id);
+  // 取的是拖拽前的 DOM 顺序（拖动过程中没有实时挪行），所以先摘掉源、再插到目标位
+  const ids = [...rowsEl.querySelectorAll("tr[data-id]")].map((el) => el.dataset.id);
   const si = ids.indexOf(src);
   if (si < 0) return;
   ids.splice(si, 1);
   const di = ids.indexOf(target);
   ids.splice(di < 0 ? ids.length : di, 0, src);
-
-  post("/sites", { action: "reorder", ids })
-    .then((d) => {
-      if (!d.ok) throw new Error(d.error || "排序失败");
-      return loadAll();
-    })
-    .catch((err) => {
-      if (!isMasked(err)) banner("排序失败：" + err.message, "error");
-      loadAll().catch(() => {});
-    });
+  saveSiteOrder(ids);
 });
 
-/* ── 站点表单 ───────────────────────────────────────────── */
+/* ── 站点表单 ──────────────────────────────────────────── */
 
 const dlg = qs("#dlg");
 
-function fillGroupSelect(current) {
-  const sel = qs("#f-group");
-  const names = CATS.map((c) => c.name);
-  if (!names.includes(UNGROUPED)) names.unshift(UNGROUPED);
-  if (current && !names.includes(current)) names.push(current);
-  sel.innerHTML = names.map((n) => `<option value="${escapeHtml(n)}">${escapeHtml(n)}</option>`).join("");
-  if (current) sel.value = current;
-}
-
-function fillIntervalSelect(current) {
-  const sel = qs("#f-interval");
-  const want = String(current ?? 5);
-  if (![...sel.options].some((o) => o.value === want)) {
-    const o = document.createElement("option");
-    o.value = want;
-    o.textContent = fmtInterval(want);
-    sel.appendChild(o);
-  }
-  sel.value = want;
-}
-
-function slugifyId(name) {
-  const slug = String(name || "")
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-|-$/g, "")
-    .slice(0, 40);
-  if (slug) return slug;
-  // 纯中文名会得到空串，必须退回随机 id，否则保存会被静默丢弃
-  const rand = Array.from(crypto.getRandomValues(new Uint8Array(4)))
-    .map((b) => b.toString(16).padStart(2, "0"))
-    .join("");
-  return `site-${rand}`;
-}
+/** 表单里最终选定的分类名 */
+const currentGroupValue = () => qs("#f-group").value || UNGROUPED;
 
 function openForm(site) {
   qs("#dlg-title").textContent = site ? "编辑站点" : "添加站点";
   qs("#f-id").value = site?.id || "";
   qs("#f-id").readOnly = Boolean(site);
+  // ⚠️ 必须清掉「用户手动改过 ID」的标记：它挂在 DOM 元素上，会跟着弹窗活到下一次打开。
+  //    不清的话，第一次新建时手动改过一次 ID，此后每次「添加站点」输名称都不再联动生成 ID，
+  //    看起来就像"自动生成功能坏了"。编辑态由 readOnly 挡住，不需要这个标记。
   delete qs("#f-id").dataset.touched;
   qs("#f-name").value = site?.name || "";
   qs("#f-url").value = site?.url || "";
+  // 勾选框 = 布尔开关，默认不勾（与数据库默认值 0 一致）
   qs("#f-hideurl").checked = Boolean(site?.hide_url);
-  fillGroupSelect(site?.group_name || (CAT && CAT !== UNGROUPED ? CAT : UNGROUPED));
+  // 新建时预填当前筛选的分类，少点一次
+  fillGroupSelect(
+    site?.group_name || (FILTER && FILTER !== UNGROUPED ? FILTER : UNGROUPED)
+  );
   qs("#f-codes").value = site?.expect_codes || "";
   qs("#f-threshold").value = site?.fail_threshold ?? 3;
   fillIntervalSelect(site?.interval_min ?? 5);
   qs("#f-enabled").value = String(site?.enabled ?? 1);
   qs("#dlg-err").hidden = true;
-  // 编辑时展开"更多选项"，否则用户看不到隐藏状态
-  qs(".adv").open = Boolean(site);
   dlg.showModal();
-  setTimeout(() => qs(site ? "#f-name" : "#f-url").focus(), 50);
 }
 
 qs("#form").addEventListener("submit", async (e) => {
+  // 只处理 save 提交，submitter 为空也按保存走。
   if (e.submitter && e.submitter.value !== "save") return;
   e.preventDefault();
 
-  const errEl = qs("#dlg-err");
-  errEl.hidden = true;
-
-  const name = qs("#f-name").value.trim();
-  let id = qs("#f-id").value.trim();
-  const url = qs("#f-url").value.trim();
-
-  if (!url) {
-    errEl.textContent = "请填写监控地址";
-    errEl.hidden = false;
-    return;
-  }
-  if (!name) {
-    errEl.textContent = "请填写显示名称";
-    errEl.hidden = false;
-    return;
-  }
-  // 没手动改过 id 就按名称生成
-  if (!id) id = slugifyId(name);
-
   const body = {
-    id,
-    name,
-    url,
-    group_name: qs("#f-group").value || UNGROUPED,
+    id: qs("#f-id").value.trim(),
+    name: qs("#f-name").value.trim(),
+    url: qs("#f-url").value.trim(),
+    group_name: currentGroupValue(),
     expect_codes: qs("#f-codes").value.trim(),
     hide_url: qs("#f-hideurl").checked,
     fail_threshold: Number(qs("#f-threshold").value || 3),
     interval_min: Number(qs("#f-interval").value || 5),
     enabled: qs("#f-enabled").value === "1",
   };
-  const prev = siteById(id);
+  // 不再静默 return：字段缺失时必须告诉用户，否则看起来像"点了没反应"。
+  const requireEl = qs("#dlg-err");
+  if (!body.id || !body.url) {
+    requireEl.textContent = !body.id ? "请填写站点标识（可用「名称」自动生成）" : "请填写监控地址";
+    requireEl.hidden = false;
+    return;
+  }
+
+  // 排序统一由列表拖拽负责，但编辑时要把原 sort 带回去，否则会被挪到队尾。
+  const prev = siteById(body.id);
   if (prev) body.sort = Number(prev.sort) || 0;
 
-  const btn = e.submitter || qs('#form button[type="submit"]');
-  if (btn) btn.disabled = true;
   try {
     const d = await post("/sites", body);
     if (!d.ok) throw new Error(d.error || "保存失败");
-    if (d.upserted === 0) throw new Error("服务端没有写入（标识或地址为空）");
+    // upserted = 0 说明服务端一条都没写（id/url 被过滤掉）：别提示"已保存"。
+    if (d.upserted === 0) throw new Error("服务端没有写入任何站点（站点标识或地址为空）");
     dlg.close();
     banner("已保存", "info");
     await loadAll();
   } catch (err) {
-    errEl.textContent = isMasked(err) ? err.message : "保存失败：" + err.message;
-    errEl.hidden = false;
-  } finally {
-    if (btn) btn.disabled = false;
+    const el = qs("#dlg-err");
+    el.textContent = isMasked(err) ? err.message : "保存失败：" + err.message;
+    el.hidden = false;
   }
 });
 
 qs("#add").addEventListener("click", () => openForm(null));
 
-qs("#f-name").addEventListener("input", (e) => {
-  const idEl = qs("#f-id");
-  if (idEl.readOnly || idEl.dataset.touched) return;
-  if (!e.target.value.trim()) {
-    idEl.value = "";
-    return;
-  }
-  idEl.value = slugifyId(e.target.value);
-});
+/* ── 站点操作 ──────────────────────────────────────────── */
 
-qs("#f-id").addEventListener("input", (e) => {
-  e.target.dataset.touched = "1";
-});
-
-/* ── 站点操作 ───────────────────────────────────────────── */
-
-qs("#list").addEventListener("click", async (e) => {
+document.addEventListener("click", async (e) => {
   const btn = e.target.closest("button[data-act]");
-  if (!btn) return;
+  if (!btn || btn.closest("#cats")) return; // 分类按钮由上面单独处理
   const act = btn.dataset.act;
   const id = btn.dataset.id;
-  const site = siteById(id);
-  if (!site) return;
+  const site = id ? siteById(id) : null;
 
   if (act === "edit") return openForm(site);
 
   if (act === "del") {
-    if (!confirm(`删除「${site.name}」？\n探测明细、证书与状态会一并删除，不可恢复。`)) return;
+    // 文案要点明「历史数据一起删」：服务端是级联删除（sites / checks / ssl / state / pending），
+    // 而"删除站点"听起来像是只删掉一个条目。
+    if (!confirm(`确定删除「${site?.name || id}」？\n该站点的探测明细、证书与状态会一并删除，不可撤销。`))
+      return;
     try {
       const d = await del(`/sites?id=${encodeURIComponent(id)}`);
-      if (!d.ok) throw new Error(d.error || "删除失败");
-      banner("已删除", "info");
+      banner(d.ok ? "已删除" : "删除失败：" + d.error, d.ok ? "info" : "error");
       await loadAll();
     } catch (err) {
       if (!isMasked(err)) banner("删除失败：" + err.message, "error");
@@ -771,42 +793,57 @@ qs("#list").addEventListener("click", async (e) => {
     return;
   }
 
-  if (act === "test") {
+  if (act === "proxy-test") {
     btn.disabled = true;
+    btn.textContent = "…";
     try {
-      const d = await post("/test", { site: id });
-      if (!d.ok) throw new Error(d.error || "测试失败");
-      const r = (d.results || [])[0] || {};
-      const ok = d.verdict ? d.verdict.ok : r.ok;
-      let msg = `${site.name} · HTTP ${r.status ?? "—"} · ${r.ttfb ?? "—"}ms · ${d.elapsed_ms ?? "—"}ms`;
-      if (d.persisted) {
-        msg += d.persisted.ok ? " · 已记录" : ` · 未记录：${d.persisted.reason || "失败"}`;
-        if (!d.persisted.ok && d.persisted.fail_run >= d.persisted.fail_threshold) {
-          msg += ` · 今天已连续失败 ${d.persisted.fail_run} 次`;
-        }
-        if (d.persisted.warn) msg += ` · ⚠ ${d.persisted.warn}`;
+      // 位置由后端从全局设置取，前端不传；带 site=<id> 让结果落库。
+      const d = await post("/test", { site: site.id });
+      const res = (d.results || [])[0] || {};
+      // 来源标签由服务端算好（origin），与前台首页 / 详情页同一口径 ——
+      // 以前这里自己拼「机房 SJC」，与前台写法不一致。
+      const where = d.origin || "";
+      // 文案压成一条紧凑的短句：toast 是单个胶囊，字段用 · 分隔比用中文更省宽度
+      let mark = d.persisted ? (d.persisted.ok ? " · 已记录" : ` · 未记录：${d.persisted.reason || "失败"}`) : "";
+      // 连续失败达到阈值时直接说出来：否则用户要自己数"今天第几次了"
+      if (d.persisted && !d.persisted.ok && d.persisted.fail_run >= d.persisted.fail_threshold) {
+        mark += ` · 今天已连续失败 ${d.persisted.fail_run} 次（构成故障）`;
       }
-      banner(msg, ok ? "info" : "error");
-      await loadAll();
+      // 写库有残缺（按天汇总 / 状态快照没写进去）时必须显形，不能装作"已记录"
+      if (d.persisted && d.persisted.warn) mark += ` · ⚠ ${d.persisted.warn}`;
+      // 先重渲染表格再弹提示，只调 renderRows 不重拉全量。
+      if (d.persisted) await renderRows();
+      // 上色按判定结果而非传输是否成功（期望 200 实得 500 仍算失败）。
+      const judged = d.verdict ? d.verdict.ok : d.persisted ? d.persisted.ok : res.ok;
+      // elapsed_ms 是这次测试实际等了多久。
+      banner(
+        `${site.name} · HTTP ${res.status ?? "—"} · ${res.ttfb ?? "—"}ms · ${where} · ${
+          d.elapsed_ms ?? "—"
+        }ms${mark}`,
+        judged ? "info" : "error"
+      );
     } catch (err) {
       if (!isMasked(err)) banner("测试失败：" + err.message, "error");
     } finally {
       btn.disabled = false;
+      btn.textContent = "测";
     }
   }
 });
 
 qs("#checkall").addEventListener("click", async () => {
   const b = qs("#checkall");
-  const old = b.innerHTML;
   b.disabled = true;
+  const old = b.innerHTML;
   b.textContent = "检查中…";
   try {
+    // 同理必须是 POST —— 手动跑一轮会真实发起探测并写库
     const d = await post("/run", {});
+    // 两阶段语义：本轮只能拿到上一轮的结果，两个数字分开报。
     const collected = d.collect?.collected || 0;
     const started = (d.dispatch?.gpStarted || []).filter((x) => x.id).length;
-    banner(`已发起 ${started} 个探测，收取 ${collected} 条（结果下一轮出）`, "info");
-    await loadAll();
+    banner(`已执行一轮 · 落库 ${collected} 条 · 发起 ${started} 个（结果下一轮出）`, "info");
+    await renderRows();
   } catch (e) {
     if (!isMasked(e)) banner("执行失败：" + e.message, "error");
   } finally {
@@ -815,10 +852,13 @@ qs("#checkall").addEventListener("click", async () => {
   }
 });
 
-/* ── 设置 ───────────────────────────────────────────────── */
+/* ── 设置 ──────────────────────────────────────────────── */
 
 const setdlg = qs("#setdlg");
+
+/** 位置筛选下拉里的「自定义…」哨兵值 */
 const MAGIC_CUSTOM = "__custom__";
+/** 预设选项必须与 admin.html 的 option 一致，[0] 是内置默认值。 */
 const MAGIC_PRESETS = [
   "CN+datacenter-network",
   "CN",
@@ -828,74 +868,36 @@ const MAGIC_PRESETS = [
   "north-america",
 ];
 
-function readMagic() {
-  const sel = qs("#s-magic");
-  return sel.value === MAGIC_CUSTOM ? qs("#s-magic-custom").value.trim() : sel.value;
+/**
+ * 读「预设 + 自定义」型下拉：选中预设就取预设值，选中「自定义」则取旁边的输入框。
+ */
+function readMagicLike(selId, customId) {
+  const v = qs(selId).value;
+  return v === MAGIC_CUSTOM ? qs(customId).value.trim() : v;
 }
 
-function writeMagic(v) {
+/** 写「预设 + 自定义」下拉：非预设值切到自定义并填入输入框。 */
+function writeMagicLike(selId, customId, v) {
   const val = v || MAGIC_PRESETS[0];
   const isPreset = MAGIC_PRESETS.includes(val);
-  qs("#s-magic").value = isPreset ? val : MAGIC_CUSTOM;
-  qs("#s-magic-custom").value = isPreset ? "" : val;
-  qs("#s-magic-custom").hidden = isPreset;
+  qs(selId).value = isPreset ? val : MAGIC_CUSTOM;
+  qs(customId).value = isPreset ? "" : val;
+  qs(customId).hidden = qs(selId).value !== MAGIC_CUSTOM;
 }
 
-function fmtEta(iso) {
-  const s = Math.round((new Date(iso).getTime() - Date.now()) / 1000);
-  if (!Number.isFinite(s)) return "—";
-  if (s <= 0) return "即将恢复";
-  return s < 60 ? `${s} 秒后` : `${Math.ceil(s / 60)} 分钟后`;
+/** `#s-magic`：对全部站点的可用性探测生效 */
+function readMagic() {
+  return readMagicLike("#s-magic", "#s-magic-custom");
 }
-
-function renderProbeInfo() {
-  const el = qs("#s-probe");
-  if (!el) return;
-  const p = PROBE || {};
-  let text;
-  let warn = false;
-  if (p.blocked_until) {
-    text = `探针：额度退避中，${fmtEta(p.blocked_until)}恢复`;
-    warn = true;
-  } else if (p.last_error) {
-    text = `探针：最近一次失败（${relTime(p.last_error_ts)}）｜${p.last_error}`;
-    warn = true;
-  } else if (p.last_ok_ts) {
-    text = `探针：正常，最近成功 ${relTime(p.last_ok_ts)}`;
-  } else {
-    text = "探针：尚未发起过测量";
-  }
-  el.textContent = text;
-  el.style.color = warn ? "hsl(var(--destructive))" : "";
-}
-
-function fillSettingsForm(s) {
-  qs("#s-title").value = s.site_title || "";
-  qs("#s-theme").value = s.default_theme || "auto";
-  const utc = String(s.utc_offset_min ?? 480);
-  const sel = qs("#s-utc");
-  if (![...sel.options].some((o) => o.value === utc)) {
-    sel.add(new Option(`UTC${Number(utc) >= 0 ? "+" : ""}${Number(utc) / 60}`, utc));
-  }
-  sel.value = utc;
-  writeMagic(s.gp_magic || "");
-  const limitSel = qs("#s-limit");
-  const limitVal = String(s.gp_limit ?? "");
-  if (limitVal && ![...limitSel.options].some((o) => o.value === limitVal)) {
-    limitSel.add(new Option(`${limitVal} 点`, limitVal));
-  }
-  if (limitVal) limitSel.value = limitVal;
-  qs("#s-warn").value = s.ssl_warn_days ?? "";
-  qs("#s-slow").value = s.slow_ms ?? "";
-  qs("#s-gp-token").value = "";
-  qs("#s-gp-token-hint").textContent = s.has_globalping_token
-    ? `已配置：${s.globalping_token_masked}`
-    : "未配置（额度 250 点/小时，配置后 500）";
-  renderProbeInfo();
+function writeMagic(v) {
+  writeMagicLike("#s-magic", "#s-magic-custom", v);
 }
 
 async function openSettings() {
   qs("#set-err").hidden = true;
+
+  // 先用 /admin 已带回的设置立即填充并打开 —— 不必额外等一次网络往返。
+  // 随后静默拉一次 /settings 校正（可能被其他会话改过），不阻塞界面。
   if (SETTINGS) {
     fillSettingsForm(SETTINGS);
     setdlg.showModal();
@@ -909,9 +911,10 @@ async function openSettings() {
       .catch(() => {});
     return;
   }
+
   try {
     const d = await api("/settings");
-    if (!d.ok) throw new Error(d.error || "读取失败");
+    if (!d.ok) throw new Error(d.error || "读取设置失败");
     SETTINGS = d.settings || {};
     fillSettingsForm(SETTINGS);
     setdlg.showModal();
@@ -920,30 +923,188 @@ async function openSettings() {
   }
 }
 
-qs("#s-magic").addEventListener("change", () => {
-  const custom = qs("#s-magic").value === MAGIC_CUSTOM;
-  qs("#s-magic-custom").hidden = !custom;
-  if (custom) qs("#s-magic-custom").focus();
+/** 把设置值填进弹窗表单（数据可能来自 /admin 预取，也可能来自 /settings 新拉） */
+function fillSettingsForm(s) {
+  qs("#s-title").value = s.site_title || "";
+  qs("#s-theme").value = s.default_theme || "auto";
+  qs("#s-utc").value = s.utc_offset_min ?? "";
+  writeMagic(s.gp_magic || "");
+  // 回填 gp_limit：取值只由下拉 option 定义，越界会显示空白。
+  const limitSel = qs("#s-limit");
+  const limitVal = String(s.gp_limit ?? "");
+  if (limitVal && ![...limitSel.options].some((o) => o.value === limitVal)) {
+    limitSel.add(new Option(`${limitVal} · 非预设档`, limitVal));
+  }
+  if (limitVal) limitSel.value = limitVal;
+  qs("#s-gptimeout").value = s.gp_timeout_sec || "";
+  qs("#s-warn").value = s.ssl_warn_days || "";
+  qs("#s-slow").value = s.slow_ms ?? "";
+  qs("#s-ipver").value = s.gp_ip_version || "4";
+  qs("#s-budget").value = s.subreq_budget || "";
+  qs("#s-keep").value = s.check_keep_days || "";
+  qs("#s-recent").value = s.recent_limit || "";
+  qs("#s-incident").value = s.incident_limit || "";
+  qs("#s-gp-token").value = "";
+  qs("#s-gp-token-hint").textContent = s.has_globalping_token
+    ? `已配置：${s.globalping_token_masked}（留空则保留）`
+    : "未配置（额度 250 次/小时；配置后 500 次/小时）";
+  renderProbeInfo();
+}
+
+/** 倒计时文案（用于额度退避截止时间）。relTime 会把未来时间夹成"0 秒前"。 */
+function fmtEta(iso) {
+  const s = Math.round((new Date(iso).getTime() - Date.now()) / 1000);
+  if (!Number.isFinite(s)) return "—";
+  if (s <= 0) return "即将恢复";
+  return s < 60 ? `${s} 秒后` : `${Math.ceil(s / 60)} 分钟后`;
+}
+
+/** 探针状态行：区分 GP 挂了 / 凭据错 / 额度用光。 */
+function renderProbeInfo() {
+  const el = qs("#s-probe");
+  if (!el) return;
+  const p = PROBE || {};
+  let text;
+  let warn = false;
+  if (p.blocked_until) {
+    text = `探针状态：额度退避中，${fmtEta(p.blocked_until)}后恢复`;
+    warn = true;
+  } else if (p.last_error) {
+    text = `探针状态：最近一次发起失败（${relTime(p.last_error_ts)}）｜${p.last_error}`;
+    warn = true;
+  } else if (p.last_ok_ts) {
+    text = `探针状态：最近一次发起成功 ${relTime(p.last_ok_ts)}`;
+  } else {
+    text = "探针状态：还没有发起过测量";
+  }
+  el.textContent = text;
+  el.style.color = warn ? "hsl(var(--destructive))" : "";
+}
+
+/**
+ * 额度账：每小时消耗 = Σ(60 / 间隔分钟) × limit，与 250/500 点每小时比较。
+ * @param limitOverride 面板里未保存的 gp_limit
+ */
+function quotaStats(limitOverride) {
+  const s = SETTINGS || {};
+  const limit = Number(limitOverride ?? s.gp_limit) || 3;
+  const token = Boolean(s.has_globalping_token);
+  const cap = token ? 500 : 250;
+
+  let n = 0;
+  let need = 0;
+  for (const site of SITES) {
+    if (site.enabled === 0 || site.enabled === false) continue;
+    // 实际间隔不能低于 2 分钟：两阶段模型（本轮发起、下轮收取）下，1 分钟档位
+    // 真实落库间隔约 120s。按 1 分钟算额度会**高估**消耗，让用户以为额度不够用。
+    const iv = Math.max(2, Number(site.interval_min) || 5);
+    n++;
+    need += (60 / iv) * limit;
+  }
+
+  const perSite = n ? need / n : 0;
+  return {
+    n,
+    need: Math.round(need),
+    limit,
+    cap,
+    token,
+    // 额度被耗尽所需分钟数。need > cap 时必然 < 60，即「一小时里只跑得动一段」
+    minutes: need > 0 ? (60 * cap) / need : Infinity,
+    // 这套额度长期能养活的站点数（按当前平均消耗）
+    fit: perSite > 0 ? Math.floor(cap / perSite) : 0,
+  };
+}
+
+/** 把额度账写成一句话，贴在站点列表底部（常驻，不必打开设置面板）。 */
+function renderQuota(limitOverride) {
+  const el = qs("#quota");
+  if (!el) return;
+  const q = quotaStats(limitOverride);
+  const fmt = (x) => Math.round(x).toLocaleString("zh-CN");
+
+  if (!q.n) {
+    el.textContent = "暂无启用中的站点，不会消耗额度";
+    el.style.color = "";
+    return;
+  }
+
+  const capText = q.token ? `${q.cap} 点/小时` : `${q.cap} 点/小时（配 Token 翻倍到 500）`;
+  // 详情放 title：一句话主线，算不清的部分鼠标悬停再看
+  el.title = `${q.n} 个启用站点 × 每次 ${q.limit} 点 × 各自间隔 ≈ ${fmt(q.need)} 点/小时；额度 ${capText}`;
+
+  if (q.need <= q.cap) {
+    const pct = Math.round((q.need / q.cap) * 100);
+    const spare = q.fit - q.n;
+    el.textContent =
+      `额度占用 ${pct}%：约 ${fmt(q.need)} / ${q.cap} 点每小时` +
+      (spare > 0 ? `，还能再加约 ${spare} 个站点` : "，已接近上限");
+    // ≥90% 提前标红：等真的撞上 429 再提示，站点已经黄了一片
+    el.style.color = pct >= 90 ? "hsl(var(--destructive))" : "";
+    return;
+  }
+
+  // 超额：额度会在 X 分钟后耗尽，之后整段时间被拉长 —— 这才是用户问的「能跑多久」
+  const mins = Math.max(1, Math.round(q.minutes));
+  const factor = (q.need / q.cap).toFixed(1);
+  const fitText = q.fit >= 1 ? `长期只够 ${q.fit} 个站点` : "单站已超出，建议调大间隔或把点数改成 1";
+  el.textContent =
+    `额度不足：约 ${mins} 分钟后耗尽，实际间隔会被拉长到约 ${factor} 倍（${fitText}）`;
+  el.style.color = "hsl(var(--destructive))";
+}
+
+qs("#settings-open").addEventListener("click", openSettings);
+
+// 改「每次探测点数」时当场重算额度（不必先保存再看结果）。
+// 不写回 SETTINGS：取消对话框后，列表底部那行仍按已保存的值显示。
+qs("#s-limit").addEventListener("change", () => {
+  const v = qs("#s-limit").value;
+  renderProbeInfo();
+  renderQuota(v);
 });
 
+// 关掉设置面板（含「取消」）：丢掉未保存的 gp_limit，底部额度行回到已保存的口径
+setdlg.addEventListener("close", () => {
+  renderProbeInfo();
+  renderQuota();
+});
+
+/** 「清除 Token」是删除已配置 Token 的唯一入口。 */
 qs("#s-gp-token-clear").addEventListener("click", async () => {
-  if (!confirm("清除已保存的 Globalping Token？\n额度会回落到 250 点/小时。")) return;
+  if (!confirm("清除已保存的 Globalping Token？\n清除后额度回落到匿名档（250 次/小时）。")) return;
+  const btn = qs("#s-gp-token-clear");
+  btn.disabled = true;
   try {
     const r = await post("/settings", { clear_globalping_token: true });
     if (!r.ok) throw new Error(r.error || "清除失败");
+    qs("#s-gp-token").value = "";
+    qs("#s-gp-token-hint").textContent = "未配置（额度 250 次/小时；配置后 500 次/小时）";
     banner("Token 已清除", "info");
     await loadAll();
-    if (setdlg.open) fillSettingsForm(SETTINGS);
-  } catch (e) {
-    if (!isMasked(e)) banner("清除失败：" + e.message, "error");
+  } catch (err) {
+    if (!isMasked(err)) banner("清除失败：" + err.message, "error");
+  } finally {
+    btn.disabled = false;
   }
 });
 
+// 位置筛选下拉选到「自定义…」时展开旁边的输入框
+for (const [selId, customId] of [["#s-magic", "#s-magic-custom"]]) {
+  qs(selId).addEventListener("change", () => {
+    const custom = qs(selId).value === MAGIC_CUSTOM;
+    qs(customId).hidden = !custom;
+    if (custom) qs(customId).focus();
+  });
+}
+
 qs("#setform").addEventListener("submit", async (e) => {
+  // 只处理 save 提交，submitter 为空也按保存走。
   if (e.submitter && e.submitter.value !== "save") return;
   e.preventDefault();
+
   const errEl = qs("#set-err");
   errEl.hidden = true;
+
   const btn = qs("#set-save");
   btn.disabled = true;
   btn.textContent = "保存中…";
@@ -951,11 +1112,18 @@ qs("#setform").addEventListener("submit", async (e) => {
   const body = {
     site_title: qs("#s-title").value.trim(),
     default_theme: qs("#s-theme").value,
-    utc_offset_min: qs("#s-utc").value,
+    utc_offset_min: qs("#s-utc").value.trim(),
     gp_magic: readMagic(),
-    gp_limit: qs("#s-limit").value,
+    gp_limit: qs("#s-limit").value.trim(),
+    gp_timeout_sec: qs("#s-gptimeout").value.trim(),
     ssl_warn_days: qs("#s-warn").value.trim(),
     slow_ms: qs("#s-slow").value.trim(),
+    gp_ip_version: qs("#s-ipver").value,
+    subreq_budget: qs("#s-budget").value.trim(),
+    check_keep_days: qs("#s-keep").value.trim(),
+    recent_limit: qs("#s-recent").value.trim(),
+    incident_limit: qs("#s-incident").value.trim(),
+    // 留空 = 不修改已有 token（后端识别 __KEEP__）
     globalping_token: qs("#s-gp-token").value.trim() || "__KEEP__",
   };
 
@@ -974,35 +1142,66 @@ qs("#setform").addEventListener("submit", async (e) => {
   }
 });
 
-/* ── 主题 / 启动 ─────────────────────────────────────────── */
-
-qs("#settings-open").addEventListener("click", openSettings);
+/* ── 主题 / 启动 ───────────────────────────────────────── */
 
 qs("#theme").addEventListener("click", () => {
   const dark = document.documentElement.classList.toggle("dark");
   try {
     localStorage.setItem("theme", dark ? "dark" : "light");
-  } catch {}
+  } catch (e) {}
 });
 
-for (const b of document.querySelectorAll("[data-close]")) {
-  b.addEventListener("click", () => b.closest("dialog")?.close());
+/** 名称 → id。纯中文名替换后为空，必须退回随机 id，否则保存会被静默丢弃。 */
+function slugifyId(name) {
+  const slug = String(name || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-|-$/g, "")
+    .slice(0, 40);
+  if (slug) return slug;
+  // 退路：site-xxxxxxxx（8 位十六进制，足够避免同一批次内碰撞）
+  const rand = Array.from(crypto.getRandomValues(new Uint8Array(4)))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+  return `site-${rand}`;
 }
 
+qs("#f-name").addEventListener("input", (e) => {
+  const idEl = qs("#f-id");
+  if (idEl.readOnly || idEl.dataset.touched) return;
+  // 名字还是空的就先别写 id：否则用户刚敲第一个字母就会拿到一个随机后缀
+  if (!e.target.value.trim()) {
+    idEl.value = "";
+    return;
+  }
+  idEl.value = slugifyId(e.target.value);
+});
+qs("#f-id").addEventListener("input", (e) => {
+  e.target.dataset.touched = "1";
+});
+
 async function bootstrap() {
+  // 一次 /admin 同时拿到登录态与全部数据；401 时直接返回。
   try {
     await loadAll();
     hideLogin();
   } catch (e) {
+    // ① needLogin：配了密码但未登录 → 登录框已由 api() 弹出
+    // ② needSetup：没配密码（后台停用）→ 说明页已由 api() 弹出
+    // 两种都交给用户，不要在这里再弹 toast（遮罩已经把界面挡住了，提示没人看得到）。
     if (e.needLogin || e.needSetup) return;
     banner("加载失败：" + e.message, "error");
   }
 }
 
-bootstrap();
+// 「我已设置，重新检查」——只刷新页面，重新走一次 bootstrap 的判定。
+// 变量在 Cloudflare 侧是秒级生效的，不需要等部署，所以刷新就能进。
+qs("#setup-reload").addEventListener("click", () => location.reload());
 
-// 后台每 2 分钟刷新一次；只看当前可见页
+bootstrap();
+// 每 2 分钟重拉数据，而不只重渲染 DOM。
 setInterval(() => {
-  if (document.hidden || !AUTHD) return;
+  if (document.hidden || !AUTHED) return;
   loadAll().catch(() => {});
 }, 120000);

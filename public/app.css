@@ -166,8 +166,7 @@ a { color: inherit; text-decoration: none; }
 }
 .brand { display: flex; align-items: center; gap: 8px; font-weight: 600; font-size: 15px; }
 .brand svg { color: hsl(var(--primary)); }
-.nav { display: flex; align-items: center; gap: 10px; }
-.nav .icon-btn { width: 32px; height: 32px; }
+.nav { display: flex; align-items: center; gap: 4px; }
 .nav a {
   padding: 6px 10px; border-radius: calc(var(--radius) - 4px);
   font-size: 13px; color: hsl(var(--muted-foreground));
@@ -299,14 +298,10 @@ a { color: inherit; text-decoration: none; }
   display: inline-flex; align-items: center; gap: 5px;
   padding: 2px 8px; border-radius: 999px;
   font-size: 12px; font-weight: 500; line-height: 1.5; white-space: nowrap;
-  /* 浅色底上用同色系深字才有足够对比度：纯 --success/--destructive 当文字只有 ~2:1 */
-  color: hsl(var(--foreground));
 }
-.b-up { background: hsl(var(--success) / 0.16); color: hsl(160 84% 26%); }
-.b-down { background: hsl(var(--destructive) / 0.14); color: hsl(0 72% 42%); }
-.dark .b-up { color: hsl(var(--success)); }
-.dark .b-down { color: hsl(var(--destructive)); }
 .badge::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+.b-up { background: hsl(var(--success) / 0.14); color: hsl(var(--success)); }
+.b-down { background: hsl(var(--destructive) / 0.14); color: hsl(var(--destructive)); }
 .b-degraded { background: hsl(var(--warning) / 0.18); color: hsl(var(--warning-text)); }
 .b-unknown { background: hsl(var(--muted)); color: hsl(var(--muted-foreground)); }
 
@@ -365,15 +360,22 @@ a { color: inherit; text-decoration: none; }
   color: hsl(var(--primary-foreground)); backdrop-filter: none;
 }
 .btn-primary:hover { background: hsl(var(--primary) / 0.9); }
-.btn-danger { color: hsl(var(--destructive)); border-color: hsl(var(--destructive) / 0.4); }
-.btn-danger:hover { background: hsl(var(--destructive) / 0.1); }
+/* 删除按钮默认与普通按钮同色，只在悬停时变红：
+   表格里「故障」徽章已经是红色，操作列再常驻一个红按钮会让同一行出现两处红色，
+   状态色和操作色就分不清了。 */
+.btn-danger { color: hsl(var(--muted-foreground)); }
+.btn-danger:hover:not(:disabled) {
+  color: hsl(var(--destructive));
+  border-color: hsl(var(--destructive) / 0.45);
+  background: hsl(var(--destructive) / 0.08);
+}
 .btn-sm { height: 30px; padding: 0 10px; font-size: 12px; }
 .btn svg { width: 15px; height: 15px; }
 
 /* 浅色模式下：默认 .btn 的玻璃白边在浅底上几乎不可见，统一改成可见的「深色」描边。
    彩色按钮（.btn-primary 绿色实心 / .btn-danger）保留自身边框，不覆盖。
    深色模式维持原有白色玻璃边框，不动。 */
-html:not(.dark) .btn:not(.btn-primary):not(.btn-danger) {
+html:not(.dark) .btn:not(.btn-primary) {
   border-color: hsl(var(--muted-foreground));
 }
 
@@ -425,6 +427,76 @@ select {
 .grid-3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
 @media (max-width: 720px) { .grid-2, .grid-3 { grid-template-columns: 1fr; } }
 
+/* ── 表格 ───────────────────────────────────────────────── */
+
+.table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.table th {
+  text-align: left; font-size: 11px; font-weight: 600;
+  letter-spacing: .04em;
+  color: hsl(var(--muted-foreground));
+  padding: 8px 10px; border-bottom: 1px solid hsl(var(--border)); white-space: nowrap;
+}
+.table td {
+  padding: 10px 10px; border-bottom: 1px solid hsl(var(--border) / 0.7);
+  vertical-align: middle;
+}
+/* 首列与末列贴齐卡片内容边距，避免表格比标题多缩进一截 */
+.table th:first-child, .table td:first-child { padding-left: 12px; }
+.table th:last-child, .table td:last-child { padding-right: 12px; }
+.table tr:last-child td { border-bottom: none; }
+.table tr:hover td { background: hsl(var(--accent) / 0.45); }
+
+/* 表格内的信息层级：主名 / 次要说明 / 等宽地址 / 操作列。
+   与卡片标题、分类项的次级文字用同一套字号（11px）与颜色，避免每处各写一套内联样式。 */
+.cell-name { font-weight: 500; font-size: 13px; }
+.cell-sub {
+  font-size: 11px; line-height: 1.5;
+  color: hsl(var(--muted-foreground));
+}
+.cell-url {
+  font-size: 12px; max-width: 260px;
+  display: inline-block; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; vertical-align: middle;
+}
+.cell-actions { text-align: right; white-space: nowrap; }
+
+/* 行内小标签（已暂停 / 已隐藏）：比 badge 更轻，不与状态徽章抢视线 */
+.tag {
+  display: inline-block; margin-left: 4px;
+  padding: 0 5px; border-radius: 4px;
+  font-size: 10.5px; line-height: 1.6; vertical-align: middle;
+  color: hsl(var(--muted-foreground));
+  background: hsl(var(--muted));
+}
+
+/* ── 窄屏：表格改成卡片行 ──────────────────────────────────
+   原先只有 .tbl-wrap 的横向滚动：手机上「地址」列占 260px，编辑/删除被推到屏幕外，
+   必须横滑才能点到，而横滑又容易和浏览器的返回手势打架。
+   这里把每行摊成两列小网格：名称+状态一行、地址一行、操作按钮一行。
+   <td> 用 data-label 出字段名，不必改 JS 生成的 HTML 结构（顺序不变）。 */
+@media (max-width: 760px) {
+  .table thead { display: none; }
+  .table, .table tbody { display: block; }
+  .table tr {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 6px 10px;
+    padding: 12px 10px;
+    border-bottom: 1px solid hsl(var(--border) / 0.7);
+  }
+  .table tr:last-child { border-bottom: none; }
+  .table td { display: block; padding: 0; border: 0; min-width: 0; }
+  /* 名称列占左，状态列占右，地址整行，操作整行右对齐 */
+  .table td:nth-child(1) { grid-column: 1; }
+  .table td:nth-child(4) { grid-column: 2; text-align: right; }
+  .table td:nth-child(2) { grid-column: 1 / -1; }
+  .table td:nth-child(3) { grid-column: 1; }
+  .table td:nth-child(5) { grid-column: 1 / -1; text-align: left; padding-top: 8px; }
+  /* 地址截断宽度放在窄屏里就没意义了：整行展示，超长省略 */
+  .tbl-wrap td .mono { max-width: 100%; }
+  /* 操作按钮做大一点：拇指点按的最小目标是 40px 左右 */
+  .table td:nth-child(5) .btn { height: 32px; padding: 0 12px; }
+}
 
 /* ── 弹层 ───────────────────────────────────────────────── */
 
@@ -440,11 +512,8 @@ dialog {
      不设上限的话，底部「保存」按钮会被键盘盖住。dvh 随地址栏/键盘变化。 */
   max-height: 86vh;
   box-shadow: 0 24px 60px -20px hsl(220 40% 15% / 0.35);
-  flex-direction: column;
+  display: flex; flex-direction: column;
 }
-/* 只给「打开时」设 display：直接写 display:flex 会盖掉 UA 的 dialog:not([open]){display:none}，
-   关闭的弹窗仍会占位并拦截点击。 */
-dialog[open] { display: flex; }
 @supports (height: 100dvh) {
   dialog { max-height: 86dvh; }
 }
@@ -612,6 +681,8 @@ dialog::backdrop { background: hsl(220 30% 10% / 0.45); }
   border-bottom: 1px solid hsl(var(--border) / 0.8);
 }
 .sec-head h2 { margin: 0; font-size: 14px; font-weight: 600; }
+/* 标题右侧的说明文字：卡片标题、站点表头、分类计数共用 */
+.sec-sub { font-size: 12px; font-weight: 400; color: hsl(var(--muted-foreground)); }
 .sec-body { padding: 16px 20px; }
 
 /* 时间范围分段控件 */
@@ -720,243 +791,99 @@ dialog::backdrop { background: hsl(220 30% 10% / 0.45); }
 }
 
 /* ══════════════════════════════════════════════════════════════
-   后台：单列信息流（概览 → 工具条 → 分类 → 站点列表）
-   旧版是「左分类树 + 右表格」，两侧都要滚动、表格列又放不下 URL，
-   现在改成一行一个站点的横向卡片：状态点、名称、元信息、操作按钮。
+   后台：左右两栏（左 = 分类目录，右 = 站点列表）
+   结构参考 HaoNav 的「链接管理」：左卡固定宽度、右卡自适应，
+   宽屏下两卡等高、各自独立滚动。
    ══════════════════════════════════════════════════════════════ */
 
-.adm { display: flex; flex-direction: column; gap: 16px; padding-top: 20px; padding-bottom: 48px; }
+/* 登录前整块隐藏：用 [hidden] 而不是 inline visibility，避免留出空白高度 */
+.adm-main { padding-top: 24px; }
 
-/* ── 概览条 ───────────────────────────────────────────── */
+.adm-grid { display: grid; gap: 16px; align-items: start; }
+@media (min-width: 1000px) {
+  /* 右列（站点表）拿剩余空间，左列给一个够放 4 个汉字+计数的宽度 */
+  .adm-grid { grid-template-columns: 13rem minmax(0, 1fr); }
+}
+.adm-col { display: flex; flex-direction: column; overflow: hidden; }
 
-.adm-overview {
-  display: grid; gap: 1px;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
-  background: hsl(var(--border));
-  border: 1px solid hsl(var(--border));
-  border-radius: var(--radius);
-  overflow: hidden;
-}
-@media (max-width: 560px) {
-  .adm-overview { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .adm-quota { grid-column: 1 / -1; }
-}
+/* ── 左侧分类目录 ─────────────────────────────────────── */
 
-.adm-stat {
-  position: relative;
-  display: flex; flex-direction: column; justify-content: space-between; gap: 4px;
-  padding: 11px 14px;
-  min-width: 0;
-  background: hsl(var(--card));
-}
-.adm-stat .k {
-  font-size: 11px; color: hsl(var(--muted-foreground));
-  letter-spacing: .02em;
-}
-.adm-stat .v {
-  font-size: 20px; font-weight: 600; line-height: 1.2;
-  font-variant-numeric: tabular-nums;
-}
-.adm-stat .v .of {
-  font-size: 11px; font-weight: 400; margin-left: 4px;
-  color: hsl(var(--muted-foreground));
-  font-variant-numeric: tabular-nums;
-}
-.adm-stat .v.ok { color: hsl(var(--success)); }
-.adm-stat .v.bad { color: hsl(var(--destructive)); }
-.adm-stat .v.warn { color: hsl(var(--warning-text)); }
-.adm-stat .of {
-  font-size: 10.5px; color: hsl(var(--muted-foreground));
-  font-variant-numeric: tabular-nums;
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+.cat-list {
+  display: flex; flex-direction: column; gap: 2px;
+  /* 与右侧 .tbl-wrap 的首行留白对齐（4px + 行内 10px ≈ 14px） */
+  padding: 4px 8px 8px;
 }
 
-/* ── 工具条 ───────────────────────────────────────────── */
-
-.adm-toolbar {
-  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
-}
-.adm-spacer { flex: 1 1 auto; }
-
-.adm-search {
-  display: flex; align-items: center; gap: 7px;
-  height: 34px; padding: 0 11px;
-  border: 1px solid hsl(var(--border)); border-radius: calc(var(--radius) - 2px);
-  background: hsl(var(--card) / 0.7);
-  flex: 1 1 220px; min-width: 0; max-width: 340px;
-}
-.adm-search:focus-within {
-  border-color: hsl(var(--primary) / 0.5);
-  box-shadow: 0 0 0 3px hsl(var(--primary) / 0.12);
-}
-.adm-search svg { width: 15px; height: 15px; color: hsl(var(--muted-foreground)); flex: 0 0 auto; }
-.adm-search input {
-  flex: 1; min-width: 0; height: 100%;
-  border: 0; outline: 0; background: transparent;
-  font: inherit; font-size: 13px; color: hsl(var(--foreground));
-}
-
-/* 分段筛选：一组互斥按钮，可横向滚动 */
-.adm-seg {
-  display: flex; align-items: center; gap: 2px;
-  padding: 2px; border-radius: calc(var(--radius) - 2px);
-  background: hsl(var(--secondary) / 0.7);
-  overflow-x: auto; scrollbar-width: none;
-}
-.adm-seg::-webkit-scrollbar { display: none; }
-.adm-seg button {
-  height: 30px; padding: 0 11px;
-  border: 0; border-radius: calc(var(--radius) - 4px);
-  background: transparent; color: hsl(var(--foreground) / 0.66);
-  font: inherit; font-size: 12.5px; white-space: nowrap; cursor: pointer;
-  transition: background .12s, color .12s;
-}
-.adm-seg button:hover { color: hsl(var(--foreground)); }
-.adm-seg button.on {
-  background: hsl(var(--card)); color: hsl(var(--foreground));
-  font-weight: 500; box-shadow: 0 1px 2px hsl(220 30% 10% / 0.08);
-}
-
-/* ── 分类 chips ───────────────────────────────────────── */
-
-.adm-cats { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-.adm-cats .chip.chip-fixed { cursor: pointer; }
-.adm-cats .chip:not(.chip-fixed) { padding-right: 7px; }
-.adm-cats .chip[draggable="true"] { cursor: grab; }
-.adm-cats .chip[draggable="true"]:active { cursor: grabbing; }
-.adm-cats .chip.dragging { opacity: .4; }
-.adm-cats .chip.drag-over { box-shadow: inset 3px 0 0 hsl(var(--primary)); }
-.adm-cats .chip .ops { display: none; align-items: center; gap: 0; }
-.adm-cats .chip:hover .ops,
-.adm-cats .chip:focus-within .ops { display: inline-flex; }
-.adm-cats .chip .ops button {
-  display: inline-flex; align-items: center; justify-content: center;
-  width: 18px; height: 18px; padding: 0;
-  border: 0; border-radius: 4px; background: transparent;
-  color: inherit; opacity: .6; cursor: pointer;
-}
-.adm-cats .chip .ops button:hover { background: hsl(var(--foreground) / 0.1); opacity: 1; }
-.adm-cats .chip .ops svg { width: 11px; height: 11px; }
-@media (hover: none) { .adm-cats .chip .ops { display: inline-flex; } }
-
-.adm-cats .chip-add { color: hsl(var(--muted-foreground)); }
-.adm-cats .chip-add:hover { color: hsl(var(--primary)); border-color: hsl(var(--primary) / 0.4); }
-.adm-cats .chip-add svg { width: 12px; height: 12px; }
-
-/* ── 站点列表 ─────────────────────────────────────────── */
-
-.adm-list {
-  display: flex; flex-direction: column;
-  border: 1px solid hsl(var(--border)); border-radius: var(--radius);
-  background: hsl(var(--card) / 0.8);
-  overflow: hidden;
-}
-
-.adm-row {
-  display: grid;
-  grid-template-columns: 20px minmax(0, 1fr) auto;
-  align-items: center; gap: 12px;
-  padding: 11px 12px 11px 14px;
-  border-bottom: 1px solid hsl(var(--border) / 0.7);
-  transition: background .12s;
-}
-.adm-row:last-child { border-bottom: 0; }
-.adm-row:hover { background: hsl(var(--accent) / 0.45); }
-.adm-row[draggable="true"] { cursor: grab; }
-.adm-row[draggable="true"]:active { cursor: grabbing; }
-.adm-row.dragging { opacity: .45; }
-.adm-row.drag-over { box-shadow: inset 0 2px 0 hsl(var(--primary)); }
-
-/* 状态点：颜色即结论，比文字 badge 更快扫 */
-.adm-status { display: flex; align-items: center; justify-content: center; }
-.adm-status i { width: 8px; height: 8px; border-radius: 50%; background: hsl(var(--muted-foreground) / 0.4); }
-.st-up .adm-status i { background: hsl(var(--success)); box-shadow: 0 0 0 3px hsl(var(--success) / 0.15); }
-.st-down .adm-status i { background: hsl(var(--destructive)); box-shadow: 0 0 0 3px hsl(var(--destructive) / 0.15); }
-.st-degraded .adm-status i { background: hsl(var(--warning)); box-shadow: 0 0 0 3px hsl(var(--warning) / 0.18); }
-.st-paused .adm-status i { background: hsl(var(--muted-foreground) / 0.3); }
-
-.adm-main { min-width: 0; display: flex; flex-direction: column; gap: 3px; }
-
-.adm-name { display: flex; align-items: center; gap: 7px; min-width: 0; flex-wrap: wrap; }
-.adm-name .nm {
-  font-size: 13.5px; font-weight: 500;
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-  max-width: 100%;
-}
-.st-paused .adm-name .nm { color: hsl(var(--muted-foreground)); }
-.adm-reason { font-size: 11.5px; color: hsl(var(--warning-text)); }
-
-.adm-meta {
+.cat-item {
   display: flex; align-items: center; gap: 6px;
-  font-size: 12px;
-  color: hsl(var(--muted-foreground));
-  opacity: 0.92;
-  min-width: 0; flex-wrap: wrap;
+  padding: 9px 10px; border-radius: calc(var(--radius) - 2px);
+  font-size: 13px; cursor: pointer;
+  transition: background .12s, color .12s, box-shadow .1s;
 }
-.adm-meta .url {
-  max-width: min(46ch, 60vw);
+.cat-item[draggable="true"] { cursor: grab; }
+.cat-item[draggable="true"]:active { cursor: grabbing; }
+.cat-item.dragging { opacity: .4; }
+/* 插入位置指示：用对比色而非主色 —— 选中的项本身就是主色实心块，主色线在上面看不见 */
+.cat-item.drag-over { box-shadow: inset 0 2px 0 hsl(var(--foreground) / 0.5); }
+/* 站点表格拖拽：与左侧分类同一套反馈（抓手光标 / 拖起时变淡 / 目标行高亮）。
+   高亮刷在 td 上 —— 直接在 tr 上设 background 会被 td 自己的背景盖住。
+   用 ID 选择器压过 .table tr:hover td 的悬浮底色（/0.9 也比 /0.45 明显）。 */
+#rows tr[draggable="true"] { cursor: grab; }
+#rows tr[draggable="true"]:active { cursor: grabbing; }
+#rows tr.row-dragging { opacity: .4; }
+#rows tr.row-drag-over > td { background: hsl(var(--accent) / 0.9); }
+.cat-item:hover { background: hsl(var(--accent) / 0.8); }
+.cat-item.on {
+  background: hsl(var(--primary)); color: hsl(var(--primary-foreground)); font-weight: 500;
+}
+.cat-item .nm {
+  flex: 1; min-width: 0;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-  color: hsl(var(--foreground) / 0.62); text-decoration: none;
-  font-family: var(--font-mono); font-size: 11.5px;
 }
-.adm-meta .url:hover { color: hsl(var(--primary)); text-decoration: underline; }
-.adm-meta .sep { opacity: .5; }
-.adm-meta .ssl.ok { color: hsl(var(--success)); }
-.adm-meta .ssl.warn { color: hsl(var(--warning-text)); }
-.adm-meta .ssl.bad { color: hsl(var(--destructive)); }
-
-.adm-actions { display: flex; align-items: center; gap: 2px; }
-.adm-actions .icon-btn { width: 30px; height: 30px; }
-.adm-actions .icon-btn svg { width: 15px; height: 15px; }
-.adm-actions .icon-btn.danger:hover { background: hsl(var(--destructive) / 0.12); color: hsl(var(--destructive)); }
-
-.adm-foot { font-size: 12px; margin: 2px 0 0; color: hsl(var(--muted-foreground)); }
-
-/* 窄屏：操作按钮换到第二行，避免挤压名称 */
-@media (max-width: 600px) {
-  .adm-row {
-    grid-template-columns: 20px minmax(0, 1fr);
-    grid-template-areas: "dot main" ". actions";
-    row-gap: 6px;
-  }
-  .adm-status { grid-area: dot; }
-  .adm-main { grid-area: main; }
-  .adm-actions { grid-area: actions; justify-content: flex-end; }
-  .adm-meta .url { max-width: 100%; }
-  .adm-toolbar .btn { flex: 1 1 auto; justify-content: center; }
+.cat-item .n {
+  flex-shrink: 0; font-size: 11px; opacity: .65; font-variant-numeric: tabular-nums;
 }
 
-/* 刷新中：图标转圈 */
-.icon-btn.spin svg, .btn.spin svg { animation: spin-once .6s linear infinite; }
-@keyframes spin-once { to { transform: rotate(360deg); } }
+/* 操作按钮：平时隐藏，hover 才出现（移动端无 hover → 常显） */
+.cat-item .ops { display: none; flex-shrink: 0; align-items: center; gap: 1px; }
+.cat-item:hover .ops { display: inline-flex; }
+.cat-item .ops button {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 20px; height: 20px; padding: 0; border: 0; border-radius: 4px;
+  background: transparent; color: inherit; opacity: .7; cursor: pointer;
+}
+.cat-item .ops button:hover:not(:disabled) { background: hsl(var(--foreground) / 0.12); opacity: 1; }
+.cat-item .ops button:disabled { opacity: .25; cursor: not-allowed; }
+.cat-item .ops svg { width: 13px; height: 13px; }
+@media (hover: none) { .cat-item .ops { display: inline-flex; } }
+
+
+
+/* ── 右侧表格容器 ─────────────────────────────────────── */
+
+.tbl-wrap { overflow-x: auto; padding: 4px 8px 8px; }
+/* URL 过长时截断，避免把操作列挤出视野 */
+.tbl-wrap td .mono {
+  display: inline-block; max-width: 260px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: middle;
+}
+
+/* 后台页面底部的说明文字（顺序提示 / 额度估算）：统一字号与颜色 */
+.adm-note {
+  margin: 0; font-size: 12px; line-height: 1.6;
+  color: hsl(var(--muted-foreground));
+}
 
 /* ── 设置对话框的分组标题 ─────────────────────────────── */
 
 .set-group {
-  margin: 4px 0 -2px; padding-top: 14px;
+  margin: 6px 0 -2px; padding-top: 12px;
   font-size: 12px; font-weight: 600; letter-spacing: .04em;
   color: hsl(var(--muted-foreground));
   border-top: 1px solid hsl(var(--border) / 0.8);
 }
-.set-group:first-of-type { border-top: 0; padding-top: 0; }
-.set-probe { margin: -4px 0 10px; }
-
-/* 折叠的高级选项 */
-.adv {
-  border: 1px solid hsl(var(--border) / 0.8);
-  border-radius: calc(var(--radius) - 2px);
-  padding: 0 12px;
-}
-.adv > summary {
-  padding: 10px 0; font-size: 12.5px;
-  color: hsl(var(--muted-foreground)); cursor: pointer;
-  list-style: none;
-}
-.adv > summary::-webkit-details-marker { display: none; }
-.adv > summary::before { content: "▸ "; display: inline-block; }
-.adv[open] > summary::before { content: "▾ "; }
-.adv[open] { padding-bottom: 12px; }
-.adv .grid-2 { margin-top: 10px; }
+.set-group:first-of-type { border-top: none; padding-top: 0; }
+.set-probe { margin: -2px 0 10px; }
 
 /* ── 登录遮罩 ─────────────────────────────────────────── */
 
