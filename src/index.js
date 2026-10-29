@@ -817,7 +817,6 @@ async function collectGlobalping(env, sitesIn) {
       blockedUntil: null,
       // 本轮没被收走的 pending（还在跑 / 被限流而跳过）—— 供 dispatch 复用，省一次查询。
       remaining: [],
-      lastChecked: {},
     };
 
   const sites = sitesIn || (await loadSites(env));
@@ -841,7 +840,6 @@ async function collectGlobalping(env, sitesIn) {
   // 还在跑 / 因限流本轮没打的 pending：交给 dispatch，省掉它自己再查一次 pending 表。
   const remaining = [];
   // 本轮更新过的 last_checked_ts（bumpState 里写的就是这个值）
-  const lastChecked = {};
 
   for (const p of pending) {
     // ── 兜底：存活过久的 pending 一律丢弃 ──
@@ -952,10 +950,7 @@ async function collectGlobalping(env, sitesIn) {
   if (rows.length) await insertChecks(env, rows);
   // 分片 IN 一次删完（deleteBySites 内部按 90 个参数分片）
   if (doneIds.length) await deleteBySites(env, "pending", doneIds);
-  // 与 bumpState 共用同一个时间戳，供 dueSites 判断到期
-  const checkedAt = new Date().toISOString();
-  await bumpState(env, perSite, [...voidSet], checkedAt);
-  for (const id of Object.keys(perSite)) lastChecked[id] = checkedAt;
+  await bumpState(env, perSite, [...voidSet]);
   // 只在握手成功时写证书；失败时保持原值（连不上不代表证书变了）
   if (sslWrites.length) await saveSslBatch(env, sslWrites).catch(() => {});
   return {
@@ -967,41 +962,40 @@ async function collectGlobalping(env, sitesIn) {
     sslWritten: sslWrites.length,
     blockedUntil,
     remaining,
-    // 本轮写进 state 的 last_checked_ts（每站点一条）。dueSites 直接用它判到期，
-    // 省掉再一次 `SELECT ... FROM state` 全表读。
-    lastChecked,
   };
 }
 
-/** cron 每分钟触发，下面两处修正都基于「调度器最多每分钟醒一次」。 */
-const CRON_PERIOD_MS = 60_000;
-
-/** 判定到期的提前量：last_checked_ts 在写库之后才更新，比 check 自身时间戳晚几秒。 */
-const DUE_GRACE_MS = 15_000;
-
 /**
- * 挑出本轮到期的站点。
- * @param lastChecked 可传 { site: iso }，省掉一次 state 全表读；不传则自己查。
+ * 挑出本轮到期的站点：只看 next_due_ts。
+ * @param schedule 可传 { site: next_due_ts }，省掉一次 state 全表读。
  */
-async function dueSites(env, sites, lastChecked) {
-  let lastMap = lastChecked;
-  if (!lastMap) {
+async function dueSites(env, sites, schedule) {
+  let map = schedule;
+  if (!map) {
     const d = await db(env);
-    const { results } = await d.prepare("SELECT site, last_checked_ts FROM state").all();
-    lastMap = Object.fromEntries((results || []).map((r) => [r.site, r.last_checked_ts]));
+    const { results } = await d
+      .prepare("SELECT site, next_due_ts, last_checked_ts FROM state")
+      .all();
+    map = Object.fromEntries(
+      (results || []).map((r) => [r.site, { due: r.next_due_ts, last: r.last_checked_ts }])
+    );
   }
   const now = Date.now();
   return sites.filter((s) => {
-    const last = lastMap[s.id];
-    if (!last) return true;
-    const ivMs = Math.max(1, Number(s.interval_min || 5)) * 60_000;
-
-    // 两阶段结果晚一轮落地，所以提前一个周期发起，让结果落在 interval 上。
-    const lead = CRON_PERIOD_MS;
-
-    const dueAt = Math.max(0, ivMs - lead) - DUE_GRACE_MS;
-    return now - new Date(last).getTime() >= dueAt;
+    const row = map[s.id];
+    if (!row) return true; // 从未检查过
+    if (row.due) return now >= Date.parse(row.due);
+    // 没排过期：升级自 v3（或别的路径写进来），用上次发起时间补算一次，
+    // 避免升级瞬间把所有站点一起重发。
+    if (!row.last) return true;
+    return now >= Date.parse(nextDueOf(row.last, s.interval_min));
   });
+}
+
+/** 下一次到期时刻 = 本次发起时刻 + 间隔。单一定义点，写侧与补算共用。 */
+function nextDueOf(startedAt, intervalMin) {
+  const iv = Math.max(1, Number(intervalMin || 5)) * 60_000;
+  return new Date(Date.parse(startedAt) + iv).toISOString();
 }
 
 /**
@@ -1038,6 +1032,9 @@ async function dispatch(env, sites, opts = {}) {
   const blocked = blockedUntil > Date.now();
 
   const gpStarted = [];
+  // 本轮成功发起的 [site, ts]：调度依据是发起节奏，不能等结果回来才更新，
+  // 否则某轮收取失败会让该站点每分钟重新发起。攒起来一次 batch 写完。
+  const started = [];
   let quota = null;
   let lastError = null;
   let okCount = 0;
@@ -1066,12 +1063,16 @@ async function dispatch(env, sites, opts = {}) {
     used += 1;
     try {
       const { id, source, quota: q } = await gpCreate(env, s);
+      const startedAt = new Date().toISOString();
       await d
         .prepare(
           "INSERT OR REPLACE INTO pending (site, measurement_id, source, created_ts) VALUES (?,?,?,?)"
         )
-        .bind(s.id, id, source, new Date().toISOString())
+        .bind(s.id, id, source, startedAt)
         .run();
+      // 发起即视为「已检查」（见下面的批量写入），结果字段不动。
+      // 发起即排下一次：调度看的是发起节奏，与结果何时回收无关
+      started.push([s.id, startedAt, nextDueOf(startedAt, s.interval_min)]);
       gpStarted.push({ site: s.id, id, source, quota: q });
       okCount++;
       if (q && (q.limit || q.remaining)) quota = q;
@@ -1113,6 +1114,23 @@ async function dispatch(env, sites, opts = {}) {
   else if (raw.gp_blocked_until) entries.push(["gp_blocked_until", ""]);
   // 一次 batch：几行 meta 不该变成几次往返
   if (entries.length) await saveSettings(env, entries).catch(() => {});
+
+  // 一次 batch 写「上次发起 + 下次到期」。发起失败的不在这里（保持原排期，下一轮重试）。
+  if (started.length) {
+    await d
+      .batch(
+        started.map(([site, ts, due]) =>
+          d
+            .prepare(
+              "INSERT INTO state (site, last_checked_ts, next_due_ts) VALUES (?, ?, ?) " +
+                "ON CONFLICT(site) DO UPDATE SET " +
+                "last_checked_ts = excluded.last_checked_ts, next_due_ts = excluded.next_due_ts"
+            )
+            .bind(site, ts, due)
+        )
+      )
+      .catch(() => {});
+  }
 
   if (voidSites.length) await bumpState(env, {}, voidSites);
 
@@ -2450,15 +2468,12 @@ export default {
       sslWritten: 0,
       blockedUntil: null,
       remaining: [],
-      lastChecked: {},
     });
 
     // 再按各站点的监测间隔，只对「已到期」的发起新一轮。
     // 预算要减掉本轮收取已经花掉的次数（见 dispatch 的注释）。
     // 到期判断复用本轮刚写进 state 的时间戳，跳过再一次 `SELECT ... FROM state`。
-    // 全新实例 state 为空 → lastChecked 也是空对象，所有站点都会被判「无记录 → 到期」，
-    // 与查库结果一致，所以可以无条件传。
-    const due = await stage("dueSites", () => dueSites(env, sites, collected.lastChecked), []);
+    const due = await stage("dueSites", () => dueSites(env, sites), []);
     const disp = await stage(
       "dispatch",
       () =>

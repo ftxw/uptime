@@ -4,7 +4,7 @@
 -- `src/schema.js` 供代码 import，那份是生成物不要手改。
 --
 -- 改结构时：版本号 +1，并在 src/migrations.js 补一条增量迁移（旧库才需要）。
--- schema-version: 3
+-- schema-version: 4
 
 CREATE TABLE IF NOT EXISTS sites (
   id             TEXT PRIMARY KEY,
@@ -51,7 +51,8 @@ CREATE TABLE IF NOT EXISTS checks_daily (
 );
 
 -- 运行态。last_* 是最后一次结果的反范式缓存，避免每次展示都对 checks 跑窗口函数。
--- last_checked_ts 供调度（只记自动探测）；last_ts 供展示（含手动测试）。
+-- last_checked_ts 记上一次发起（只记自动探测）；last_ts 供展示（含手动测试）。
+-- next_due_ts 是计划的下一次发起时刻，调度只看它，不再从 last_checked_ts 反推。
 CREATE TABLE IF NOT EXISTS state (
   site             TEXT PRIMARY KEY,
   consecutive_fail INTEGER NOT NULL DEFAULT 0,
@@ -60,6 +61,9 @@ CREATE TABLE IF NOT EXISTS state (
   -- 页面只是「X 分钟前」越变越大 —— 用户无法区分「站点好了」和「我们瞎了」。
   void_streak      INTEGER NOT NULL DEFAULT 0,
   last_checked_ts  TEXT,
+  -- 计划的下一次发起时刻（ISO）。NULL = 尚未排期，按 last_checked_ts + 间隔补算一次。
+  -- 用绝对时刻而非"上次时间 + 间隔"来比对：收取失败、时间戳缺失都不会打乱后续排期。
+  next_due_ts      TEXT,
   last_ok          INTEGER,  -- 1 正常 / 0 故障
   last_status      INTEGER,
   last_ttfb_ms     INTEGER,

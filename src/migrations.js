@@ -14,4 +14,10 @@ export const MIGRATIONS = [
     v: 3,
     stmts: ["ALTER TABLE state ADD COLUMN void_streak INTEGER NOT NULL DEFAULT 0"],
   },
+  {
+    // 计划的下一次发起时刻。旧库补列后为 NULL，dueSites 会按 last_checked_ts 补算一次，
+    // 所以升级当轮不会把所有站点一起重发。
+    v: 4,
+    stmts: ["ALTER TABLE state ADD COLUMN next_due_ts TEXT"],
+  },
 ];
