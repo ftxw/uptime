@@ -16,6 +16,13 @@
 /*.svg
   Cache-Control: public, max-age=86400
 
+# 后台页不要进搜索引擎 / 不要被外站引用：<meta name="robots"> 只对遵守约定的爬虫有效，
+# HTTP 头则是所有抓取方都能看到的。X-Robots-Tag 是零成本的一层保险。
+/admin.html
+  X-Robots-Tag: noindex, nofollow
+/admin.js
+  X-Robots-Tag: noindex, nofollow
+
 # ⚠️ 这里**刻意不给 `/*.js` 与 `/*.css` 加长缓存**。
 # 前端文件名都**不带内容哈希**（app.js / app.css 固定名），所以
 # `max-age=300` 之类的长缓存必然产生版本错配：部署后的 5 分钟里，

@@ -92,10 +92,13 @@ function barHtml(m) {
         : b.st === "up" ? "全天正常"
         : b.st === "fault" ? "当天有故障"
         : "当天有抖动";
-      return `<span class="${cls}" data-d="${b.d}" data-s="${label}"></span>`;
+      // title + aria-label + tabindex：移动端没有 hover（自定义 tooltip 摸不到），
+      // 键盘/读屏也够不到一个不可聚焦的 <span>。三样一起补，才不是"只有鼠标能用"。
+      return `<span class="${cls}" tabindex="0" title="${b.d} · ${label}"
+        aria-label="${b.d} ${label}" data-d="${b.d}" data-s="${label}"></span>`;
     })
     .join("");
-  return `<div class="bar" aria-label="最近 30 天运行历史">${segs}</div>`;
+  return `<div class="bar" role="img" aria-label="最近 30 天运行历史">${segs}</div>`;
 }
 
 function monitorRow(m) {
@@ -305,6 +308,32 @@ document.addEventListener("mousemove", (e) => {
 });
 document.addEventListener("mouseout", (e) => {
   if (e.target.closest(".bar span")) tip.classList.remove("show");
+});
+
+/* 触屏：色条上的每一格都绑了 title，但原生 title 在手机上不会弹。
+   这里复用一个 1px 的透明代理，用 pointerdown 定位到具体格子再把 data-* 读出来。 */
+document.addEventListener("pointerdown", (e) => {
+  if (e.pointerType === "mouse") return; // 鼠标走上面的 mouseover
+  const seg = e.target.closest(".bar span");
+  if (!seg) {
+    tip.classList.remove("show");
+    return;
+  }
+  tip.innerHTML = `<b>${seg.dataset.s}</b><br>${seg.dataset.d}`;
+  tip.classList.add("show");
+  tip.style.left = Math.min(e.clientX + 12, innerWidth - tip.offsetWidth - 8) + "px";
+  tip.style.top = Math.max(e.clientY - tip.offsetHeight - 10, 8) + "px";
+});
+
+/* 键盘：聚焦到某一格时也把提示显示出来，读屏用户才有"这一格是什么"的反馈 */
+document.addEventListener("focusin", (e) => {
+  const seg = e.target.closest && e.target.closest(".bar span");
+  if (!seg) return;
+  const r = seg.getBoundingClientRect();
+  tip.innerHTML = `<b>${seg.dataset.s}</b><br>${seg.dataset.d}`;
+  tip.classList.add("show");
+  tip.style.left = Math.min(r.left + r.width / 2, innerWidth - tip.offsetWidth - 8) + "px";
+  tip.style.top = Math.max(r.top - tip.offsetHeight - 10, 8) + "px";
 });
 
 document.addEventListener("visibilitychange", () => { if (!document.hidden) load(); });

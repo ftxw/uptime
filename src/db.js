@@ -253,16 +253,42 @@ async function backfillDaily(d) {
   return { rows, done: true };
 }
 
+/**
+ * meta 表全量读的 isolate 级缓存。
+ *
+ * 为什么要有：`fetch` 每一步（认证、缓存 key、读接口）都要 loadSettings，
+ * 于是**即便边缘缓存命中，也照样打一次 D1** —— 被别人刷 overview 就等于刷 D1 读额度。
+ * 设置是「读极多、写极少」的数据，在本 isolate 内缓存 30 秒完全不影响语义：
+ * 写侧（saveSetting/saveSettings）会主动清缓存，本实例立刻看到新值；
+ * 其它机房最迟 30 秒跟上，而它们本来就要靠 config_version 换 key。
+ *
+ * 不带 env 差异：一个 isolate 只服务一个 Worker，缓存按 D1 绑定的对象身份区分。
+ */
+const SETTINGS_TTL_MS = 30_000;
+let settingsCache = null; // { binding, expires, data }
+
+function invalidateSettings() {
+  settingsCache = null;
+}
+
 export async function loadSettings(env) {
   const d = await db(env);
+  const now = Date.now();
+  if (settingsCache && settingsCache.binding === d && settingsCache.expires > now) {
+    return { ...settingsCache.data };
+  }
   const out = {};
   const { results } = await d.prepare("SELECT key, value FROM meta").all();
   for (const r of results || []) out[r.key] = r.value;
-  return out;
+  settingsCache = { binding: d, expires: now + SETTINGS_TTL_MS, data: out };
+  // 返回副本：调用方（effectiveEnv / 登录失败计数）会就地改对象，不能污染缓存。
+  return { ...out };
 }
 
 export async function saveSetting(env, key, value) {
   const d = await db(env);
+  // 写前先失效：避免并发请求在本函数的 await 窗口里读到旧值并回填缓存。
+  invalidateSettings();
   if (value === null || value === undefined || value === "") {
     await d.prepare("DELETE FROM meta WHERE key = ?").bind(key).run();
   } else {
@@ -280,6 +306,7 @@ export async function saveSetting(env, key, value) {
 export async function saveSettings(env, entries) {
   if (!entries || !entries.length) return 0;
   const d = await db(env);
+  invalidateSettings();
   const upsert = d.prepare(
     "INSERT INTO meta (key, value) VALUES (?, ?) " +
       "ON CONFLICT(key) DO UPDATE SET value = excluded.value"
@@ -288,6 +315,7 @@ export async function saveSettings(env, entries) {
   const stmts = entries.map(([k, v]) =>
     v === null || v === undefined || v === "" ? del.bind(k) : upsert.bind(k, String(v))
   );
+  // 写失败也保留失效：下次读回源即可，绝不把旧值留在缓存里。
   await d.batch(stmts);
   return stmts.length;
 }
@@ -387,14 +415,17 @@ function lastResultFields(info, nowIso) {
  *
  * 必须批量（否则一轮 N 站就是 2N 次往返），且每条都要 .bind() 后入 batch。
  */
-export async function bumpState(env, perSite, voidSites = []) {
+export async function bumpState(env, perSite, voidSites = [], checkedAt) {
   const d = await db(env);
   const ids = Object.keys(perSite);
   const voids = (voidSites || []).filter((s) => s && !perSite[s]);
   if (!ids.length && !voids.length) return;
 
+  // 上一轮的连续失败计数：用于算「当天连续段」与新的 consecutive_fail。
   const prev = ids.length ? await selectPrevState(d, ids) : {};
-  const nowIso = new Date().toISOString();
+  // checkedAt 由调用方给：collectGlobalping 要在同一轮里把「谁在本轮被检查过」回传给 dueSites，
+  // 两边若各取一次 now，差几毫秒就够让刚测过的 1 分钟站点被误判为到期。
+  const nowIso = checkedAt || new Date().toISOString();
   const offsetMs = dayOffsetMs(env);
   const today = dayKey(nowIso, offsetMs);
   const batch = [];
@@ -514,19 +545,51 @@ export async function upsertLastResult(env, row) {
  *
  * 只写 checks_daily，不动 consecutive_fail / last_checked_ts（那是调度用的）。
  */
-export async function bumpDailyManual(env, site, ok) {
+/**
+ * 手动测试写「按天汇总」。
+ *
+ * 与 bumpState 的区别只有一处、但很要紧：**连续失败段不能用全局 consecutive_fail**。
+ * 那列只随自动探测递增（upsertLastResult 刻意不碰它），所以在一个暂时正常的站点上
+ * 连点 5 次「测」全失败，每次都算出 `0 + 1 = 1`，永远到不了 fail_threshold（默认 3）——
+ * 色条一直是黄的，而「最近检查」里明明是 5 条失败。这正是两套口径。
+ *
+ * 改成直接数「今天最后一次成功之后连续失败了几条」：
+ *   run = SELECT COUNT(*) FROM checks WHERE 今天 AND ok=0 AND ts > 今天最后一次成功的 ts
+ * 一条按 (site, ts) 索引的查询就能算出来，且**与自动探测的 checks 明细同源**，
+ * 所以「今天手动测了几次、红不红」和详情页列表永远对得上。
+ *
+ * 前提：本函数必须在 insertChecks **之后**调用（本次结果已落库，数得进去）。
+ *
+ * @param ts 本次记录的 ts（与写入 checks 的那条一致，避免两处各取一次 now 而跨日界）
+ * @returns {{ run: number }} 写入的当天连续失败段
+ */
+export async function bumpDailyManual(env, site, ok, ts) {
   const d = await db(env);
-  const p = await d
-    .prepare("SELECT consecutive_fail, last_checked_ts FROM state WHERE site = ?")
-    .bind(site)
-    .first();
   const offsetMs = dayOffsetMs(env);
-  const nowIso = new Date().toISOString();
-  const today = dayKey(nowIso, offsetMs);
-  // 与 bumpState 同一套「当天连续段」口径：跨日从头数，同日沿用全局连续数 + 1。
-  const sameDay = p?.last_checked_ts ? dayKey(p.last_checked_ts, offsetMs) === today : false;
-  const run = ok ? 0 : sameDay ? Number(p?.consecutive_fail || 0) + 1 : 1;
+  const at = ts || new Date().toISOString();
+  const today = dayKey(at, offsetMs);
+  // 当天 00:00 对应的 UTC 时刻：dayKey 反推，不另起一套日期算法。
+  const dayStart = new Date(Date.parse(`${today}T00:00:00.000Z`) - offsetMs).toISOString();
+
+  let run = 0;
+  if (!ok) {
+    const r = await d
+      .prepare(
+        `SELECT COUNT(*) AS n FROM checks INDEXED BY idx_checks_site_ts
+         WHERE site = ?1 AND ts >= ?2 AND ok = 0
+           AND ts > COALESCE(
+             (SELECT MAX(ts) FROM checks WHERE site = ?1 AND ts >= ?2 AND ok = 1),
+             ?2
+           )`
+      )
+      .bind(site, dayStart)
+      .first();
+    // 至少算 1：即便这条记录因跨日/索引边界没被数进去，也不能记成"当天没失败过"。
+    run = Math.max(1, Number(r?.n || 0));
+  }
+
   await d.prepare(DAY_UPSERT).bind(site, today, ok ? 1 : 0, run).run();
+  return { run };
 }
 
 /** 证书整体覆盖写：证书是一次握手的完整快照，拼旧值反而会半新半旧。 */

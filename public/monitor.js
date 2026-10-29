@@ -190,6 +190,12 @@ function renderChart(series, hours) {
     grid += `<text class="axis-text" x="${pad.l - 8}" y="${(y + 4).toFixed(
       1
     )}" text-anchor="end">${Math.round(v)}</text>`;
+    // 只在顶刻度补单位：每格都写 "ms" 会让 y 轴看起来像一串噪点
+    if (i === STEP) {
+      grid += `<text class="axis-text" x="${pad.l - 8}" y="${(y - 12).toFixed(
+        1
+      )}" text-anchor="end">ms</text>`;
+    }
   }
 
   // x 轴刻度
@@ -242,11 +248,18 @@ function renderChart(series, hours) {
       bad += `<circle class="chart-dot-bad" cx="${X(T(p)).toFixed(1)}" cy="${Y(p.v).toFixed(
         1
       )}" r="3.5"/>`;
+    } else if (p.n > 0 && p.v == null) {
+      // 整槽全失败：折线在这里是断的，而"断线"在视觉上和"没有数据"一模一样。
+      // 在基线画一道红杠，把「挂了」和「没测」区分开 —— 这两件事的含义天差地别。
+      bad += `<line class="chart-tick-bad" x1="${(X(T(p)) - 3).toFixed(1)}" y1="${baseY}"
+        x2="${(X(T(p)) + 3).toFixed(1)}" y2="${baseY}"/>`;
     }
   }
 
-  box.innerHTML = `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img"
-      aria-label="响应时间趋势图">
+  // 不再用 preserveAspectRatio="none"：viewBox 的宽高比已经按 clientWidth:260 算好，
+  // 再叠一个 none 等于允许非等比拉伸 —— 宽屏上折线被横向抻开、y 轴数字也被拉宽变形。
+  box.innerHTML = `<svg viewBox="0 0 ${W} ${H}" role="img"
+      aria-label="响应时间趋势图（单位毫秒）">
     <defs>
       <linearGradient id="areaGrad" x1="0" y1="0" x2="0" y2="1">
         <stop offset="0%" style="stop-color:hsl(var(--primary));stop-opacity:.30"/>
@@ -430,7 +443,7 @@ function renderIncidents(incidents, winHours) {
         <div class="muted" style="font-size:12px;margin-top:3px">
           ${fmtFull(i.start)} → ${i.end ? fmtFull(i.end) : "持续中"} · 历时 ${fmtDur(
         i.duration_s
-      )} · 约 ${i.checks_est} 次检查
+      )} · ${i.checks ?? i.checks_est} 次失败
         </div>
       </div>
     </div>`

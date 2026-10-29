@@ -184,9 +184,22 @@ qs("#logout").addEventListener("click", async () => {
 /* ── 目录 / 列表渲染 ───────────────────────────────────── */
 
 const cmps = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
+
+/**
+ * 分组排序必须跟前台 / 左侧目录一致：按 categories.sort 的**显式顺序**，
+ * 而不是分组名的码点顺序。否则用户在左边把「生产环境」拖到第一位，
+ * 右边的分组块仍按拼音/Unicode 排，看起来像“只改了左边一项”。
+ * 不在 CATS 里的分组（站点上手输的）排到末尾，并按名字稳定排序。
+ */
+function groupRank(name) {
+  const i = CATS.findIndex((c) => c.name === name);
+  return i < 0 ? Number.MAX_SAFE_INTEGER : i;
+}
+
 function sortSites(list) {
   return [...list].sort(
     (a, b) =>
+      groupRank(groupOf(a)) - groupRank(groupOf(b)) ||
       cmps(groupOf(a), groupOf(b)) ||
       Number(a.sort ?? 0) - Number(b.sort ?? 0) ||
       cmps(String(a.id), String(b.id))
@@ -389,8 +402,9 @@ async function loadAll() {
     throw new Error((d.error || "加载失败") + (d.hint ? `｜${d.hint}` : ""));
   }
 
-  SITES = sortSites(d.sites || []);
+  // CATS 必须先赋值：sortSites 依赖它算分组顺序。
   CATS = d.categories || [];
+  SITES = sortSites(d.sites || []);
   if (d.settings) SETTINGS = d.settings; // 供设置面板预填，打开时不必先等网络
   PROBE = d.probe || null;
   applyBrandTitle(SETTINGS);
@@ -730,7 +744,13 @@ qs("#form").addEventListener("submit", async (e) => {
     interval_min: Number(qs("#f-interval").value || 5),
     enabled: qs("#f-enabled").value === "1",
   };
-  if (!body.id || !body.url) return;
+  // 不再静默 return：字段缺失时必须告诉用户，否则看起来像"点了没反应"。
+  const requireEl = qs("#dlg-err");
+  if (!body.id || !body.url) {
+    requireEl.textContent = !body.id ? "请填写站点标识（可用「名称」自动生成）" : "请填写监控地址";
+    requireEl.hidden = false;
+    return;
+  }
 
   // 排序统一由列表拖拽负责，但编辑时要把原 sort 带回去，否则会被挪到队尾。
   const prev = siteById(body.id);
@@ -739,6 +759,8 @@ qs("#form").addEventListener("submit", async (e) => {
   try {
     const d = await post("/sites", body);
     if (!d.ok) throw new Error(d.error || "保存失败");
+    // upserted = 0 说明服务端一条都没写（id/url 被过滤掉）：别提示"已保存"。
+    if (d.upserted === 0) throw new Error("服务端没有写入任何站点（站点标识或地址为空）");
     dlg.close();
     banner("已保存", "info");
     await loadAll();
@@ -788,7 +810,13 @@ document.addEventListener("click", async (e) => {
       // 以前这里自己拼「机房 SJC」，与前台写法不一致。
       const where = d.origin || "";
       // 文案压成一条紧凑的短句：toast 是单个胶囊，字段用 · 分隔比用中文更省宽度
-      const mark = d.persisted ? (d.persisted.ok ? " · 已记录" : ` · 未记录：${d.persisted.reason || "失败"}`) : "";
+      let mark = d.persisted ? (d.persisted.ok ? " · 已记录" : ` · 未记录：${d.persisted.reason || "失败"}`) : "";
+      // 连续失败达到阈值时直接说出来：否则用户要自己数"今天第几次了"
+      if (d.persisted && !d.persisted.ok && d.persisted.fail_run >= d.persisted.fail_threshold) {
+        mark += ` · 今天已连续失败 ${d.persisted.fail_run} 次（构成故障）`;
+      }
+      // 写库有残缺（按天汇总 / 状态快照没写进去）时必须显形，不能装作"已记录"
+      if (d.persisted && d.persisted.warn) mark += ` · ⚠ ${d.persisted.warn}`;
       // 先重渲染表格再弹提示，只调 renderRows 不重拉全量。
       if (d.persisted) await renderRows();
       // 上色按判定结果而非传输是否成功（期望 200 实得 500 仍算失败）。
@@ -983,7 +1011,9 @@ function quotaStats(limitOverride) {
   let need = 0;
   for (const site of SITES) {
     if (site.enabled === 0 || site.enabled === false) continue;
-    const iv = Math.max(1, Number(site.interval_min) || 5);
+    // 实际间隔不能低于 2 分钟：两阶段模型（本轮发起、下轮收取）下，1 分钟档位
+    // 真实落库间隔约 120s。按 1 分钟算额度会**高估**消耗，让用户以为额度不够用。
+    const iv = Math.max(2, Number(site.interval_min) || 5);
     n++;
     need += (60 / iv) * limit;
   }
@@ -1147,14 +1177,37 @@ qs("#theme").addEventListener("click", () => {
 });
 
 // 名称自动生成 id
-qs("#f-name").addEventListener("input", (e) => {
-  const idEl = qs("#f-id");
-  if (idEl.readOnly || idEl.dataset.touched) return;
-  idEl.value = e.target.value
+/**
+ * 名称 → id 的自动推导。
+ *
+ * ⚠️ 纯中文名（「我的博客」）经下面这串替换会得到**空串**，而空 id 在提交时会被
+ * `if (!body.id || !body.url) return;` 静默吞掉：用户点了保存，弹窗不关、没有报错、
+ * 什么也没发生。所以中文名必须退化成一个随机 id，而不是留空。
+ */
+function slugifyId(name) {
+  const slug = String(name || "")
     .trim()
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-|-$/g, "");
+    .replace(/^-|-$/g, "")
+    .slice(0, 40);
+  if (slug) return slug;
+  // 退路：site-xxxxxxxx（8 位十六进制，足够避免同一批次内碰撞）
+  const rand = Array.from(crypto.getRandomValues(new Uint8Array(4)))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+  return `site-${rand}`;
+}
+
+qs("#f-name").addEventListener("input", (e) => {
+  const idEl = qs("#f-id");
+  if (idEl.readOnly || idEl.dataset.touched) return;
+  // 名字还是空的就先别写 id：否则用户刚敲第一个字母就会拿到一个随机后缀
+  if (!e.target.value.trim()) {
+    idEl.value = "";
+    return;
+  }
+  idEl.value = slugifyId(e.target.value);
 });
 qs("#f-id").addEventListener("input", (e) => {
   e.target.dataset.touched = "1";

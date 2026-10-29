@@ -176,13 +176,15 @@
         <div class="field">
           <label for="f-interval">监测间隔</label>
           <select id="f-interval">
-            <option value="1">1 分钟</option>
+            <option value="1">1 分钟（实际约 2 分钟）</option>
             <option value="5">5 分钟</option>
             <option value="10">10 分钟</option>
             <option value="30">30 分钟</option>
             <option value="60">1 小时</option>
           </select>
-          <span class="hint">每隔多久探测一次</span>
+          <!-- 1 分钟档位受两阶段模型限制：本轮发起、下一轮收取，所以真实间隔约 2 分钟。
+               不写清楚的话，用户会按 1 分钟算额度，却拿到 2 分钟一次的结果。 -->
+          <span class="hint">每隔多久探测一次；1 分钟档位受调度模型限制，实际约 2 分钟</span>
         </div>
         <div class="field">
           <label for="f-enabled">启用</label>

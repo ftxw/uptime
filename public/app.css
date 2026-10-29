@@ -324,10 +324,13 @@ a { color: inherit; text-decoration: none; }
 .bar { display: flex; align-items: center; gap: 2px; }
 .bar span {
   height: 24px; flex: 1; border-radius: 2px;
+  /* 键盘可达：可聚焦才有 focusin，用户才能用 Tab 逐格读 tooltip */
+  outline-offset: 2px;
   background: hsl(var(--muted) / 0.9);
   transition: filter .12s; cursor: pointer;
 }
 .bar span:hover { filter: brightness(1.12); }
+.bar span:focus-visible { outline: 2px solid hsl(var(--primary)); }
 .bar .s-up { background: hsl(var(--success)); }
 /* 红 = 当天出现「连续失败达到该站点阈值」的段（真故障，与「故障记录」同一口径）。
    只有零星抖动的天用黄 —— 单次失败不算故障，涂红会与故障记录卡片自相矛盾。 */
@@ -430,6 +433,35 @@ select {
 .table tr:last-child td { border-bottom: none; }
 .table tr:hover td { background: hsl(var(--accent) / 0.45); }
 
+/* ── 窄屏：表格改成卡片行 ──────────────────────────────────
+   原先只有 .tbl-wrap 的横向滚动：手机上「地址」列占 260px，编辑/删除被推到屏幕外，
+   必须横滑才能点到，而横滑又容易和浏览器的返回手势打架。
+   这里把每行摊成两列小网格：名称+状态一行、地址一行、操作按钮一行。
+   <td> 用 data-label 出字段名，不必改 JS 生成的 HTML 结构（顺序不变）。 */
+@media (max-width: 760px) {
+  .table thead { display: none; }
+  .table, .table tbody { display: block; }
+  .table tr {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 6px 10px;
+    padding: 12px 10px;
+    border-bottom: 1px solid hsl(var(--border) / 0.7);
+  }
+  .table tr:last-child { border-bottom: none; }
+  .table td { display: block; padding: 0; border: 0; min-width: 0; }
+  /* 名称列占左，状态列占右，地址整行，操作整行右对齐 */
+  .table td:nth-child(1) { grid-column: 1; }
+  .table td:nth-child(4) { grid-column: 2; text-align: right; }
+  .table td:nth-child(2) { grid-column: 1 / -1; }
+  .table td:nth-child(3) { grid-column: 1; }
+  .table td:nth-child(5) { grid-column: 1 / -1; text-align: left; padding-top: 8px; }
+  /* 地址截断宽度放在窄屏里就没意义了：整行展示，超长省略 */
+  .tbl-wrap td .mono { max-width: 100%; }
+  /* 操作按钮做大一点：拇指点按的最小目标是 40px 左右 */
+  .table td:nth-child(5) .btn { height: 32px; padding: 0 12px; }
+}
+
 /* ── 弹层 ───────────────────────────────────────────────── */
 
 dialog {
@@ -440,16 +472,30 @@ dialog {
   -webkit-backdrop-filter: blur(20px) saturate(160%);
   color: hsl(var(--foreground));
   padding: 0; width: min(600px, calc(100vw - 32px));
+  /* iOS Safari 弹出软键盘时视口会缩小，但 fixed 定位的 dialog 不跟随：
+     不设上限的话，底部「保存」按钮会被键盘盖住。dvh 随地址栏/键盘变化。 */
+  max-height: 86vh;
   box-shadow: 0 24px 60px -20px hsl(220 40% 15% / 0.35);
+  display: flex; flex-direction: column;
 }
+@supports (height: 100dvh) {
+  dialog { max-height: 86dvh; }
+}
+/* 弹窗内容自己滚，头/底常驻 —— 表单在手机上经常比屏幕高 */
+.dialog-body { overflow-y: auto; overscroll-behavior: contain; }
+/* 弹窗打开时锁住背景滚动，避免 iOS 上的"背景跟着滑" */
+body:has(dialog[open]) { overflow: hidden; }
 dialog::backdrop { background: hsl(220 30% 10% / 0.45); }
 .dialog-head {
   display: flex; align-items: center; justify-content: space-between;
   padding: 14px 18px; border-bottom: 1px solid hsl(var(--border) / 0.7);
   font-weight: 600; font-size: 14px;
 }
-.dialog-body { padding: 18px; display: flex; flex-direction: column; gap: 14px; }
+/* min-height:0 必须给：flex 子项默认 min-height:auto 不会收缩，overflow 就不生效，
+   长表单会把 dialog 撑破而不是在内部滚动。 */
+.dialog-body { padding: 18px; display: flex; flex-direction: column; gap: 14px; min-height: 0; }
 .dialog-foot {
+  flex: 0 0 auto;
   display: flex; justify-content: flex-end; gap: 8px;
   padding: 14px 18px; border-top: 1px solid hsl(var(--border) / 0.7);
 }
@@ -638,6 +684,8 @@ dialog::backdrop { background: hsl(220 30% 10% / 0.45); }
 }
 .chart-dot { fill: hsl(var(--primary)); }
 .chart-dot-bad { fill: hsl(var(--destructive)); stroke: hsl(var(--card)); stroke-width: 1.5; }
+/* 整槽全失败：在基线画一道红杠，与"空槽（没测）"的断线区分开 */
+.chart-tick-bad { stroke: hsl(var(--destructive)); stroke-width: 3; stroke-linecap: round; }
 .chart-guide { stroke: hsl(var(--primary) / 0.55); stroke-width: 1; stroke-dasharray: 3 3; }
 .chart-hi { fill: hsl(var(--primary)); stroke: hsl(var(--card)); stroke-width: 2; }
 .chart-hit { fill: transparent; cursor: crosshair; }

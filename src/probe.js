@@ -211,6 +211,12 @@ function tlsOf(rr) {
  *
  * broken 分支不可省：id 失效或 API 返回错误体时响应里没有 status，若当成"还在跑"
  * 就会永远 done:false → pending 永不删除 → dispatch 跳过该站点，静默停摆。
+ *
+ * 必须显式看 res.ok / res.status —— 这是与 gpCreate 对齐的部分。早先直接 res.json()，
+ * 结果查询接口一旦限流，每分钟重试一次、直到 PENDING_TTL 到点，日志刷满却没人知道是额度问题：
+ *  · 5xx / 网关 HTML 错误页 → json() 抛 SyntaxError，被上层记成 "throw"，看着像代码 bug；
+ *  · 429 → 不触发 gp_blocked_until 退避（发起端退避了，收取端还在打）。
+ * 现在把 HTTP 层的失败统一成 broken，并把 Retry-After 交给调度层（见 scheduled 的 noteBlocked）。
  */
 export async function gpCollect(env, pending) {
   const token = env && env.GLOBALPING_TOKEN;
@@ -218,7 +224,29 @@ export async function gpCollect(env, pending) {
     `https://api.globalping.io/v1/measurements/${pending.measurement_id}`,
     { headers: token ? { Authorization: `Bearer ${token}` } : {} }
   );
-  const d = await res.json();
+
+  // 429 先处理：它带 Retry-After，要留给调度层做退避，而不是当成"这条结果坏了"丢掉。
+  if (res.status === 429) {
+    const ra = retryAfterMs(res.headers.get("retry-after"));
+    return {
+      done: true,
+      broken: true,
+      rateLimited: true,
+      retryAfterMs: ra,
+      results: [],
+      error: `收取被限流（429），${Math.round(ra / 1000)} 秒后重试`,
+    };
+  }
+  if (!res.ok) {
+    return {
+      done: true,
+      broken: true,
+      results: [],
+      error: `收取失败：HTTP ${res.status}`,
+    };
+  }
+
+  const d = await res.json().catch(() => null);
   if (!d || typeof d.status !== "string") {
     return {
       done: true,
