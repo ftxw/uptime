@@ -988,14 +988,26 @@ async function dueSites(env, sites, schedule) {
     // 没排过期：升级自 v3（或别的路径写进来），用上次发起时间补算一次，
     // 避免升级瞬间把所有站点一起重发。
     if (!row.last) return true;
-    return now >= Date.parse(nextDueOf(row.last, s.interval_min));
+    const next = nextDueOf(row.last, s.interval_min);
+    // 时间不可解析时按"该检查了"处理，不能因为脏数据让站点永久停摆
+    return !next || now >= Date.parse(next);
   });
 }
 
-/** 下一次到期时刻 = 本次发起时刻 + 间隔。单一定义点，写侧与补算共用。 */
-function nextDueOf(startedAt, intervalMin) {
+/**
+ * 下一次到期时刻 = 本轮 cron 触发时刻 + 间隔，对齐到整分钟。
+ *
+ * 不能以「gpCreate 完成时刻」为基准：那样排期点会落在第 303 秒之类的位置，
+ * 而 cron 只在整分钟醒，下一轮 300s 够不到、要到 360s，于是 5 分钟变成 6 分钟。
+ * 以整分钟为基准后，到期点正好落在某次 cron 的出发时刻上。
+ */
+function nextDueOf(fireAt, intervalMin) {
   const iv = Math.max(1, Number(intervalMin || 5)) * 60_000;
-  return new Date(Date.parse(startedAt) + iv).toISOString();
+  // fireAt 可能是毫秒数，也可能是 ISO 字符串（补算路径传的是 last_checked_ts）
+  const ms = typeof fireAt === "number" ? fireAt : Date.parse(fireAt);
+  if (!Number.isFinite(ms)) return null;
+  const base = Math.floor(ms / 60_000) * 60_000;
+  return new Date(base + iv).toISOString();
 }
 
 /**
@@ -1032,8 +1044,10 @@ async function dispatch(env, sites, opts = {}) {
   const blocked = blockedUntil > Date.now();
 
   const gpStarted = [];
-  // 本轮成功发起的 [site, ts]：调度依据是发起节奏，不能等结果回来才更新，
-  // 否则某轮收取失败会让该站点每分钟重新发起。攒起来一次 batch 写完。
+  // 本轮的调度基准（cron 唤醒时刻，同一轮内共用）。排下一次必须用它，
+  // 不能用各站点的完成时刻，否则排期点会逐轮往后挪出整整一分钟。
+  const roundAt = Number(opts.roundAt) || Date.now();
+  // 本轮成功发起的 [site, 完成时刻, 下次到期]：攒起来一次 batch 写完。
   const started = [];
   let quota = null;
   let lastError = null;
@@ -1072,7 +1086,7 @@ async function dispatch(env, sites, opts = {}) {
         .run();
       // 发起即视为「已检查」（见下面的批量写入），结果字段不动。
       // 发起即排下一次：调度看的是发起节奏，与结果何时回收无关
-      started.push([s.id, startedAt, nextDueOf(startedAt, s.interval_min)]);
+      started.push([s.id, startedAt, nextDueOf(roundAt, s.interval_min)]);
       gpStarted.push({ site: s.id, id, source, quota: q });
       okCount++;
       if (q && (q.limit || q.remaining)) quota = q;
@@ -2277,6 +2291,7 @@ export default {
           voided: collect.voidSites,
           pendingSites: collect.remaining,
           blockedUntil: collect.blockedUntil,
+          roundAt: Date.now(),
         });
         // rows / perSite 只在服务端内部用，不下发给浏览器：
         // 后台只需要「收了几条、发起了几个」，把整份明细塞进响应纯属浪费。
@@ -2437,6 +2452,8 @@ export default {
   },
 
   async scheduled(controller, env, ctx) {
+    // 本轮基准时刻：在入口处取一次，全轮共用（排期以它为基准，见 nextDueOf）。
+    const roundAt = Date.now();
     /** 分段容错：每段单独 try/catch，任何一段失败都不中断整轮。 */
     const errors = [];
     const stage = async (name, fn, fallback) => {
@@ -2488,6 +2505,7 @@ export default {
           pendingSites: collected.remaining,
           // 收取侧撞到 429 时，发起端本轮也一起停 —— 否则两边各撞各的。
           blockedUntil: collected.blockedUntil,
+          roundAt,
         }),
       { used: 0, gpStarted: [], skipped: [], voided: 0, blocked_until: null, quota: null }
     );
