@@ -25,88 +25,62 @@
     <div class="brand">
       <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
       <span id="brand-name">站点状态</span>
+      <span class="brand-sub">管理</span>
     </div>
     <nav class="nav">
-      <button class="btn btn-sm" id="logout" title="退出登录">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="M16 17l5-5-5-5M21 12H9"/></svg>
-        退出
-      </button>
+      <a class="icon-btn" href="/" title="查看前台" aria-label="查看前台">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><path d="M15 3h6v6M10 14 21 3"/></svg>
+      </a>
       <button class="icon-btn" id="theme" title="切换主题" aria-label="切换主题">
         <svg class="sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M6.3 17.7l-1.4 1.4M19.1 4.9l-1.4 1.4"/></svg>
         <svg class="moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>
+      </button>
+      <button class="icon-btn" id="settings-open" title="设置" aria-label="设置">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-2.9 1.2V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-2.9-1.2l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1A1.7 1.7 0 0 0 3 15H3a2 2 0 1 1 0-4h.1A1.7 1.7 0 0 0 4.2 8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1A1.7 1.7 0 0 0 9.9 4V3a2 2 0 1 1 4 0v.1A1.7 1.7 0 0 0 16.8 5l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0 1.2 2.9H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>
+      </button>
+      <button class="icon-btn" id="logout" title="退出登录" aria-label="退出登录">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="M16 17l5-5-5-5M21 12H9"/></svg>
       </button>
     </nav>
   </div>
 </header>
 
-<main class="wrap stack" id="main" style="padding-top:24px;visibility:hidden">
+<main class="wrap adm" id="main" hidden>
 
-  <div class="between page-head">
-    <div>
-      <h1>站点管理</h1>
-      <p>左边管分类、右边管站点。两边都支持直接拖动排序 —— 站点需先在左侧选中一个分类。</p>
+  <!-- 概览条：进入页面第一眼要知道"现在什么状态、还剩多少额度" -->
+  <section class="adm-overview" id="overview" aria-label="概览"></section>
+
+  <!-- 工具条：搜索 + 筛选 + 主动作 -->
+  <div class="adm-toolbar">
+    <div class="adm-search">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+      <input id="q" type="search" placeholder="搜索名称、地址或标识" autocomplete="off" aria-label="搜索站点">
     </div>
-    <div class="row">
-      <button class="btn" id="checkall">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polygon points="6 3 20 12 6 21 6 3"/></svg>
-        立即全部检查
-      </button>
-      <button class="btn" id="settings-open">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-2.9 1.2V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-2.9-1.2l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1A1.7 1.7 0 0 0 3 15H3a2 2 0 1 1 0-4h.1A1.7 1.7 0 0 0 4.2 8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1A1.7 1.7 0 0 0 9.9 4V3a2 2 0 1 1 4 0v.1A1.7 1.7 0 0 0 16.8 5l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0 1.2 2.9H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>
-        设置
-      </button>
+    <div class="adm-seg" id="state-filter" role="tablist" aria-label="按状态筛选">
+      <button role="tab" data-state="" class="on">全部</button>
+      <button role="tab" data-state="down">故障</button>
+      <button role="tab" data-state="degraded">降级</button>
+      <button role="tab" data-state="up">正常</button>
+      <button role="tab" data-state="paused">已暂停</button>
     </div>
+    <span class="adm-spacer"></span>
+    <button class="btn btn-sm" id="checkall" title="立即对所有启用站点发起一轮探测">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polygon points="6 3 20 12 6 21 6 3"/></svg>
+      立即检查
+    </button>
+    <button class="btn btn-sm btn-primary" id="add">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
+      添加站点
+    </button>
   </div>
 
-  <!-- 提示统一走 body 末尾的 #toast-host（fixed），不占文档流 -->
+  <!-- 分类条：横向 chips，点一下筛选，拖拽排序 -->
+  <div class="adm-cats" id="cats" role="list" aria-label="分类"></div>
 
-  <!-- 左右两栏：左 = 分类，右 = 站点 -->
-  <div class="adm-grid">
-    <section class="card glass adm-col">
-      <div class="sec-head">
-        <h2>分类</h2>
-        <button class="btn btn-sm" id="cat-add-toggle">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
-          添加分类
-        </button>
-      </div>
-      <div class="cat-list" id="cats"></div>
-    </section>
+  <!-- 站点列表 -->
+  <section class="adm-list" id="list" aria-live="polite"></section>
 
-    <section class="card glass adm-col">
-      <div class="sec-head">
-        <h2 id="sites-title">站点</h2>
-        <button class="btn btn-sm btn-primary" id="add">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
-          添加站点
-        </button>
-      </div>
-      <div class="tbl-wrap">
-        <table class="table">
-          <thead>
-            <tr>
-              <th>名称</th>
-              <th>地址</th>
-              <th>证书</th>
-              <th>状态</th>
-              <th style="text-align:right">操作</th>
-            </tr>
-          </thead>
-          <tbody id="rows">
-            <tr><td colspan="5" class="empty">加载中…</td></tr>
-          </tbody>
-        </table>
-      </div>
-    </section>
-  </div>
-
-  <p class="muted" style="font-size:12px;margin:0">
-    站点顺序、分类顺序都在列表里直接拖动调整（站点需先在左侧选中一个分类）。
-    删除站点会同时清掉它的探测明细、证书与状态（不可撤销）。
-  </p>
-
-  <!-- 额度估算，由 renderQuota() 填充 -->
-  <p id="quota" style="font-size:12px;margin:8px 0 0;line-height:1.6"></p>
+  <p class="adm-foot muted" id="foot"></p>
 </main>
 
 <!-- ══════════ 站点表单 ══════════ -->
@@ -120,72 +94,73 @@
     </div>
 
     <div class="dialog-body">
+      <div class="field">
+        <label for="f-url">监控地址</label>
+        <input id="f-url" required type="url" placeholder="https://example.com/health" autocomplete="off">
+        <span class="hint">路径会保留：填 /health 就检测 /health</span>
+      </div>
+
       <div class="grid-2">
-        <div class="field">
-          <label for="f-id">标识（唯一，字母/数字/点/下划线/短横线）</label>
-          <!-- pattern 必须与后端 SITE_ID_RE 一致 -->
-          <input id="f-id" required pattern="[A-Za-z0-9._-]{1,64}" maxlength="64" placeholder="my-site">
-        </div>
         <div class="field">
           <label for="f-name">显示名称</label>
           <input id="f-name" required placeholder="我的主站">
         </div>
-      </div>
-
-      <div class="field">
-        <label for="f-url">监控地址（完整 URL）</label>
-        <div class="input-row">
-          <input id="f-url" required type="url" placeholder="https://example.com/health">
-          <!-- 与地址框同行，布尔量用 checkbox -->
-          <label class="check-row" for="f-hideurl">
-            <input id="f-hideurl" type="checkbox">
-            <span>URL隐藏</span>
-          </label>
+        <div class="field">
+          <label for="f-id">标识</label>
+          <input id="f-id" required pattern="[A-Za-z0-9._-]{1,64}" maxlength="64" placeholder="自动生成">
+          <span class="hint">唯一，用于链接；留空会按名称生成</span>
         </div>
-        <span class="hint">路径会被保留 —— 填 /health 就检测 /health，不会退化成首页，「URL隐藏」只影响前台展示</span>
-      </div>
-
-      <div class="field">
-        <label for="f-group">分类</label>
-        <select id="f-group"></select>
-        <span class="hint">新建分类请用左侧「＋ 添加分类」</span>
       </div>
 
       <div class="grid-2">
         <div class="field">
-          <label for="f-codes">期望状态码</label>
-          <input id="f-codes" placeholder="200,301,302">
-          <span class="hint">留空 = 接受 200-399</span>
+          <label for="f-group">分类</label>
+          <select id="f-group"></select>
         </div>
-        <div class="field">
-          <label for="f-threshold">连续失败几次判故障</label>
-          <input id="f-threshold" type="number" min="1" max="20" value="3">
-          <span class="hint">未达阈值只算抖动，不标红</span>
-        </div>
-      </div>
-
-      <!-- 顺序由拖拽决定，不提供输入框 -->
-      <div class="grid-2">
         <div class="field">
           <label for="f-interval">监测间隔</label>
           <select id="f-interval">
             <option value="1">1 分钟（实际约 2 分钟）</option>
-            <option value="5">5 分钟</option>
+            <option value="5" selected>5 分钟</option>
             <option value="10">10 分钟</option>
             <option value="30">30 分钟</option>
             <option value="60">1 小时</option>
           </select>
-          <!-- 1 分钟档位实际约 2 分钟，见 dueSites -->
-          <span class="hint">每隔多久探测一次；1 分钟档位受调度模型限制，实际约 2 分钟</span>
-        </div>
-        <div class="field">
-          <label for="f-enabled">启用</label>
-          <select id="f-enabled">
-            <option value="1">启用</option>
-            <option value="0">暂停</option>
-          </select>
         </div>
       </div>
+
+      <!-- 高级选项：默认折叠。绝大多数站点只需要上面四项 -->
+      <details class="adv">
+        <summary>更多选项</summary>
+        <div class="grid-2">
+          <div class="field">
+            <label for="f-codes">期望状态码</label>
+            <input id="f-codes" placeholder="200,301,302">
+            <span class="hint">留空 = 接受 2xx/3xx</span>
+          </div>
+          <div class="field">
+            <label for="f-threshold">判故障阈值</label>
+            <input id="f-threshold" type="number" min="1" max="20" value="3">
+            <span class="hint">连续失败几次算故障</span>
+          </div>
+        </div>
+        <div class="grid-2">
+          <div class="field">
+            <label for="f-enabled">状态</label>
+            <select id="f-enabled">
+              <option value="1">启用</option>
+              <option value="0">暂停</option>
+            </select>
+          </div>
+          <div class="field">
+            <label class="check-row" for="f-hideurl">
+              <input id="f-hideurl" type="checkbox">
+              <span>前台隐藏地址</span>
+            </label>
+            <span class="hint">站点仍监测，只是不对外显示链接</span>
+          </div>
+        </div>
+      </details>
 
       <div class="alert alert-error" id="dlg-err" hidden></div>
     </div>
@@ -206,16 +181,14 @@
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>
       </button>
     </div>
-
     <div class="dialog-body">
       <div class="field">
         <label for="c-name">分类名称</label>
         <input id="c-name" required placeholder="例如：生产环境" autocomplete="off">
-        <span class="hint" id="c-name-hint">分类只用于分组展示，不影响探测行为</span>
+        <span class="hint" id="c-name-hint">只影响分组展示</span>
       </div>
       <div class="alert alert-error" id="catdlg-err" hidden></div>
     </div>
-
     <div class="dialog-foot">
       <button class="btn" data-close type="button">取消</button>
       <button class="btn btn-primary" id="cat-save" value="save" type="submit">保存</button>
@@ -223,11 +196,14 @@
   </form>
 </dialog>
 
-<!-- ══════════ 设置 ══════════ -->
+<!-- ══════════ 设置 ══════════
+     只保留三类：站点展示、探测凭据/位置、降级阈值。
+     IP 版本、子请求预算、明细保留天数等实现细节不再暴露 —— 它们有合理默认值，
+     改错的代价（探测全灭 / 存不下）远大于收益。 -->
 <dialog id="setdlg">
   <form method="dialog" id="setform">
     <div class="dialog-head">
-      <span>站点设置</span>
+      <span>设置</span>
       <button class="icon-btn" data-close aria-label="关闭" type="button">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>
       </button>
@@ -236,12 +212,10 @@
     <div class="dialog-body">
       <div class="alert alert-error" id="set-err" hidden></div>
 
-      <h3 class="set-group">外观</h3>
+      <h3 class="set-group">站点</h3>
       <div class="grid-2">
         <div class="field">
           <label for="s-title">站点标题</label>
-          <!-- maxlength 与后端 normalizeSetting("site_title") 的 slice(0,60) 对齐：
-               否则超长部分会被服务端静默截断，用户看到的与存进去的不一致。 -->
           <input id="s-title" maxlength="60" placeholder="站点状态">
         </div>
         <div class="field">
@@ -251,39 +225,38 @@
             <option value="light">浅色</option>
             <option value="dark">深色</option>
           </select>
-          <span class="hint">用户手动切过主题后，以其选择为准</span>
         </div>
       </div>
-
-      <div class="grid-2">
-        <div class="field">
-          <label for="s-utc">展示时区 · UTC 偏移（分钟）</label>
-          <input id="s-utc" type="number" min="-720" max="840" step="15" placeholder="480">
-          <span class="hint">480 = UTC+8。决定 30 天色条「一天」从哪一刻起算，与服务端口径一致</span>
-        </div>
+      <div class="field">
+        <label for="s-utc">时区</label>
+        <select id="s-utc">
+          <option value="480">UTC+8（北京时间）</option>
+          <option value="0">UTC</option>
+          <option value="420">UTC+7</option>
+          <option value="540">UTC+9（东京）</option>
+          <option value="-300">UTC-5（纽约）</option>
+          <option value="-480">UTC-8（洛杉矶）</option>
+          <option value="60">UTC+1（柏林）</option>
+        </select>
+        <span class="hint">决定 30 天色条怎么切"一天"</span>
       </div>
 
       <h3 class="set-group">探测</h3>
-      <!-- 探针健康（最近一次成功/失败/429 退避），由 admin.js 的 renderProbeInfo() 填充。
-           额度估算不在这里 —— 它随站点与间隔变化，常驻在站点列表底部（#quota）。 -->
-      <p class="hint" id="s-probe" style="margin:-4px 0 12px"></p>
+      <p class="hint set-probe" id="s-probe"></p>
+      <div class="field">
+        <label for="s-gp-token">Globalping Token</label>
+        <div class="input-row">
+          <input id="s-gp-token" type="password" placeholder="留空 = 不修改" autocomplete="off">
+          <button class="btn" type="button" id="s-gp-token-clear">清除</button>
+        </div>
+        <span class="hint" id="s-gp-token-hint">未配置</span>
+      </div>
       <div class="grid-2">
         <div class="field">
-          <label for="s-gp-token">Globalping Token</label>
-          <!-- 「清除」是唯一能删掉已存 token 的入口：输入框留空只表示"不修改"。 -->
-          <div style="display:flex;gap:8px">
-            <input id="s-gp-token" type="password" placeholder="留空 = 不修改" autocomplete="off" style="flex:1;min-width:0">
-            <button class="btn" type="button" id="s-gp-token-clear">清除</button>
-          </div>
-          <span class="hint" id="s-gp-token-hint">未配置（额度 250 次/小时）</span>
-        </div>
-        <div class="field">
-          <label for="s-magic">探测位置筛选</label>
-          <!-- `CN` 单独一项 = 不限网络类型，即云机房 + 家庭宽带全部探针。
-               没有这一项时，"想覆盖两类网络"只能靠下面的「自定义…」手填 CN，很容易被漏掉。 -->
+          <label for="s-magic">探测位置</label>
           <select id="s-magic">
             <option value="CN+datacenter-network">中国 · 云机房</option>
-            <option value="CN">中国 · 全部网络（云机房 + 家庭宽带）</option>
+            <option value="CN">中国 · 全部网络</option>
             <option value="CN+eyeball-network">中国 · 家庭宽带</option>
             <option value="east-asia">东亚</option>
             <option value="western-europe">西欧</option>
@@ -291,77 +264,29 @@
             <option value="__custom__">自定义…</option>
           </select>
           <input id="s-magic-custom" placeholder="CN+changsha+4837" hidden aria-label="自定义位置筛选">
-          <span class="hint">对所有站点生效</span>
         </div>
-      </div>
-
-      <div class="grid-3">
         <div class="field">
-          <label for="s-limit">GP 每次探测点数</label>
-          <!-- 这里是「每次探测点数」取值的**唯一定义处**：选定即生效，代码侧不做换算或钳制。
-               以后要加档位（如 7、9）只在这里加一行 option 即可，别处无需改动。
-               判定规则是「任一探针成功即视为可达，全部失败才判故障」，所以这里只影响
-               「有多少张票可以互相兜底」，不存在平票问题。
-               1 = 退回单点采样（链路抖动会 100% 记成站点故障）。 -->
+          <label for="s-limit">每次探测点数</label>
           <select id="s-limit">
-            <option value="1">1 · 单点采样（无兜底）</option>
-            <option value="3" selected>3 · 多探针兜底（推荐）</option>
+            <option value="1">1 · 单点（无兜底）</option>
+            <option value="3">3 · 多探针兜底（推荐）</option>
             <option value="5">5 · 多探针兜底（更稳）</option>
           </select>
-          <span class="hint">额度按点数计费：选几就扣几次</span>
-        </div>
-        <div class="field">
-          <label for="s-gptimeout">GP 探针超时（秒）</label>
-          <input id="s-gptimeout" type="number" min="5" max="30" step="1" placeholder="15">
-          <span class="hint">整数秒 5–30，越界 Globalping 直接拒绝</span>
-        </div>
-        <div class="field">
-          <label for="s-warn">证书降级阈值（天）</label>
-          <!-- min=0 与服务端的 0–90 对齐：0 = 只在证书已过期时才判降级 -->
-          <input id="s-warn" type="number" min="0" max="90" placeholder="14">
-          <span class="hint">剩余 ≤ N 天判降级；0 = 只在过期时降级</span>
-        </div>
-        <div class="field">
-          <label for="s-slow">响应偏慢阈值（毫秒）</label>
-          <input id="s-slow" type="number" min="0" max="60000" step="100" placeholder="2000">
-          <span class="hint">响应超过 N 毫秒判降级；0 = 关闭</span>
+          <span class="hint">额度按点数计费</span>
         </div>
       </div>
 
-      <h3 class="set-group">高级</h3>
-      <div class="grid-3">
-        <div class="field">
-          <label for="s-ipver">Globalping IP 版本</label>
-          <select id="s-ipver">
-            <option value="4">IPv4</option>
-            <option value="6">IPv6</option>
-          </select>
-          <span class="hint">探测发起时使用的 IP 协议版本</span>
-        </div>
-        <div class="field">
-          <label for="s-budget">单次子请求预算</label>
-          <!-- max=35 与服务端钳制一致（见 normalizeSetting("subreq_budget")）：
-               50 是免费层硬上限，D1 往返另计约 15–20 次，设到 45 等于"合法但一定跑不通"。 -->
-          <input id="s-budget" type="number" min="1" max="35" placeholder="30">
-          <span class="hint">每站点 2 次（发起 + 收取）；免费层硬上限 50</span>
-        </div>
-        <div class="field">
-          <label for="s-keep">明细保留天数</label>
-          <input id="s-keep" type="number" min="1" max="365" placeholder="30">
-          <span class="hint">过期记录由 cron 每天自动清理一次</span>
-        </div>
-      </div>
-
+      <h3 class="set-group">降级判定</h3>
       <div class="grid-2">
         <div class="field">
-          <label for="s-recent">最近检查条数</label>
-          <input id="s-recent" type="number" min="5" max="200" placeholder="20">
-          <span class="hint">详情页「最近检查」最多列几条</span>
+          <label for="s-warn">证书剩余天数</label>
+          <input id="s-warn" type="number" min="0" max="90" placeholder="14">
+          <span class="hint">≤ N 天判降级；0 = 只在过期时</span>
         </div>
         <div class="field">
-          <label for="s-incident">故障记录条数</label>
-          <input id="s-incident" type="number" min="1" max="100" placeholder="10">
-          <span class="hint">详情页「故障记录」最多列几条</span>
+          <label for="s-slow">响应偏慢阈值（ms）</label>
+          <input id="s-slow" type="number" min="0" max="60000" step="100" placeholder="2000">
+          <span class="hint">超过判降级；0 = 关闭</span>
         </div>
       </div>
     </div>
@@ -373,11 +298,11 @@
   </form>
 </dialog>
 
-<!-- ══════════ 登录 ══════════ -->
+<!-- 登录 / 未配置密码 -->
 <div class="login-mask" id="login-mask" hidden>
   <form class="card glass login-card" id="login-form">
     <h2>管理员登录</h2>
-    <p class="muted">请输入管理员密码。登录状态保持 30 天。</p>
+    <p class="muted">登录状态保持 30 天。</p>
     <div class="field">
       <input type="password" id="login-pwd" placeholder="管理员密码"
              autocomplete="current-password" aria-label="管理员密码">
@@ -387,32 +312,20 @@
   </form>
 </div>
 
-<!-- ══════════ 未设置管理员密码 → 后台停用 ══════════
-     服务端在 ADMIN_PASSWORD 未配置时**整体停用后台**（fail-closed）：
-     所有后台接口一律 403，所以这个页面拿不到任何数据，它是唯一的界面。
-     这里刻意**不给密码输入框** —— 密码根本没配置，输什么都进不去。 -->
 <div class="login-mask" id="setup-mask" hidden>
   <div class="card glass login-card setup-card">
     <h2>后台已停用</h2>
-    <p class="muted">
-      未设置管理员密码，后台不提供任何服务 —— 否则任何人打开这个网址就能改配置、
-      读到 Globalping Token。
-    </p>
+    <p class="muted">未设置管理员密码，后台不提供任何服务。</p>
     <ol class="setup-steps muted">
-      <li>打开 Cloudflare 控制台 → Workers &amp; Pages → 本 Worker → Settings → Variables and Secrets</li>
-      <li>新增一条变量：名称 <code>ADMIN_PASSWORD</code>，类型选 <b>Secret</b>，值填你的管理员密码</li>
-      <li>保存后回来刷新本页即可登录（变量秒级生效，不用等重新部署）</li>
+      <li>Cloudflare 控制台 → Workers &amp; Pages → 本 Worker → Settings → Variables and Secrets</li>
+      <li>新增变量 <code>ADMIN_PASSWORD</code>，类型选 <b>Secret</b></li>
+      <li>保存后刷新本页</li>
     </ol>
     <button class="btn btn-primary" type="button" id="setup-reload">我已设置，重新检查</button>
     <a class="btn" href="/">返回前台</a>
   </div>
 </div>
 
-<!-- ══════════ 顶部滑出提示 ══════════
-     fixed 定位、不参与文档流 —— 出现与消失都不会推挤下面的卡片。
-     层级高于 topbar(20)、低于登录遮罩(100)，所以不会盖住登录框。
-     提示全部由 admin.js 的 banner() 动态插入到这里：一句话短文案、
-     几秒后自动消失，没有常驻条目，也不需要点关闭。 -->
 <div class="toast-host" id="toast-host" aria-live="polite"></div>
 
 <script src="/admin.js" defer></script>

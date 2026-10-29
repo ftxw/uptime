@@ -51,9 +51,18 @@ import { formatOrigin } from "./origin.js";
 
 const JSON_HEADERS = { "content-type": "application/json; charset=utf-8" };
 
-/** 只读接口的边缘缓存 TTL（秒）。改配置会换缓存 key，所以不需要更短。 */
-const READ_TTL_SEC = 300;
-const READ_CACHE = `public, s-maxage=${READ_TTL_SEC}, stale-while-revalidate=600`;
+/**
+ * 只读接口的边缘缓存 TTL（秒）。
+ *
+ * 60 而不是 300：cron 每分钟一轮，缓存超过 1 分钟就一定会「比数据慢一轮」，
+ * 前台刷新页面看到的还是上一轮的结论 —— 这正是"刷新不更新"的由来。
+ * 60 秒下最多落后一轮，且单个机房每天回源 1440 次，D1 读量仍然可控。
+ *
+ * 必须带 max-age=0：只写 s-maxage 时浏览器会用启发式缓存，
+ * 用户按 F5 也可能直接吃本地副本，连边缘缓存都到不了。
+ */
+const READ_TTL_SEC = 60;
+const READ_CACHE = `public, max-age=0, s-maxage=${READ_TTL_SEC}, stale-while-revalidate=120`;
 
 /** 会改配置的写接口才递增 config_version；test / run 只产生探测记录，不算。 */
 const WRITE_APIS = new Set(["settings", "sites", "categories"]);
@@ -230,6 +239,19 @@ function requirePost(request, pretty) {
 async function withEdgeCache(request, ctx, ttl, producer, keyUrl) {
   const key = new Request(keyUrl || request.url, { method: "GET" });
   const cache = caches.default;
+
+  // 手动刷新必须绕过缓存：缓存 key 由参数归一化得出，客户端加时间戳换不掉它，
+  // 只能在这里显式短路，否则用户点「刷新」拿到的还是同一份副本。
+  const cc = String(request.headers.get("cache-control") || "").toLowerCase();
+  const pragma = String(request.headers.get("pragma") || "").toLowerCase();
+  const bypass = cc.includes("no-store") || cc.includes("no-cache") || pragma === "no-cache";
+  if (bypass) {
+    const fresh = await producer();
+    return new Response(await fresh.text(), {
+      status: fresh.status,
+      headers: { ...JSON_HEADERS, "Cache-Control": "no-store", "x-edge-cache": "BYPASS" },
+    });
+  }
   try {
     const hit = await cache.match(key);
     if (hit) {
@@ -238,7 +260,7 @@ async function withEdgeCache(request, ctx, ttl, producer, keyUrl) {
         status: 200,
         headers: {
           ...JSON_HEADERS,
-          "Cache-Control": `public, s-maxage=${ttl}`,
+          "Cache-Control": `public, max-age=0, s-maxage=${ttl}`,
           "x-edge-cache": "HIT",
         },
       });
@@ -252,7 +274,7 @@ async function withEdgeCache(request, ctx, ttl, producer, keyUrl) {
   /** 只缓存 200，并原样返回原始状态码，否则 404 会被缓存成 200。 */
   const cacheable = status === 200 && !res.headers.get("set-cookie");
   const headers = cacheable
-    ? { ...JSON_HEADERS, "Cache-Control": `public, s-maxage=${ttl}` }
+    ? { ...JSON_HEADERS, "Cache-Control": `public, max-age=0, s-maxage=${ttl}` }
     : {
         ...JSON_HEADERS,
         "Cache-Control": res.headers.get("cache-control") || "no-store",
@@ -1049,6 +1071,8 @@ async function dispatch(env, sites, opts = {}) {
   const roundAt = Number(opts.roundAt) || Date.now();
   // 本轮成功发起的 [site, 完成时刻, 下次到期]：攒起来一次 batch 写完。
   const started = [];
+  // 本轮被跳过（退避 / 预算）的站点及其新排期：只更新 next_due_ts，不动结果字段。
+  const deferred = [];
   let quota = null;
   let lastError = null;
   let okCount = 0;
@@ -1068,10 +1092,14 @@ async function dispatch(env, sites, opts = {}) {
       // 否则额度耗尽时整页会一直显示"正常"，而实际上已经没人在测了。
       skipped.push(s.id);
       noteVoid(s.id);
+      // 把排期推到退避结束之后：否则每轮都"已到期 → 被跳过"，界面上就是监测不动。
+      deferred.push([s.id, new Date(blockedUntil).toISOString()]);
       continue;
     }
     if (used + 1 > budget) {
       skipped.push(s.id);
+      // 预算不足同理：推到下一轮（+1 个 cron 周期），不然会一直卡在"到期未执行"。
+      deferred.push([s.id, new Date(roundAt + 60_000).toISOString()]);
       continue;
     }
     used += 1;
@@ -1128,6 +1156,23 @@ async function dispatch(env, sites, opts = {}) {
   else if (raw.gp_blocked_until) entries.push(["gp_blocked_until", ""]);
   // 一次 batch：几行 meta 不该变成几次往返
   if (entries.length) await saveSettings(env, entries).catch(() => {});
+
+  // 先落被跳过站点的排期，再落正常发起的（两者互不重叠，合成一次 batch 也行，
+  // 但分成两次能让失败范围更小）。
+  if (deferred.length) {
+    await d
+      .batch(
+        deferred.map(([site, due]) =>
+          d
+            .prepare(
+              "INSERT INTO state (site, next_due_ts) VALUES (?, ?) " +
+                "ON CONFLICT(site) DO UPDATE SET next_due_ts = excluded.next_due_ts"
+            )
+            .bind(site, due)
+        )
+      )
+      .catch(() => {});
+  }
 
   // 一次 batch 写「上次发起 + 下次到期」。发起失败的不在这里（保持原排期，下一轮重试）。
   if (started.length) {

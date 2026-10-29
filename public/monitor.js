@@ -497,7 +497,11 @@ function render(d) {
     `探测位置 ${d.site.gp_magic || "默认筛选"} · SSL 随探测顺带采集`;
 }
 
-async function load() {
+/**
+ * 拉详情并渲染。
+ * @param manual 用户主动刷新：绕过缓存，不先用 localStorage 顶替
+ */
+async function load(manual = false) {
   if (!SITE_ID) {
     qs("#title").textContent = "缺少站点参数";
     qs("#subtitle").textContent = "请从总览页点击站点名称进入详情。";
@@ -506,15 +510,21 @@ async function load() {
   }
 
   let cached = null;
-  try {
-    cached = JSON.parse(localStorage.getItem(cacheKey()) || "null");
-  } catch (e) {}
-  if (cached) render(cached); // 先渲染缓存，首屏不等网络
+  if (!manual) {
+    try {
+      cached = JSON.parse(localStorage.getItem(cacheKey()) || "null");
+    } catch (e) {}
+    if (cached) render(cached); // 先渲染缓存，首屏不等网络
+  }
 
   qs("#refresh").disabled = true;
   try {
     const r = await fetch(`/api/site?id=${encodeURIComponent(SITE_ID)}`, {
-      headers: { accept: "application/json" },
+      headers: {
+        accept: "application/json",
+        ...(manual ? { "cache-control": "no-cache" } : {}),
+      },
+      cache: manual ? "reload" : "default",
     });
     const data = await r.json();
     if (data && data.ok) {
@@ -537,7 +547,7 @@ async function load() {
   }
 }
 
-qs("#refresh").addEventListener("click", load);
+qs("#refresh").addEventListener("click", () => load(true));
 
 qs("#theme").addEventListener("click", () => {
   const dark = document.documentElement.classList.toggle("dark");
@@ -580,10 +590,10 @@ addEventListener("resize", () => {
 });
 
 document.addEventListener("visibilitychange", () => {
-  if (!document.hidden) load();
+  if (!document.hidden) load(true);
 });
 
 load();
 setInterval(() => {
-  if (!document.hidden) load();
+  if (!document.hidden) load(true);
 }, 60000);

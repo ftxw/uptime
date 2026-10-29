@@ -249,31 +249,52 @@ function render(data) {
 
 /* ── 数据 ──────────────────────────────────────────────── */
 
-async function load() {
+/**
+ * 拉数据并渲染。
+ * @param manual 用户主动刷新（点按钮 / F5）：绕过一切缓存，且不先用 localStorage 顶替
+ *
+ * 手动刷新必须带 no-cache：边缘缓存 TTL 内直接返回旧副本，
+ * 用户点"刷新"却什么都没变，会以为页面坏了。
+ */
+async function load(manual = false) {
   let cached = null;
-  try {
-    cached = JSON.parse(localStorage.getItem(CACHE_KEY) || "null");
-  } catch (e) {}
-  if (cached) render(cached); // 先渲染缓存 → 首屏不等网络
+  if (!manual) {
+    try {
+      cached = JSON.parse(localStorage.getItem(CACHE_KEY) || "null");
+    } catch (e) {}
+    // 首屏先用上次数据，避免白屏
+    if (cached) render(cached);
+  }
 
   qs("#refresh").disabled = true;
+  qs("#refresh").classList.add("spin");
   try {
-    const r = await fetch(API, { headers: { accept: "application/json" } });
+    const r = await fetch(API, {
+      // 手动刷新带 no-cache：服务端据此跳过边缘缓存并返回 no-store
+      headers: {
+        accept: "application/json",
+        ...(manual ? { "cache-control": "no-cache" } : {}),
+      },
+      cache: manual ? "reload" : "default",
+    });
     const data = await r.json();
     if (data && data.ok !== false) {
       render(data);
       try { localStorage.setItem(CACHE_KEY, JSON.stringify(data)); } catch (e) {}
+    } else if (manual) {
+      qs("#subtitle").textContent = (data && data.error) || "加载失败";
     }
   } catch (e) {
     if (!cached) qs("#subtitle").textContent = "加载失败，稍后重试";
   } finally {
     qs("#refresh").disabled = false;
+    qs("#refresh").classList.remove("spin");
   }
 }
 
 /* ── 交互 ──────────────────────────────────────────────── */
 
-qs("#refresh").addEventListener("click", load);
+qs("#refresh").addEventListener("click", () => load(true));
 
 /* 分类筛选：纯前端过滤，不发请求 —— 数据本来就一次全拿到了 */
 qs("#chips").addEventListener("click", (e) => {
@@ -331,7 +352,9 @@ document.addEventListener("focusin", (e) => {
   tip.style.top = Math.max(r.top - tip.offsetHeight - 10, 8) + "px";
 });
 
-document.addEventListener("visibilitychange", () => { if (!document.hidden) load(); });
+// 切回标签页：用户期望看到最新状态，直接绕过缓存
+document.addEventListener("visibilitychange", () => { if (!document.hidden) load(true); });
 
 load();
-setInterval(() => { if (!document.hidden) load(); }, 60000);
+// 轮询也要绕过缓存，否则每分钟拿到的还是同一份边缘副本
+setInterval(() => { if (!document.hidden) load(true); }, 60000);
