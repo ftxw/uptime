@@ -516,7 +516,15 @@ dialog {
 }
 /* display 只能给「打开时」：直接写 display:flex 会盖掉 UA 的
    `dialog:not([open]) { display: none }`，关闭的弹窗会以块级元素常驻页面。 */
-dialog[open] { display: flex; }
+dialog[open] {
+  display: flex;
+  /* overflow 放在 dialog 上：滚动交给 .dialog-body，头和底的按钮永远可见。
+     不写的话 dialog 自己会成为滚动容器（UA 默认 overflow:auto），
+     整个弹窗内容在它内部上下滑，头尾跟着跑。 */
+  overflow: hidden;
+}
+/* 高度约束：dialog 只负责"不许超出视口"，滚动交给 .dialog-body。 */
+dialog[open] { height: auto; max-height: 86vh; }
 @supports (height: 100dvh) {
   dialog { max-height: 86dvh; }
 }
@@ -529,13 +537,19 @@ dialog::backdrop { background: hsl(220 30% 10% / 0.45); }
   padding: 14px 18px; border-bottom: 1px solid hsl(var(--border) / 0.7);
   font-weight: 600; font-size: 14px;
 }
-/* min-height:0 必须给：flex 子项默认 min-height:auto 不会收缩，overflow 就不生效，
-   长表单会把 dialog 撑破而不是在内部滚动。 */
-/* min-height:0 必须给：flex 子项默认 min-height:auto 不会收缩，overflow 就不生效，
-   长表单会把 dialog 撑破而不是在内部滚动。 */
+/* 弹窗滚动分区：头(63px) / 底(65px) 固定，只有中间滚。
+   dialog 的 max-height 不会压缩它的 flex 内容盒 —— 实测 dialog 是 619px，
+   但 .dialog-body 仍被算成 932px（等于内容高度），scrollTop 永远是 0。
+   所以这里必须直接给 body 一个可计算的上限，而不是指望它从父级"分到"剩余空间。
+   86vh 减去头尾（约 8.5rem）即中间可视高度。 */
 .dialog-body {
+  flex: 1 1 auto;
   padding: 18px; display: flex; flex-direction: column; gap: 14px;
-  min-height: 0; overflow-y: auto; overscroll-behavior: contain;
+  min-height: 0; max-height: calc(86vh - 8.5rem);
+  overflow-y: auto; overscroll-behavior: contain;
+}
+@supports (height: 100dvh) {
+  .dialog-body { max-height: calc(86dvh - 8.5rem); }
 }
 .dialog-foot {
   flex: 0 0 auto;
