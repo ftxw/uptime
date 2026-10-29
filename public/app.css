@@ -512,13 +512,15 @@ dialog {
      不设上限的话，底部「保存」按钮会被键盘盖住。dvh 随地址栏/键盘变化。 */
   max-height: 86vh;
   box-shadow: 0 24px 60px -20px hsl(220 40% 15% / 0.35);
-  display: flex; flex-direction: column;
+  flex-direction: column;
 }
+/* display 只能给「打开时」：直接写 display:flex 会盖掉 UA 的
+   `dialog:not([open]) { display: none }`，关闭的弹窗会以块级元素常驻页面。 */
+dialog[open] { display: flex; }
 @supports (height: 100dvh) {
   dialog { max-height: 86dvh; }
 }
 /* 弹窗内容自己滚，头/底常驻 —— 表单在手机上经常比屏幕高 */
-.dialog-body { overflow-y: auto; overscroll-behavior: contain; }
 /* 弹窗打开时锁住背景滚动，避免 iOS 上的"背景跟着滑" */
 body:has(dialog[open]) { overflow: hidden; }
 dialog::backdrop { background: hsl(220 30% 10% / 0.45); }
@@ -529,7 +531,12 @@ dialog::backdrop { background: hsl(220 30% 10% / 0.45); }
 }
 /* min-height:0 必须给：flex 子项默认 min-height:auto 不会收缩，overflow 就不生效，
    长表单会把 dialog 撑破而不是在内部滚动。 */
-.dialog-body { padding: 18px; display: flex; flex-direction: column; gap: 14px; min-height: 0; }
+/* min-height:0 必须给：flex 子项默认 min-height:auto 不会收缩，overflow 就不生效，
+   长表单会把 dialog 撑破而不是在内部滚动。 */
+.dialog-body {
+  padding: 18px; display: flex; flex-direction: column; gap: 14px;
+  min-height: 0; overflow-y: auto; overscroll-behavior: contain;
+}
 .dialog-foot {
   flex: 0 0 auto;
   display: flex; justify-content: flex-end; gap: 8px;

@@ -1017,11 +1017,11 @@ async function dueSites(env, sites, schedule) {
 }
 
 /**
- * 下一次到期时刻 = 本轮 cron 触发时刻 + 间隔，对齐到整分钟。
+ * 下一次到期时刻 = 本轮 cron 轮次 + 间隔。
  *
- * 不能以「gpCreate 完成时刻」为基准：那样排期点会落在第 303 秒之类的位置，
- * 而 cron 只在整分钟醒，下一轮 300s 够不到、要到 360s，于是 5 分钟变成 6 分钟。
- * 以整分钟为基准后，到期点正好落在某次 cron 的出发时刻上。
+ * 不能用「gpCreate 完成时刻」当基准：那样排期点会落在第 303 秒这类位置，
+ * 下一轮 cron 在第 300 秒够不到、要到 360 秒，5 分钟直接变 6 分钟。
+ * 以整分对齐后，排期点落在某轮 cron 的启动区间内，可容忍几十秒的触发抖动。
  */
 function nextDueOf(fireAt, intervalMin) {
   const iv = Math.max(1, Number(intervalMin || 5)) * 60_000;
@@ -1073,6 +1073,8 @@ async function dispatch(env, sites, opts = {}) {
   const started = [];
   // 本轮被跳过（退避 / 预算）的站点及其新排期：只更新 next_due_ts，不动结果字段。
   const deferred = [];
+  // 排期写失败时会记在这里，随返回值透出到 cron 日志（原先被 .catch 静默吞掉）
+  let scheduleError = null;
   let quota = null;
   let lastError = null;
   let okCount = 0;
@@ -1188,7 +1190,11 @@ async function dispatch(env, sites, opts = {}) {
             .bind(site, ts, due)
         )
       )
-      .catch(() => {});
+      .catch((e) => {
+        // 排期写失败必须可见：写不进去的站点会一直走"补算"路径，
+        // 表现为间隔忽长忽短，而日志里什么也看不到。
+        scheduleError = String((e && e.message) || e);
+      });
   }
 
   if (voidSites.length) await bumpState(env, {}, voidSites);
@@ -1201,6 +1207,8 @@ async function dispatch(env, sites, opts = {}) {
     voided: voidSites.length,
     blocked_until: blockedUntil > Date.now() ? blockedUntil : null,
     quota,
+    // 非 null 表示排期没写进去：该站点下一轮会走"补算"路径，间隔可能不准
+    scheduleError,
   };
 }
 
@@ -2606,6 +2614,8 @@ export default {
         ssl: collected.sslWritten || 0,
         cleaned, // 0 = 不在清理时点或无过期数据；-1 = 清理失败
         orphans, // 本次清掉的孤儿行数（站点已删除的 state/ssl/pending）
+        // 非 null 表示本轮没写成排期（next_due_ts），这些站点下一轮会走补算路径
+        scheduleError: disp.scheduleError || null,
         // 分段错误：正常恒为 []。非空说明本轮有阶段失败，但其余阶段仍照常跑完了。
         errors,
       })
