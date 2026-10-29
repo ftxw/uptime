@@ -811,7 +811,7 @@ dialog::backdrop { background: hsl(220 30% 10% / 0.45); }
   /* 右列（站点表）拿剩余空间，左列给一个够放 4 个汉字+计数的宽度 */
   .adm-grid { grid-template-columns: 13rem minmax(0, 1fr); }
 }
-.adm-col { display: flex; flex-direction: column; overflow: hidden; }
+.adm-col { display: flex; flex-direction: column; min-height: 0; }
 
 /* ── 左侧分类目录 ─────────────────────────────────────── */
 
@@ -819,6 +819,9 @@ dialog::backdrop { background: hsl(220 30% 10% / 0.45); }
   display: flex; flex-direction: column; gap: 2px;
   /* 与右侧 .tbl-wrap 的首行留白对齐（4px + 行内 10px ≈ 14px） */
   padding: 4px 8px 8px;
+  /* 分类多时同样内部滚动，别被卡片裁掉 */
+  overflow-y: auto;
+  max-height: calc(100vh - 22rem);
 }
 
 .cat-item {
@@ -868,7 +871,19 @@ dialog::backdrop { background: hsl(220 30% 10% / 0.45); }
 
 /* ── 右侧表格容器 ─────────────────────────────────────── */
 
-.tbl-wrap { overflow-x: auto; padding: 4px 8px 8px; }
+/* 站点多时表格本身要能滚：只写 overflow-x 会让超出部分被卡片裁掉，
+   滚轮落在表格上等于没反应。限一个视口内的最大高度，超出部分内部滚动，
+   表头用 sticky 固定 —— 否则滚到中间就看不到列名了。 */
+.tbl-wrap {
+  overflow: auto;
+  max-height: calc(100vh - 22rem);
+  padding: 4px 8px 8px;
+}
+.tbl-wrap .table thead th {
+  position: sticky; top: 0; z-index: 1;
+  background: hsl(var(--card));
+  box-shadow: inset 0 -1px 0 hsl(var(--border));
+}
 /* URL 过长时截断，避免把操作列挤出视野 */
 .tbl-wrap td .mono {
   display: inline-block; max-width: 260px;
@@ -931,4 +946,10 @@ dialog::backdrop { background: hsl(220 30% 10% / 0.45); }
 
 @media (prefers-reduced-motion: reduce) {
   * { animation-duration: .001ms !important; transition-duration: .001ms !important; }
+}
+
+/* 窄屏两栏堆叠：再按 100vh 限高每块只剩半屏，此时交给页面整体滚动。
+   这条必须写在 .tbl-wrap / .cat-list 之后才生效（否则被基础规则覆盖）。 */
+@media (max-width: 760px) {
+  .tbl-wrap, .cat-list { max-height: none; overflow: visible; }
 }
