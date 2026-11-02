@@ -799,7 +799,13 @@ document.addEventListener("click", async (e) => {
     try {
       // 位置由后端从全局设置取，前端不传；带 site=<id> 让结果落库。
       const d = await post("/test", { site: site.id });
+      // 展示用的状态码/延迟必须取「判定所用的代表值」（verdict），
+      // 不能用 results[0] —— 那是探针返回顺序的第一条，多探针分歧时
+      // 可能是失败的那条，于是出现"HTTP 500 · 已记录 · 绿色"这种自相矛盾的提示。
+      const v = d.verdict || {};
       const res = (d.results || [])[0] || {};
+      const showStatus = v.status != null ? v.status : res.status;
+      const showTtfb = v.ttfb != null ? v.ttfb : res.ttfb;
       // 来源标签由服务端算好（origin），与前台首页 / 详情页同一口径 ——
       // 以前这里自己拼「机房 SJC」，与前台写法不一致。
       const where = d.origin || "";
@@ -817,7 +823,7 @@ document.addEventListener("click", async (e) => {
       const judged = d.verdict ? d.verdict.ok : d.persisted ? d.persisted.ok : res.ok;
       // elapsed_ms 是这次测试实际等了多久。
       banner(
-        `${site.name} · HTTP ${res.status ?? "—"} · ${res.ttfb ?? "—"}ms · ${where} · ${
+        `${site.name} · HTTP ${showStatus ?? "—"} · ${showTtfb ?? "—"}ms · ${where} · ${
           d.elapsed_ms ?? "—"
         }ms${mark}`,
         judged ? "info" : "error"

@@ -53,8 +53,11 @@ function renderStats(s) {
     { label: "离线", value: s.down, icon: "down", cls: "i-destructive" },
     {
       // 口径是「最近 24 小时（滚动）」—— 与详情页趋势图同一个窗口、同一批行。
+      // 后端在「24h 内一次都没测成功」时刻意返回 null（见 /api/overview 的注释），
+      // 这里必须原样显示「--」：给个 100 会让新实例第一屏就是"可用率 100.0%"，
+      // 与详情页的"暂无数据"自相矛盾。
       label: "24 小时可用率",
-      value: (s.uptime_24h ?? 100).toFixed(1) + "%",
+      value: s.uptime_24h == null ? "--" : Number(s.uptime_24h).toFixed(1) + "%",
       icon: "shield",
       cls: "i-primary",
     },
@@ -256,7 +259,14 @@ function render(data) {
  * 手动刷新必须带 no-cache：边缘缓存 TTL 内直接返回旧副本，
  * 用户点"刷新"却什么都没变，会以为页面坏了。
  */
+/**
+ * 上次拉数据的时刻。切回标签页时的即时刷新按它节流 ——
+ * 否则来回切标签页会把边缘缓存整个打穿（每次都是 no-store 直击源站）。
+ */
+let lastFetchAt = 0;
+
 async function load(manual = false) {
+  lastFetchAt = Date.now();
   let cached = null;
   if (!manual) {
     try {
@@ -352,9 +362,16 @@ document.addEventListener("focusin", (e) => {
   tip.style.top = Math.max(r.top - tip.offsetHeight - 10, 8) + "px";
 });
 
-// 切回标签页：用户期望看到最新状态，直接绕过缓存
-document.addEventListener("visibilitychange", () => { if (!document.hidden) load(true); });
+// 切回标签页：用户期望看到最新状态，绕过一次缓存 —— 但 60 秒内刚拉过就跳过
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) return;
+  if (Date.now() - lastFetchAt < 60000) return;
+  load(true);
+});
 
 load();
-// 轮询也要绕过缓存，否则每分钟拿到的还是同一份边缘副本
-setInterval(() => { if (!document.hidden) load(true); }, 60000);
+// 轮询不再绕过缓存：TTL 内直接吃边缘副本（最多落后 5 分钟），
+// 想立刻看最新数据点「刷新」—— 那一按钮走的是 no-cache + 跳过边缘缓存。
+// 原先每分钟 load(true)，等于每个开着的标签页每天打 1440 次源站，
+// 5 个站点就足以吃满 D1 免费层的日读额度。
+setInterval(() => { if (!document.hidden) load(false); }, 60000);

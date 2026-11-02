@@ -501,7 +501,13 @@ function render(d) {
  * 拉详情并渲染。
  * @param manual 用户主动刷新：绕过缓存，不先用 localStorage 顶替
  */
+/**
+ * 上次拉数据的时刻：切回标签页的即时刷新按它节流，避免来回切把边缘缓存打穿。
+ */
+let lastFetchAt = 0;
+
 async function load(manual = false) {
+  lastFetchAt = Date.now();
   if (!SITE_ID) {
     qs("#title").textContent = "缺少站点参数";
     qs("#subtitle").textContent = "请从总览页点击站点名称进入详情。";
@@ -590,10 +596,14 @@ addEventListener("resize", () => {
 });
 
 document.addEventListener("visibilitychange", () => {
-  if (!document.hidden) load(true);
+  if (document.hidden) return;
+  if (Date.now() - lastFetchAt < 60000) return;
+  load(true);
 });
 
 load();
+// 轮询走缓存（TTL 内最多落后 5 分钟），要立刻看最新点「刷新」。
+// 每分钟 load(true) 会让每个标签页都直击源站，直接把 D1 日读额度烧穿。
 setInterval(() => {
-  if (!document.hidden) load(true);
+  if (!document.hidden) load(false);
 }, 60000);

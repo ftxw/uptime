@@ -73,9 +73,10 @@ export async function cleanupOldChecks(env, keepDays = 30) {
   const d = await db(env);
   const cutoff = new Date(Date.now() - keepDays * 86400_000).toISOString();
   const r = await d.prepare("DELETE FROM checks WHERE ts < ?").bind(cutoff).run();
-  // 按天汇总每站每天只有 1 行，保留期给足 400 天（色条最多 90 天），
-  // 免得改小 check_keep_days 后历史色条也跟着消失。
-  const dayCutoff = new Date(Date.now() - 400 * 86400_000).toISOString().slice(0, 10);
+  // 按天汇总每站每天只有 1 行，保留期给到 100 天：色条/统计上限是 90 天，
+  // 留 10 天余量即可。原先给 400 天，等于让每次总览多扫 4 倍的行
+  // （`WHERE day >= ?` 走 idx_daily_day，区间越大读得越多）。
+  const dayCutoff = new Date(Date.now() - 100 * 86400_000).toISOString().slice(0, 10);
   await d
     .prepare("DELETE FROM checks_daily WHERE day < ?")
     .bind(dayCutoff)
@@ -405,7 +406,6 @@ export async function bumpState(env, perSite, voidSites = [], checkedAt) {
   // 两边若各取一次 now，差几毫秒就够让刚测过的 1 分钟站点被误判为到期。
   const nowIso = checkedAt || new Date().toISOString();
   const offsetMs = dayOffsetMs(env);
-  const today = dayKey(nowIso, offsetMs);
   const batch = [];
 
   for (const site of ids) {
@@ -413,14 +413,19 @@ export async function bumpState(env, perSite, voidSites = [], checkedAt) {
     const p = prev[site];
     const before = Number(p?.consecutive_fail || 0);
     const fail = info.ok ? 0 : before + 1;
+    // 站点自己的检查时刻（本轮「发起」时刻，由收取侧带下来）。一轮里可能有
+    // 多个站点的 pending，各自的发起时刻差几十秒 —— 用统一的 now 会让
+    // last_checked_ts 变成「回收时刻」，而它同时还是补算排期的基准。
+    const ts = typeof info.checkedAt === "string" ? info.checkedAt : nowIso;
+    const day = dayKey(ts, offsetMs);
 
-    batch.push(d.prepare(STATE_UPSERT).bind(site, fail, nowIso, ...lastResultFields(info, nowIso)));
+    batch.push(d.prepare(STATE_UPSERT).bind(site, fail, ts, ...lastResultFields(info, ts)));
 
     // 当天连续段：跨过日界就从头数（宁可少标红），否则沿用全局连续数 ——
     // 这样色条与圆点用的是同一个定义，不会出现「圆点红、色条黄」。
-    const sameDay = p?.last_checked_ts ? dayKey(p.last_checked_ts, offsetMs) === today : false;
+    const sameDay = p?.last_checked_ts ? dayKey(p.last_checked_ts, offsetMs) === day : false;
     const runToday = info.ok ? 0 : sameDay ? fail : 1;
-    batch.push(d.prepare(DAY_UPSERT).bind(site, today, info.ok ? 1 : 0, runToday));
+    batch.push(d.prepare(DAY_UPSERT).bind(site, day, info.ok ? 1 : 0, runToday));
   }
 
   // 无结论的站点：只累加 void_streak，不写 checks_daily（那天没有「检查结果」可统计）。

@@ -20,4 +20,14 @@ export const MIGRATIONS = [
     v: 4,
     stmts: ["ALTER TABLE state ADD COLUMN next_due_ts TEXT"],
   },
+  {
+    // 两条读路径的索引（纯新增，IF NOT EXISTS，重复执行安全）：
+    // ① (site, ts DESC, ok)：24h 聚合从「按站点回表扫 576 行」变成 index-only；
+    // ② checks_daily(day)：色条/统计的 WHERE day >= ? 不再全表扫。
+    v: 5,
+    stmts: [
+      "CREATE INDEX IF NOT EXISTS idx_checks_site_ts_ok ON checks(site, ts DESC, ok)",
+      "CREATE INDEX IF NOT EXISTS idx_daily_day ON checks_daily(day)",
+    ],
+  },
 ];

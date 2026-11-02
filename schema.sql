@@ -4,7 +4,7 @@
 -- `src/schema.js` 供代码 import，那份是生成物不要手改。
 --
 -- 改结构时：版本号 +1，并在 src/migrations.js 补一条增量迁移（旧库才需要）。
--- schema-version: 4
+-- schema-version: 5
 
 CREATE TABLE IF NOT EXISTS sites (
   id             TEXT PRIMARY KEY,
@@ -37,6 +37,11 @@ CREATE INDEX IF NOT EXISTS idx_checks_site_ts ON checks(site, ts DESC);
 -- 跨站点的按时间查询（清理过期行、近 24h 聚合）与详情页时间序列。
 -- 带上 site/ok 让 24h 聚合变成覆盖索引扫描，不回表 —— 少读一半。
 CREATE INDEX IF NOT EXISTS idx_checks_ts_site_ok ON checks(ts DESC, site, ok);
+-- 24h 聚合的专用覆盖索引。查询形态是「site = ? AND ts > ?」：
+-- 上面那条以 ts 打头，只能做时间范围扫描；site 虽是第二列，仍要把 24h 内
+-- 所有站点的索引项逐条走过才能过滤 —— N 个站点就等于把同一段行读 N 遍。
+-- 这条让 (site, ts) 直接定范围、ok 从索引里取，完全不用回表。
+CREATE INDEX IF NOT EXISTS idx_checks_site_ts_ok ON checks(site, ts DESC, ok);
 
 -- 按天物化汇总：色条与按天统计的唯一数据源。
 -- 每次检查增量累加（每站每天 1 行），把「30 天色条」的读代价从
@@ -49,6 +54,9 @@ CREATE TABLE IF NOT EXISTS checks_daily (
   max_fail_run INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (site, day)
 );
+-- 色条与按天统计都是「WHERE day >= ?」的区间查询，主键 (site, day) 用不上
+-- 最左前缀，只能全表扫。保留期 100 天 × N 站的行数会被每个总览请求读一遍。
+CREATE INDEX IF NOT EXISTS idx_daily_day ON checks_daily(day);
 
 -- 运行态。last_* 是最后一次结果的反范式缓存，避免每次展示都对 checks 跑窗口函数。
 -- last_checked_ts 记上一次发起（只记自动探测）；last_ts 供展示（含手动测试）。

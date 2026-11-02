@@ -54,14 +54,18 @@ const JSON_HEADERS = { "content-type": "application/json; charset=utf-8" };
 /**
  * 只读接口的边缘缓存 TTL（秒）。
  *
- * 60 而不是 300：cron 每分钟一轮，缓存超过 1 分钟就一定会「比数据慢一轮」，
- * 前台刷新页面看到的还是上一轮的结论 —— 这正是"刷新不更新"的由来。
- * 60 秒下最多落后一轮，且单个机房每天回源 1440 次，D1 读量仍然可控。
+ * 300 而不是 60：一次总览就是 N 站 × 24h 明细的聚合，代价随站点数线性放大，
+ * 而 D1 免费层是每天 500 万行读取、超了直接拒查到 UTC 零点。
+ * TTL 60 时，每个开着的标签页每分钟都会穿透边缘缓存打一次源站
+ * （1440 次/天/机房）；300 秒把它压到 288 次，单页最多落后 5 分钟。
+ *
+ * 想让用户立刻看到最新数据的场景由「刷新」按钮承担：它带 no-cache，
+ * 服务端据此跳过边缘缓存并回 no-store，不受这个 TTL 约束。
  *
  * 必须带 max-age=0：只写 s-maxage 时浏览器会用启发式缓存，
  * 用户按 F5 也可能直接吃本地副本，连边缘缓存都到不了。
  */
-const READ_TTL_SEC = 60;
+const READ_TTL_SEC = 300;
 const READ_CACHE = `public, max-age=0, s-maxage=${READ_TTL_SEC}, stale-while-revalidate=120`;
 
 /** 会改配置的写接口才递增 config_version；test / run 只产生探测记录，不算。 */
@@ -607,8 +611,13 @@ function normalizeSetting(k, v) {
       return ["auto", "light", "dark"].includes(v) ? v : SETTING_META.default_theme.def;
     case "site_title":
       return v.slice(0, 60);
+    case "globalping_token":
+      // 只进 Authorization 头，128 足够；防止误粘贴一整段文本把 meta 撑大
+      return String(v ?? "").slice(0, 128);
     default:
-      return v;
+      // 新增设置项忘了写 case 时不能原样落库：超长/非法值会被每轮 cron 读出来用。
+      // 截断而不是抛错 —— 抛错会让整个设置保存失败，用户完全不知道是哪一项。
+      return String(v ?? "").slice(0, 200);
   }
 }
 
@@ -706,6 +715,9 @@ function validSiteId(id) {
 
 /** 只接受 http/https —— 阻断 javascript: / data: 等 scheme 落到 href 上被执行 */
 function validHttpUrl(u) {
+  // 长度上限：超长 URL 会落库并被每一轮 cron 读出来做探测，2KB 已是浏览器与
+  // 常见反代的实际上限（Nginx 默认 8K 请求行，但没人会用它做监控目标）。
+  if (String(u).length > 2048) return false;
   try {
     const p = new URL(String(u));
     return p.protocol === "http:" || p.protocol === "https:";
@@ -718,6 +730,9 @@ function validHttpUrl(u) {
 function validExpectCodes(v) {
   const s = String(v ?? "").trim();
   if (!s) return true; // 空 = 接受 2xx/3xx，合法
+  // 格式合法不代表长度合理："200,200,200..." 可以写到 MB 级。
+  // 64 字符 ≈ 16 个状态码，远超实际需要。
+  if (s.length > 64) return false;
   return /^\d{3}(,\d{3})*$/.test(s);
 }
 
@@ -839,6 +854,8 @@ async function collectGlobalping(env, sitesIn) {
       blockedUntil: null,
       // 本轮没被收走的 pending（还在跑 / 被限流而跳过）—— 供 dispatch 复用，省一次查询。
       remaining: [],
+      // 发起 → 回收的最大滞后（毫秒）；空轮没有样本，给 0
+      collectLagMs: 0,
     };
 
   const sites = sitesIn || (await loadSites(env));
@@ -861,7 +878,11 @@ async function collectGlobalping(env, sitesIn) {
   let blockedUntil = null;
   // 还在跑 / 因限流本轮没打的 pending：交给 dispatch，省掉它自己再查一次 pending 表。
   const remaining = [];
-  // 本轮更新过的 last_checked_ts（bumpState 里写的就是这个值）
+  // 本轮收取的时刻：所有行的滞后都相对它算，不在循环里逐行取 now（会引入毫秒级噪音）
+  const collectAt = Date.now();
+  // 「发起 → 回收」的最大滞后。正常 ≈ 一轮 cron（60 秒上下）；变成两轮说明
+  // 本轮投递得早、空窗期只有几秒，测量还没跑完，这条结果就晚一分钟落库。
+  let collectLagMs = 0;
 
   for (const p of pending) {
     // ── 兜底：存活过久的 pending 一律丢弃 ──
@@ -945,8 +966,16 @@ async function collectGlobalping(env, sitesIn) {
         ? r0.probe || null
         : `${r0.probe || "?"} (${dec.okCount}/${dec.total})`;
 
+    // 落库时间用「发起时刻」而不是「回收时刻」：回收时刻取决于测量跑多久、
+    // 我们哪一轮来收，会让相邻两条记录的时间差在 4/5/6 分钟之间跳。
+    // 发起时刻才是这次检查真正落在排期网格上的位置。
+    const firedAt = Number.isFinite(born)
+      ? new Date(born).toISOString()
+      : new Date(collectAt).toISOString();
+    if (Number.isFinite(born)) collectLagMs = Math.max(collectLagMs, collectAt - born);
+
     rows.push({
-      ts: new Date().toISOString(),
+      ts: firedAt,
       site: p.site,
       source: p.source,
       probe: probeLabel,
@@ -965,6 +994,9 @@ async function collectGlobalping(env, sitesIn) {
       threshold: Number(site.fail_threshold || 3),
       source: p.source,
       probe: probeLabel,
+      // 逐站点传给 bumpState：一轮里多个 pending 的发起时刻各不相同，
+      // 用统一的 now 会把「排期网格时刻」和「回收时刻」混进同一列
+      checkedAt: firedAt,
     };
     if (r0.tls) sslWrites.push([p.site, r0.tls]);
   }
@@ -984,6 +1016,8 @@ async function collectGlobalping(env, sitesIn) {
     sslWritten: sslWrites.length,
     blockedUntil,
     remaining,
+    // 本轮「发起 → 回收」的最大滞后：≈1 轮属正常，突然 ≥2 轮说明有测量慢到跨轮
+    collectLagMs,
   };
 }
 
@@ -1538,8 +1572,11 @@ export default {
           // 可用率口径：最近 24 小时（滚动），与详情页趋势图同一个窗口。
           const since24 = new Date(Date.now() - 86400000).toISOString();
 
-          // 站点/状态/证书/分类一次 JOIN；24h 可用率按站点走 (site, ts) 子查询，
-          // 单站代价与站点数无关。
+          // 站点/状态/证书/分类一次 JOIN。
+          // 24h 聚合改成「先 GROUP BY 算一遍，再 JOIN 回来」：
+          // 原先每个站点带两个相关子查询（COUNT + SUM），同一段索引要扫两遍，
+          // 其中 SUM(ok) 那遍还得回表 —— 单站 ≈576 行。改成子查询后走
+          // idx_checks_ts_site_ok 做一次覆盖扫描（不回表），总读量减半且只有一次扫描。
           const siteRows = await d
             .prepare(
               `SELECT s.id, s.name, s.url, s.group_name,
@@ -1553,16 +1590,20 @@ export default {
                       ${sslDaysLeftSql("ss.")} AS ssl_days_left,
                       ss.checked_ts AS ssl_checked_ts,
                       ss.error AS ssl_error,
-                      (SELECT COUNT(*) FROM checks INDEXED BY idx_checks_site_ts
-                        WHERE site = s.id AND ts > ?2) AS u_n,
-                      (SELECT SUM(ok) FROM checks INDEXED BY idx_checks_site_ts
-                        WHERE site = s.id AND ts > ?2) AS u_ok
+                      COALESCE(u.n, 0) AS u_n,
+                      COALESCE(u.ok, 0) AS u_ok
                FROM sites s
                LEFT JOIN state st ON st.site = s.id
                LEFT JOIN ssl ss ON ss.site = s.id
                -- 按 categories.sort 排序；按字面排中文会乱
               LEFT JOIN categories cat
                      ON cat.name = COALESCE(NULLIF(TRIM(s.group_name), ''), ?1)
+               LEFT JOIN (
+                 SELECT site, COUNT(*) AS n, SUM(ok) AS ok
+                 FROM checks INDEXED BY idx_checks_ts_site_ok
+                 WHERE ts > ?2
+                 GROUP BY site
+               ) u ON u.site = s.id
                WHERE s.enabled = 1
                ORDER BY COALESCE(cat.sort, 100000), s.group_name, s.sort, s.id`
             )
@@ -1960,31 +2001,45 @@ export default {
           }
 
           // 上面的 n 是「翻转点条数」，不等于真实失败次数 —— 中间的连续失败行不会出现在
-          // changeRows 里。所以再按段区间数一次真实记录，判定与展示都用这个数。
-          const evts = await Promise.all(
-            evtsAll.map(async (e) => {
-              const endIso = e.end || new Date().toISOString();
-              const c = await d
+          // changeRows 里。所以还要按段区间数真实记录，判定与展示都用这个数。
+          //
+          // 但不能再「每段一条 COUNT(*)」：段数最多等于故障记录条数，等于 10 次串行往返，
+          // 而它们扫过的行数总和与下面这一次查询完全相同 —— 纯亏往返。
+          // 一次取回窗口内所有失败行的时间戳，段升序且互不相交，双指针即可计数。
+          const failTs = (
+            (
+              await d
                 .prepare(
-                  `SELECT COUNT(*) AS n FROM checks INDEXED BY idx_checks_site_ts
-                   WHERE site = ?1 AND ts >= ?2 AND ts <= ?3 AND ok = 0`
+                  `SELECT ts FROM checks INDEXED BY idx_checks_site_ts_ok
+                   WHERE site = ?1 AND ts >= ?2 AND ok = 0 ORDER BY ts`
                 )
-                .bind(id, e.start, endIso)
-                .first();
-              const nFail = Math.max(1, Number(c?.n || e.n || 1));
-              const t0 = Date.parse(e.start);
-              const t1 = Date.parse(endIso);
-              return {
-                start: e.start,
-                end: e.end,
-                ongoing: !e.end,
-                duration_s: Math.max(0, Math.round((t1 - t0) / 1000)),
-                error: e.error,
-                checks: nFail, // 真实失败次数
-                reached: nFail >= failThreshold,
-              };
-            })
-          );
+                .bind(id, since)
+                .all()
+            ).results || []
+          ).map((r) => r.ts);
+
+          const endNow = new Date().toISOString();
+          let fi = 0; // failTs 上的游标：段按时间升序，只往前走
+          const evts = evtsAll.map((e) => {
+            const endIso = e.end || endNow;
+            while (fi < failTs.length && failTs[fi] < e.start) fi++;
+            let j = fi;
+            while (j < failTs.length && failTs[j] <= endIso) j++;
+            // [start, end] 内全是失败行，j - fi 就是真实失败次数
+            const nFail = Math.max(1, j - fi || Number(e.n) || 1);
+            fi = j;
+            const t0 = Date.parse(e.start);
+            const t1 = Date.parse(endIso);
+            return {
+              start: e.start,
+              end: e.end,
+              ongoing: !e.end,
+              duration_s: Math.max(0, Math.round((t1 - t0) / 1000)),
+              error: e.error,
+              checks: nFail, // 真实失败次数
+              reached: nFail >= failThreshold,
+            };
+          });
 
           const shown = evts
             // 未达阈值的单次抖动不算故障事件（与色条 red/yellow 的判据同一个）
@@ -2116,6 +2171,11 @@ export default {
           if (action !== "reorder" && !name) {
             return json({ ok: false, error: "分类名不能为空" }, 400, "no-store", pretty);
           }
+          // 与站点 group_name 的 64 字符上限保持一致：分类名会写进 sites.group_name，
+          // 两边不一致就会出现「建得进去、存到站点上被截断」的错位。
+          if (action !== "reorder" && name.length > 64) {
+            return json({ ok: false, error: "分类名最多 64 个字符" }, 400, "no-store", pretty);
+          }
           if (action === "create") {
             const exists = await d
               .prepare("SELECT name FROM categories WHERE name = ?")
@@ -2138,6 +2198,9 @@ export default {
             const nn = String(body.new_name || "").trim();
             if (!nn) {
               return json({ ok: false, error: "新名称不能为空" }, 400, "no-store", pretty);
+            }
+            if (nn.length > 64) {
+              return json({ ok: false, error: "分类名最多 64 个字符" }, 400, "no-store", pretty);
             }
             if (nn === name) return json({ ok: true, action, name }, 200, "no-store", pretty);
             // 目标名已存在 → 直接合并过去，避免留下重复分类
@@ -2166,6 +2229,10 @@ export default {
             const names = Array.isArray(body.names) ? body.names.map(String) : [];
             if (!names.length) {
               return json({ ok: false, error: "names 不能为空" }, 400, "no-store", pretty);
+            }
+            // reorder 也会把分类名 upsert 进 categories，长度必须和 create 一样拦住
+            if (names.some((n) => n.length > 64)) {
+              return json({ ok: false, error: "分类名最多 64 个字符" }, 400, "no-store", pretty);
             }
             await d.batch(
               names.map((n, i) =>
@@ -2300,7 +2367,10 @@ export default {
                 // 阈值 1–20、间隔 1–1440 分钟（≤1 天）：防负数/超大值污染调度
                 clampInt(s.fail_threshold, 1, 20, 3),
                 clampInt(s.interval_min, 1, 1440, 5),
-                s.enabled === false ? 0 : 1,
+                // 缺省视为启用；显式传 0 / false / "0" 都必须落成 0。
+                // 原先写的是 `s.enabled === false ? 0 : 1`，只认布尔 false，
+                // `{"enabled":0}` 会被当成"启用"—— 公开契约上的坑。
+                s.enabled == null ? 1 : boolInt(s.enabled),
                 sortValue
               )
             );
@@ -2466,8 +2536,18 @@ export default {
           ok: true, kind: "globalping", source, quota, elapsed_ms: elapsedMs,
           // 与后台表格 / 前台同一口径的来源标签（见 origin.js）
           origin: formatOrigin(source, probeLabel),
-          // 判定结论与票型 —— 后台据此用"判定成功"而不是"传输成功"上色
-          verdict: { ok: dec.ok, reason: dec.reason ?? null, votes: `${dec.okCount}/${dec.total}` },
+          // 判定结论与票型 —— 后台据此用"判定成功"而不是"传输成功"上色。
+          // 同时下发判定所用的代表值（best）：后台 toast 如果自行取 results[0]，
+          // 拿到的可能是失败的那条探针，就会出现"HTTP 500 · 已记录 · 绿色"。
+          verdict: {
+            ok: dec.ok,
+            reason: dec.reason ?? null,
+            votes: `${dec.okCount}/${dec.total}`,
+            status: best.status ?? 0,
+            ttfb: best.ttfb ?? null,
+            total: best.total ?? null,
+            probe: probeLabel,
+          },
           results, persisted,
         });
       }
@@ -2506,7 +2586,21 @@ export default {
 
   async scheduled(controller, env, ctx) {
     // 本轮基准时刻：在入口处取一次，全轮共用（排期以它为基准，见 nextDueOf）。
-    const roundAt = Date.now();
+    //
+    // 用名义触发时刻（scheduledTime，落在整分边界）而不是实际开跑的 Date.now()：
+    // nextDueOf 会把基准 floor 到整分，延迟不足一分钟时两者算出同一个排期点；
+    // 但只要这一轮被推迟到下一分钟，floor(Date.now()) 就会把排期整体推后
+    // 整整一分钟，且没有任何后续轮次能把它补回来（表现就是"这次多一分钟"）。
+    // 改用名义时刻后，排期点恒为「名义整分 + 间隔」，与本轮晚到多少无关。
+    const wokeAt = Date.now();
+    const nominal = Number(controller && controller.scheduledTime);
+    // 名义时刻必须落在「现在之前的 5 分钟内」：晚于现在说明字段不可信，
+    // 早于 5 分钟说明 cron 已经严重积压 —— 两种情况都退回实际时刻，
+    // 否则排期点会被算到未来（站点停摆）或一直落在过去（每轮补跑）。
+    const roundAt =
+      Number.isFinite(nominal) && nominal > 0 && nominal <= wokeAt && wokeAt - nominal < 300_000
+        ? nominal
+        : wokeAt;
     /** 分段容错：每段单独 try/catch，任何一段失败都不中断整轮。 */
     const errors = [];
     const stage = async (name, fn, fallback) => {
@@ -2525,6 +2619,25 @@ export default {
     const settings = await stage("loadSettings", () => loadSettings(env), {});
     env = await effectiveEnv(env, settings);
 
+    // ── 轮次互斥锁 ──
+    // cron 不保证「上一轮结束才触发下一轮」。两轮重叠时：collect 会读到同一批 pending，
+    // dispatch 会对同站点再 gpCreate 一次，`INSERT OR REPLACE INTO pending` 覆盖掉旧的
+    // measurement_id —— 旧测量永远收不回来，点数白烧。
+    // 用 55 秒租约互斥：正常一轮 10 秒内结束，不影响下一分钟；万一进程被 kill，
+    // 租约到点自动失效，不会死锁（最多少测一轮）。
+    const lockUntil = Number(settings.gp_round_lock_until || 0) || 0;
+    if (lockUntil > Date.now()) {
+      console.log(
+        JSON.stringify({ cron: controller.cron, skipped: "locked", locked_for_ms: lockUntil - Date.now() })
+      );
+      return;
+    }
+    await stage(
+      "roundLock",
+      () => saveSetting(env, "gp_round_lock_until", String(Date.now() + 55_000)),
+      null
+    );
+
     const sites = await stage("loadSites", () => loadSites(env), []);
 
     // 先收取上一轮 Globalping 的结果 —— 必须全量收，不受间隔影响：
@@ -2538,6 +2651,7 @@ export default {
       sslWritten: 0,
       blockedUntil: null,
       remaining: [],
+      collectLagMs: 0,
     });
 
     // 再按各站点的监测间隔，只对「已到期」的发起新一轮。
@@ -2565,7 +2679,6 @@ export default {
     const subreqBudget = Number((env && env.SUBREQ_BUDGET) || 30);
 
     // 这里不再递增 config_version，否则每分钟都让前台缓存全失效。
-    void collected; // 结果只用于日志汇总
 
     // 每天一次的过期明细清理（保留 N 天）。
     // 按「距上次成功清理的时间」判断而不是卡某个钟点 —— 后者只要那一轮 cron
@@ -2587,12 +2700,21 @@ export default {
       }
     }
 
+    // 释放轮次租约：正常结束立刻放开，下一轮不必空等满 55 秒
+    await stage("roundUnlock", () => saveSetting(env, "gp_round_lock_until", "0"), null);
+
     console.log(
       JSON.stringify({
         cron: controller.cron,
+        // 投递延迟：名义触发时刻 → 实际开始跑。持续为负或极大值说明 cron 在漂，
+        // 而排期以 scheduledTime 为基准后，它已经不影响各站点的间隔了。
+        cronDelayMs: wokeAt - roundAt,
         sites: sites.length,
         due: due.length, // 本轮按间隔筛选后实际该查的站点数
         collected: collected.collected,
+        // 「发起 → 回收」的最大滞后。≈1 个 cron 周期（60s）属正常；
+        // 接近或超过 120s 说明那一轮空窗太短、测量没跑完，结果多等了一轮。
+        collectLagMs: collected.collectLagMs || 0,
         // 丢弃且未记检查记录的 pending（ttl / broken / throw）。正常恒为 []；
         // 非空说明 Globalping 那边有异常，且该站点本轮没有产出检查记录。
         gpDropped: collected.dropped,
