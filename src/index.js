@@ -1023,7 +1023,8 @@ async function collectGlobalping(env, sitesIn) {
 
 /**
  * 挑出本轮到期的站点：只看 next_due_ts。
- * @param schedule 可传 { site: next_due_ts }，省掉一次 state 全表读。
+ * 返回 { list, schedule }：schedule 一并交回给 dispatch 做排期累加，省一次 state 全表读。
+ * @param schedule 可传 { site: {due, last} }，省掉一次 state 全表读。
  */
 async function dueSites(env, sites, schedule) {
   let map = schedule;
@@ -1037,33 +1038,51 @@ async function dueSites(env, sites, schedule) {
     );
   }
   const now = Date.now();
-  return sites.filter((s) => {
+  const list = sites.filter((s) => {
     const row = map[s.id];
     if (!row) return true; // 从未检查过
     if (row.due) return now >= Date.parse(row.due);
     // 没排过期：升级自 v3（或别的路径写进来），用上次发起时间补算一次，
     // 避免升级瞬间把所有站点一起重发。
     if (!row.last) return true;
-    const next = nextDueOf(row.last, s.interval_min);
+    const next = nextDueOf(row.last, s.interval_min, now);
     // 时间不可解析时按"该检查了"处理，不能因为脏数据让站点永久停摆
     return !next || now >= Date.parse(next);
   });
+  return { list, schedule: map };
+}
+
+/** 把时刻对齐到最近的整分（±30 秒内归到同一格）。 */
+function snapMinute(ms) {
+  return Math.round(ms / 60_000) * 60_000;
 }
 
 /**
- * 下一次到期时刻 = 本轮 cron 轮次 + 间隔。
+ * 下一次到期时刻 = 上一次排期点 + 间隔（纯网格累加）。
  *
- * 不能用「gpCreate 完成时刻」当基准：那样排期点会落在第 303 秒这类位置，
- * 下一轮 cron 在第 300 秒够不到、要到 360 秒，5 分钟直接变 6 分钟。
- * 以整分对齐后，排期点落在某轮 cron 的启动区间内，可容忍几十秒的触发抖动。
+ * 基准绝不能用「本轮什么时候被唤醒」：
+ *
+ * - 用 scheduledTime（名义整分）：线上实测它会比实际开跑早约一分钟，
+ *   于是「名义整分 + 5 分钟」到下一轮就已经到期 —— 5 分钟的站点稳定变成 4 分钟，
+ *   而且因为每轮都偏，偏得**稳定**，看起来不像抖动，像设置错了。
+ * - 用 Date.now()：只要那一轮晚到跨过分钟边界，排期点就整体前移一分钟，
+ *   表现为「这次 4 分钟、下次 6 分钟」。
+ *
+ * 累加网格把这些都消掉：排期点是等差序列（09:21 / 09:26 / 09:31…），
+ * 唤醒时刻只决定「什么时候执行这个网格点」，不改变网格本身。
+ *
+ * @param prev   上一次的排期点（没有则用上次检查时刻），毫秒数或 ISO 串
+ * @param nowMs  当前时刻，仅在锚点过期太狠时用于重新起算
  */
-function nextDueOf(fireAt, intervalMin) {
+function nextDueOf(prev, intervalMin, nowMs) {
   const iv = Math.max(1, Number(intervalMin || 5)) * 60_000;
-  // fireAt 可能是毫秒数，也可能是 ISO 字符串（补算路径传的是 last_checked_ts）
-  const ms = typeof fireAt === "number" ? fireAt : Date.parse(fireAt);
-  if (!Number.isFinite(ms)) return null;
-  const base = Math.floor(ms / 60_000) * 60_000;
-  return new Date(base + iv).toISOString();
+  const now = Number.isFinite(nowMs) ? nowMs : Date.now();
+  const ms = typeof prev === "number" ? prev : Date.parse(prev);
+  let next = (Number.isFinite(ms) ? snapMinute(ms) : snapMinute(now)) + iv;
+  // 锚点落后超过一个周期（长期停摆、刚把间隔调小）：从当下重新起算。
+  // 否则会连续多轮都判「已到期」，按分钟密度补测一串，反而更乱。
+  if (next <= now - iv) next = snapMinute(now) + iv;
+  return new Date(next).toISOString();
 }
 
 /**
@@ -1100,9 +1119,11 @@ async function dispatch(env, sites, opts = {}) {
   const blocked = blockedUntil > Date.now();
 
   const gpStarted = [];
-  // 本轮的调度基准（cron 唤醒时刻，同一轮内共用）。排下一次必须用它，
-  // 不能用各站点的完成时刻，否则排期点会逐轮往后挪出整整一分钟。
+  // 本轮的调度基准。**只用于「本轮被跳过时相对推后」，不参与排期累加** ——
+  // 排期以各站点自己的上一次排期点为锚（见 nextDueOf 的说明）。
   const roundAt = Number(opts.roundAt) || Date.now();
+  // dueSites 已经读过 state 全表，这里复用：排期需要每站自己的 next_due_ts。
+  const schedule = opts.schedule || {};
   // 本轮成功发起的 [site, 完成时刻, 下次到期]：攒起来一次 batch 写完。
   const started = [];
   // 本轮被跳过（退避 / 预算）的站点及其新排期：只更新 next_due_ts，不动结果字段。
@@ -1135,7 +1156,7 @@ async function dispatch(env, sites, opts = {}) {
     if (used + 1 > budget) {
       skipped.push(s.id);
       // 预算不足同理：推到下一轮（+1 个 cron 周期），不然会一直卡在"到期未执行"。
-      deferred.push([s.id, new Date(roundAt + 60_000).toISOString()]);
+      deferred.push([s.id, new Date(snapMinute(roundAt) + 60_000).toISOString()]);
       continue;
     }
     used += 1;
@@ -1149,8 +1170,13 @@ async function dispatch(env, sites, opts = {}) {
         .bind(s.id, id, source, startedAt)
         .run();
       // 发起即视为「已检查」（见下面的批量写入），结果字段不动。
-      // 发起即排下一次：调度看的是发起节奏，与结果何时回收无关
-      started.push([s.id, startedAt, nextDueOf(roundAt, s.interval_min)]);
+      // 发起即排下一次：以该站点上一次的排期点为锚 + 间隔，网格不被唤醒时刻带偏。
+      const prevSchedule = schedule[s.id];
+      started.push([
+        s.id,
+        startedAt,
+        nextDueOf(prevSchedule?.due || prevSchedule?.last, s.interval_min, roundAt),
+      ]);
       gpStarted.push({ site: s.id, id, source, quota: q });
       okCount++;
       if (q && (q.limit || q.remaining)) quota = q;
@@ -2585,22 +2611,16 @@ export default {
   },
 
   async scheduled(controller, env, ctx) {
-    // 本轮基准时刻：在入口处取一次，全轮共用（排期以它为基准，见 nextDueOf）。
+    // 本轮实际唤醒时刻。**它不再是排期基准** —— 排期现在以每站自己的上一次
+    // 排期点为锚做网格累加（见 nextDueOf），唤醒只决定何时执行、不改变间隔。
     //
-    // 用名义触发时刻（scheduledTime，落在整分边界）而不是实际开跑的 Date.now()：
-    // nextDueOf 会把基准 floor 到整分，延迟不足一分钟时两者算出同一个排期点；
-    // 但只要这一轮被推迟到下一分钟，floor(Date.now()) 就会把排期整体推后
-    // 整整一分钟，且没有任何后续轮次能把它补回来（表现就是"这次多一分钟"）。
-    // 改用名义时刻后，排期点恒为「名义整分 + 间隔」，与本轮晚到多少无关。
+    // 这里曾经改用 controller.scheduledTime，线上实测反而把 5 分钟稳定压成 4 分钟：
+    // 该值比实际开跑早约一分钟，「名义整分 + 间隔」在下一轮就已到期。
+    // 保留它只为在日志里量投递延迟。
     const wokeAt = Date.now();
     const nominal = Number(controller && controller.scheduledTime);
-    // 名义时刻必须落在「现在之前的 5 分钟内」：晚于现在说明字段不可信，
-    // 早于 5 分钟说明 cron 已经严重积压 —— 两种情况都退回实际时刻，
-    // 否则排期点会被算到未来（站点停摆）或一直落在过去（每轮补跑）。
-    const roundAt =
-      Number.isFinite(nominal) && nominal > 0 && nominal <= wokeAt && wokeAt - nominal < 300_000
-        ? nominal
-        : wokeAt;
+    const cronDelayMs =
+      Number.isFinite(nominal) && nominal > 0 && nominal <= wokeAt ? wokeAt - nominal : null;
     /** 分段容错：每段单独 try/catch，任何一段失败都不中断整轮。 */
     const errors = [];
     const stage = async (name, fn, fallback) => {
@@ -2656,8 +2676,13 @@ export default {
 
     // 再按各站点的监测间隔，只对「已到期」的发起新一轮。
     // 预算要减掉本轮收取已经花掉的次数（见 dispatch 的注释）。
-    // 到期判断复用本轮刚写进 state 的时间戳，跳过再一次 `SELECT ... FROM state`。
-    const due = await stage("dueSites", () => dueSites(env, sites), []);
+    // 到期判断复用「本轮刚写进 state 的时间戳」，跳过再一次 `SELECT ... FROM state`。
+    // 顺带把每站的 next_due_ts 交给 dispatch：排期要以它为锚做累加。
+    const dueInfo = await stage("dueSites", () => dueSites(env, sites), {
+      list: [],
+      schedule: {},
+    });
+    const due = dueInfo.list;
     const disp = await stage(
       "dispatch",
       () =>
@@ -2672,7 +2697,9 @@ export default {
           pendingSites: collected.remaining,
           // 收取侧撞到 429 时，发起端本轮也一起停 —— 否则两边各撞各的。
           blockedUntil: collected.blockedUntil,
-          roundAt,
+          // 各站既有的排期点，排期累加的锚。
+          schedule: dueInfo.schedule,
+          roundAt: wokeAt,
         }),
       { used: 0, gpStarted: [], skipped: [], voided: 0, blocked_until: null, quota: null }
     );
@@ -2706,9 +2733,10 @@ export default {
     console.log(
       JSON.stringify({
         cron: controller.cron,
-        // 投递延迟：名义触发时刻 → 实际开始跑。持续为负或极大值说明 cron 在漂，
-        // 而排期以 scheduledTime 为基准后，它已经不影响各站点的间隔了。
-        cronDelayMs: wokeAt - roundAt,
+        // 投递延迟：名义触发时刻 → 实际开始跑。线上实测常态是 0~5s（秒级抖动），
+        // 偶尔 60s+ 说明那一轮真的被推迟了一个周期。排期已是纯网格累加，
+        // 这个值现在只用于判断 cron 健不健康，不再影响任何站点的间隔。
+        cronDelayMs,
         sites: sites.length,
         due: due.length, // 本轮按间隔筛选后实际该查的站点数
         collected: collected.collected,
