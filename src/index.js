@@ -1022,66 +1022,64 @@ async function collectGlobalping(env, sitesIn) {
 }
 
 /**
- * 挑出本轮到期的站点：只看 next_due_ts。
- * 返回 { list, schedule }：schedule 一并交回给 dispatch 做排期累加，省一次 state 全表读。
- * @param schedule 可传 { site: {due, last} }，省掉一次 state 全表读。
+ * 挑出本轮到期的站点。
+ *
+ * 到期时刻完全由 last_checked_ts 派生（见 nextDueOf），不读任何"排期状态"：
+ * 状态一旦写失败就会腐烂，而腐烂后只能靠 fallback 猜，猜错就是相位漂移。
+ * 纯函数不会腐烂 —— 排期是「上次发起时刻」的函数，写失败最多晚一轮重测，
+ * 而 pending 表本来就挡着重复发起。
  */
-async function dueSites(env, sites, schedule) {
-  let map = schedule;
-  if (!map) {
-    const d = await db(env);
-    const { results } = await d
-      .prepare("SELECT site, next_due_ts, last_checked_ts FROM state")
-      .all();
-    map = Object.fromEntries(
-      (results || []).map((r) => [r.site, { due: r.next_due_ts, last: r.last_checked_ts }])
-    );
-  }
+async function dueSites(env, sites) {
+  const d = await db(env);
+  const { results } = await d.prepare("SELECT site, last_checked_ts FROM state").all();
+  const lastOf = new Map((results || []).map((r) => [r.site, r.last_checked_ts]));
   const now = Date.now();
-  const list = sites.filter((s) => {
-    const row = map[s.id];
-    if (!row) return true; // 从未检查过
-    if (row.due) return now >= Date.parse(row.due);
-    // 没排过期：升级自 v3（或别的路径写进来），用上次发起时间补算一次，
-    // 避免升级瞬间把所有站点一起重发。
-    if (!row.last) return true;
-    const next = nextDueOf(row.last, s.interval_min, now);
+  return sites.filter((s) => {
+    const last = lastOf.get(s.id);
+    if (!last) return true; // 从未检查过
+    const next = nextDueOf(last, s.interval_min, now);
     // 时间不可解析时按"该检查了"处理，不能因为脏数据让站点永久停摆
     return !next || now >= Date.parse(next);
   });
-  return { list, schedule: map };
 }
 
-/** 把时刻对齐到最近的整分（±30 秒内归到同一格）。 */
+/** 向下取整到整分：发起时刻只可能落在网格点之后（延迟 0~60s），floor 永远回到网格点。 */
 function snapMinute(ms) {
-  return Math.round(ms / 60_000) * 60_000;
+  return Math.floor(ms / 60_000) * 60_000;
 }
 
 /**
- * 下一次到期时刻 = 上一次排期点 + 间隔（纯网格累加）。
+ * 下一次到期时刻 = 上次发起时刻所在的整分 + 间隔。
  *
- * 基准绝不能用「本轮什么时候被唤醒」：
+ * 排期点是等差的（09:21 / 09:26 / 09:31…），锚点只有 last_checked_ts 一个来源，
+ * 没有需要维护的独立状态 —— 状态会腐烂，纯函数不会。
  *
- * - 用 scheduledTime（名义整分）：线上实测它会比实际开跑早约一分钟，
- *   于是「名义整分 + 5 分钟」到下一轮就已经到期 —— 5 分钟的站点稳定变成 4 分钟，
- *   而且因为每轮都偏，偏得**稳定**，看起来不像抖动，像设置错了。
- * - 用 Date.now()：只要那一轮晚到跨过分钟边界，排期点就整体前移一分钟，
- *   表现为「这次 4 分钟、下次 6 分钟」。
+ * 两条踩过的坑记在这里：
  *
- * 累加网格把这些都消掉：排期点是等差序列（09:21 / 09:26 / 09:31…），
- * 唤醒时刻只决定「什么时候执行这个网格点」，不改变网格本身。
+ * - 用「本轮唤醒时刻」当锚（Date.now 或 scheduledTime）：唤醒时刻一旦跨分钟边界
+ *   （scheduledTime 更是恒定早约一分钟），间隔就整体多/少一分钟。
+ * - 用四舍五入对齐整分：发起时刻秒数过半就进位，网格相位整体平移一分钟；
+ *   平移后间隔依然精确，从数据上几乎看不出来。
  *
- * @param prev   上一次的排期点（没有则用上次检查时刻），毫秒数或 ISO 串
- * @param nowMs  当前时刻，仅在锚点过期太狠时用于重新起算
+ * @param last  上一次发起时刻，毫秒数或 ISO 串
+ * @param nowMs 当前时刻
  */
-function nextDueOf(prev, intervalMin, nowMs) {
+function nextDueOf(last, intervalMin, nowMs) {
   const iv = Math.max(1, Number(intervalMin || 5)) * 60_000;
   const now = Number.isFinite(nowMs) ? nowMs : Date.now();
-  const ms = typeof prev === "number" ? prev : Date.parse(prev);
-  let next = (Number.isFinite(ms) ? snapMinute(ms) : snapMinute(now)) + iv;
-  // 锚点落后超过一个周期（长期停摆、刚把间隔调小）：从当下重新起算。
-  // 否则会连续多轮都判「已到期」，按分钟密度补测一串，反而更乱。
-  if (next <= now - iv) next = snapMinute(now) + iv;
+  const ms = typeof last === "number" ? last : Date.parse(last);
+  // 锚点在未来 = 时钟错乱，忽略它，否则该站点会永远不到期
+  const base = Number.isFinite(ms) && ms <= now ? snapMinute(ms) : snapMinute(now);
+  const next = base + iv;
+  // 已经跨过这个网格点所在的整分 = 这一轮来晚了（cron 积压 / 中断恢复）。
+  // 此时若"立刻补测"，写进去的发起时刻就落在下一分钟，下一轮的 base 跟着变，
+  // 网格相位被永久带走（X3/X8 → X4/X9），而间隔仍然精确 —— 事后极难察觉。
+  // 顺着原网格找第一个还没过的点：宁可少测这一次，也要保住相位。
+  if (snapMinute(now) > next) {
+    // 用整分差算步数：带秒的差会让 ceil 每轮多进一格，结果永远比 now 大 → 站点再也不到期
+    const steps = Math.ceil((snapMinute(now) - base) / iv);
+    return new Date(base + steps * iv).toISOString();
+  }
   return new Date(next).toISOString();
 }
 
@@ -1119,16 +1117,9 @@ async function dispatch(env, sites, opts = {}) {
   const blocked = blockedUntil > Date.now();
 
   const gpStarted = [];
-  // 本轮的调度基准。**只用于「本轮被跳过时相对推后」，不参与排期累加** ——
-  // 排期以各站点自己的上一次排期点为锚（见 nextDueOf 的说明）。
-  const roundAt = Number(opts.roundAt) || Date.now();
-  // dueSites 已经读过 state 全表，这里复用：排期需要每站自己的 next_due_ts。
-  const schedule = opts.schedule || {};
-  // 本轮成功发起的 [site, 完成时刻, 下次到期]：攒起来一次 batch 写完。
+  // 本轮成功发起的 [site, 发起时刻]：攒起来一次 batch 写完。
   const started = [];
-  // 本轮被跳过（退避 / 预算）的站点及其新排期：只更新 next_due_ts，不动结果字段。
-  const deferred = [];
-  // 排期写失败时会记在这里，随返回值透出到 cron 日志（原先被 .catch 静默吞掉）
+  // 写 last_checked_ts 失败时记在这里，随返回值透出到 cron 日志
   let scheduleError = null;
   let quota = null;
   let lastError = null;
@@ -1147,16 +1138,14 @@ async function dispatch(env, sites, opts = {}) {
     if (blocked) {
       // 额度窗口内本轮不发起：这些站点这一轮同样没有任何结果，必须计入无结论，
       // 否则额度耗尽时整页会一直显示"正常"，而实际上已经没人在测了。
+      // 排期不用管：它们仍然处于「已到期」，退避一结束下一轮立刻补上。
       skipped.push(s.id);
       noteVoid(s.id);
-      // 把排期推到退避结束之后：否则每轮都"已到期 → 被跳过"，界面上就是监测不动。
-      deferred.push([s.id, new Date(blockedUntil).toISOString()]);
       continue;
     }
     if (used + 1 > budget) {
+      // 预算不足：同理保持「已到期」，下一轮预算重置后自然补上。
       skipped.push(s.id);
-      // 预算不足同理：推到下一轮（+1 个 cron 周期），不然会一直卡在"到期未执行"。
-      deferred.push([s.id, new Date(snapMinute(roundAt) + 60_000).toISOString()]);
       continue;
     }
     used += 1;
@@ -1170,13 +1159,8 @@ async function dispatch(env, sites, opts = {}) {
         .bind(s.id, id, source, startedAt)
         .run();
       // 发起即视为「已检查」（见下面的批量写入），结果字段不动。
-      // 发起即排下一次：以该站点上一次的排期点为锚 + 间隔，网格不被唤醒时刻带偏。
-      const prevSchedule = schedule[s.id];
-      started.push([
-        s.id,
-        startedAt,
-        nextDueOf(prevSchedule?.due || prevSchedule?.last, s.interval_min, roundAt),
-      ]);
+      // 排期不在这里算：下一轮由 last_checked_ts 派生，唯一来源、无状态可腐烂。
+      started.push([s.id, startedAt]);
       gpStarted.push({ site: s.id, id, source, quota: q });
       okCount++;
       if (q && (q.limit || q.remaining)) quota = q;
@@ -1219,40 +1203,22 @@ async function dispatch(env, sites, opts = {}) {
   // 一次 batch：几行 meta 不该变成几次往返
   if (entries.length) await saveSettings(env, entries).catch(() => {});
 
-  // 先落被跳过站点的排期，再落正常发起的（两者互不重叠，合成一次 batch 也行，
-  // 但分成两次能让失败范围更小）。
-  if (deferred.length) {
-    await d
-      .batch(
-        deferred.map(([site, due]) =>
-          d
-            .prepare(
-              "INSERT INTO state (site, next_due_ts) VALUES (?, ?) " +
-                "ON CONFLICT(site) DO UPDATE SET next_due_ts = excluded.next_due_ts"
-            )
-            .bind(site, due)
-        )
-      )
-      .catch(() => {});
-  }
-
-  // 一次 batch 写「上次发起 + 下次到期」。发起失败的不在这里（保持原排期，下一轮重试）。
+  // 一次 batch 写「上次发起时刻」。发起失败的不在这里（保持原值，下一轮重试）。
   if (started.length) {
     await d
       .batch(
-        started.map(([site, ts, due]) =>
+        started.map(([site, ts]) =>
           d
             .prepare(
-              "INSERT INTO state (site, last_checked_ts, next_due_ts) VALUES (?, ?, ?) " +
-                "ON CONFLICT(site) DO UPDATE SET " +
-                "last_checked_ts = excluded.last_checked_ts, next_due_ts = excluded.next_due_ts"
+              "INSERT INTO state (site, last_checked_ts) VALUES (?, ?) " +
+                "ON CONFLICT(site) DO UPDATE SET last_checked_ts = excluded.last_checked_ts"
             )
-            .bind(site, ts, due)
+            .bind(site, ts)
         )
       )
       .catch((e) => {
-        // 排期写失败必须可见：写不进去的站点会一直走"补算"路径，
-        // 表现为间隔忽长忽短，而日志里什么也看不到。
+        // 写失败仍然要可见：虽然下一轮能自愈（pending 挡着重复发起），
+        // 但连续失败意味着 dueSites 会反复把这些站点判为到期。
         scheduleError = String((e && e.message) || e);
       });
   }
@@ -1267,7 +1233,8 @@ async function dispatch(env, sites, opts = {}) {
     voided: voidSites.length,
     blocked_until: blockedUntil > Date.now() ? blockedUntil : null,
     quota,
-    // 非 null 表示排期没写进去：该站点下一轮会走"补算"路径，间隔可能不准
+    // 非 null 表示 last_checked_ts 没写进去：这些站点下一轮会被判为「已到期」重试，
+    // 由 pending 挡住重复发起，不会真的多点一次
     scheduleError,
   };
 }
@@ -2440,7 +2407,6 @@ export default {
           voided: collect.voidSites,
           pendingSites: collect.remaining,
           blockedUntil: collect.blockedUntil,
-          roundAt: Date.now(),
         });
         // rows / perSite 只在服务端内部用，不下发给浏览器：
         // 后台只需要「收了几条、发起了几个」，把整份明细塞进响应纯属浪费。
@@ -2611,12 +2577,8 @@ export default {
   },
 
   async scheduled(controller, env, ctx) {
-    // 本轮实际唤醒时刻。**它不再是排期基准** —— 排期现在以每站自己的上一次
-    // 排期点为锚做网格累加（见 nextDueOf），唤醒只决定何时执行、不改变间隔。
-    //
-    // 这里曾经改用 controller.scheduledTime，线上实测反而把 5 分钟稳定压成 4 分钟：
-    // 该值比实际开跑早约一分钟，「名义整分 + 间隔」在下一轮就已到期。
-    // 保留它只为在日志里量投递延迟。
+    // 唤醒时刻只用于日志里的投递延迟测量 —— 排期彻底不依赖它
+    // （排期 = 上次发起时刻 + 间隔，见 nextDueOf）。
     const wokeAt = Date.now();
     const nominal = Number(controller && controller.scheduledTime);
     const cronDelayMs =
@@ -2676,13 +2638,8 @@ export default {
 
     // 再按各站点的监测间隔，只对「已到期」的发起新一轮。
     // 预算要减掉本轮收取已经花掉的次数（见 dispatch 的注释）。
-    // 到期判断复用「本轮刚写进 state 的时间戳」，跳过再一次 `SELECT ... FROM state`。
-    // 顺带把每站的 next_due_ts 交给 dispatch：排期要以它为锚做累加。
-    const dueInfo = await stage("dueSites", () => dueSites(env, sites), {
-      list: [],
-      schedule: {},
-    });
-    const due = dueInfo.list;
+    // 到期判断只看 state.last_checked_ts，排期无独立状态。
+    const due = await stage("dueSites", () => dueSites(env, sites), []);
     const disp = await stage(
       "dispatch",
       () =>
@@ -2697,9 +2654,6 @@ export default {
           pendingSites: collected.remaining,
           // 收取侧撞到 429 时，发起端本轮也一起停 —— 否则两边各撞各的。
           blockedUntil: collected.blockedUntil,
-          // 各站既有的排期点，排期累加的锚。
-          schedule: dueInfo.schedule,
-          roundAt: wokeAt,
         }),
       { used: 0, gpStarted: [], skipped: [], voided: 0, blocked_until: null, quota: null }
     );
@@ -2764,7 +2718,8 @@ export default {
         ssl: collected.sslWritten || 0,
         cleaned, // 0 = 不在清理时点或无过期数据；-1 = 清理失败
         orphans, // 本次清掉的孤儿行数（站点已删除的 state/ssl/pending）
-        // 非 null 表示本轮没写成排期（next_due_ts），这些站点下一轮会走补算路径
+        // 非 null 表示本轮没写成 last_checked_ts。下一轮会把这些站点判为到期重试，
+        // pending 挡着不会重复发起，但连续出现说明 D1 写在出问题
         scheduleError: disp.scheduleError || null,
         // 分段错误：正常恒为 []。非空说明本轮有阶段失败，但其余阶段仍照常跑完了。
         errors,

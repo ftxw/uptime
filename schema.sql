@@ -59,8 +59,9 @@ CREATE TABLE IF NOT EXISTS checks_daily (
 CREATE INDEX IF NOT EXISTS idx_daily_day ON checks_daily(day);
 
 -- 运行态。last_* 是最后一次结果的反范式缓存，避免每次展示都对 checks 跑窗口函数。
--- last_checked_ts 记上一次发起（只记自动探测）；last_ts 供展示（含手动测试）。
--- next_due_ts 是计划的下一次发起时刻，调度只看它，不再从 last_checked_ts 反推。
+-- last_checked_ts 记上一次发起（只记自动探测），是**排期的唯一来源**：
+-- 下次到期 = floor(last_checked_ts 到整分) + interval_min，纯派生、无独立排期状态。
+-- last_ts 供展示（含手动测试）。
 CREATE TABLE IF NOT EXISTS state (
   site             TEXT PRIMARY KEY,
   consecutive_fail INTEGER NOT NULL DEFAULT 0,
@@ -69,8 +70,10 @@ CREATE TABLE IF NOT EXISTS state (
   -- 页面只是「X 分钟前」越变越大 —— 用户无法区分「站点好了」和「我们瞎了」。
   void_streak      INTEGER NOT NULL DEFAULT 0,
   last_checked_ts  TEXT,
-  -- 计划的下一次发起时刻（ISO）。NULL = 尚未排期，按 last_checked_ts + 间隔补算一次。
-  -- 用绝对时刻而非"上次时间 + 间隔"来比对：收取失败、时间戳缺失都不会打乱后续排期。
+  -- 已废弃：不读也不写，保留列只为免去重建表（SQLite 删列要整表重建）。
+  -- 它以前存「计划的下一次发起时刻」，但这是个会被写失败腐蚀的冗余状态：
+  -- 写不进去就只能 fallback 猜锚点，猜错一次网格相位就永久平移。
+  -- 现在排期由 last_checked_ts 派生（见 nextDueOf），不需要它了。
   next_due_ts      TEXT,
   last_ok          INTEGER,  -- 1 正常 / 0 故障
   last_status      INTEGER,
