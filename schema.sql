@@ -4,7 +4,7 @@
 -- `src/schema.js` 供代码 import，那份是生成物不要手改。
 --
 -- 改结构时：版本号 +1，并在 src/migrations.js 补一条增量迁移（旧库才需要）。
--- schema-version: 5
+-- schema-version: 6
 
 CREATE TABLE IF NOT EXISTS sites (
   id             TEXT PRIMARY KEY,
@@ -117,4 +117,28 @@ CREATE TABLE IF NOT EXISTS categories (
 CREATE TABLE IF NOT EXISTS meta (
   key   TEXT PRIMARY KEY,
   value TEXT
+);
+
+-- 每轮 cron 的调度事实。**排期问题的唯一证据来源。**
+--
+-- 为什么必须有这张表：`checks` 只记录「发起时刻」，而发起时刻 =
+-- cron 触发时刻 + 执行耗时。两个成因会得到完全相同的时间戳：
+--   cron 在 :58 触发，执行 4 秒 → 记录 09:06:02
+--   cron 在 :02 触发，执行 4 秒 → 记录 09:06:02
+-- 但前者说明触发在漂、后者说明一切正常，修法完全不同。
+-- Analytics 只有分钟粒度，`wrangler tail` 又常被网络挡住，于是只能靠猜。
+-- 这张表把 scheduledTime 与实际开始时刻的差固定下来，让「迟到」可以被证实或证伪。
+--
+-- 体积：一行约 90 字节，保留 7 天 ≈ 10080 行 / 900KB，对免费额度可忽略。
+CREATE TABLE IF NOT EXISTS rounds (
+  ts          TEXT PRIMARY KEY,   -- 本轮实际开始时刻（ISO，毫秒精度，天然去重）
+  sched_ts    TEXT,               -- controller.scheduledTime 原值；NULL = 运行时未提供
+  delay_ms    INTEGER,            -- 实际开始 - 名义触发。cron 真正的投递延迟
+  dur_ms      INTEGER,            -- 本轮总耗时。> 60000 说明这一轮跨了分钟
+  due_n       INTEGER,            -- 按间隔筛选后应查的站点数
+  started_n   INTEGER,            -- 真正发出测量的站点数
+  failed_n    INTEGER,            -- 发起失败的站点数
+  collected_n INTEGER,            -- 本轮收取并落库的结果数
+  skipped_n   INTEGER,            -- 因预算/退避被跳过的站点数
+  err         TEXT                -- 非空 = 有阶段失败，或被上一轮的租约挡住
 );

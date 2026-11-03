@@ -30,4 +30,16 @@ export const MIGRATIONS = [
       "CREATE INDEX IF NOT EXISTS idx_daily_day ON checks_daily(day)",
     ],
   },
+  {
+    // 每轮 cron 的调度事实（排期诊断）。新表，纯新增，不碰任何既有数据。
+    // err: 'locked' 表示被上一轮租约挡住（说明上一轮跑了超 55 秒）；
+    //      JSON 数组表示有阶段失败。
+    v: 6,
+    stmts: [
+      "CREATE TABLE IF NOT EXISTS rounds (" +
+        "ts TEXT PRIMARY KEY, sched_ts TEXT, delay_ms INTEGER, dur_ms INTEGER, " +
+        "due_n INTEGER, started_n INTEGER, failed_n INTEGER, collected_n INTEGER, " +
+        "skipped_n INTEGER, err TEXT)",
+    ],
+  },
 ];

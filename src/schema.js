@@ -12,7 +12,7 @@
  * 每条都是可单独 `.run()` 的完整语句，顺序即依赖顺序（先建表、后建索引）。
  */
 
-export const SCHEMA_VERSION = 5;
+export const SCHEMA_VERSION = 6;
 
 export const SCHEMA_STMTS = [
   "CREATE TABLE IF NOT EXISTS sites (\n  id             TEXT PRIMARY KEY,\n  name           TEXT NOT NULL,\n  url            TEXT NOT NULL,\n  group_name     TEXT,\n  expect_codes   TEXT,\n  hide_url       INTEGER NOT NULL DEFAULT 0,\n  fail_threshold INTEGER NOT NULL DEFAULT 3,\n  interval_min   INTEGER NOT NULL DEFAULT 5,\n  enabled        INTEGER NOT NULL DEFAULT 1,\n  sort           INTEGER NOT NULL DEFAULT 0\n)",
@@ -27,4 +27,5 @@ export const SCHEMA_STMTS = [
   "CREATE TABLE IF NOT EXISTS ssl (\n  site       TEXT PRIMARY KEY,\n  checked_ts TEXT,\n  authorized INTEGER,\n  protocol   TEXT,\n  issuer     TEXT,\n  subject    TEXT,\n  key_type   TEXT,\n  expires_at TEXT,\n  error      TEXT\n)",
   "CREATE TABLE IF NOT EXISTS categories (\n  name TEXT PRIMARY KEY,\n  sort INTEGER NOT NULL DEFAULT 0\n)",
   "CREATE TABLE IF NOT EXISTS meta (\n  key   TEXT PRIMARY KEY,\n  value TEXT\n)",
+  "CREATE TABLE IF NOT EXISTS rounds (\n  ts          TEXT PRIMARY KEY,\n  sched_ts    TEXT,\n  delay_ms    INTEGER,\n  dur_ms      INTEGER,\n  due_n       INTEGER,\n  started_n   INTEGER,\n  failed_n    INTEGER,\n  collected_n INTEGER,\n  skipped_n   INTEGER,\n  err         TEXT\n)",
 ];

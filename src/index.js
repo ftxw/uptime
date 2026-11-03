@@ -1084,6 +1084,47 @@ function nextDueOf(last, intervalMin, nowMs) {
 }
 
 /**
+ * 记录本轮 cron 的调度事实。**观测专用，任何失败都不能影响主流程。**
+ *
+ * 为什么要落库而不是只打日志：`checks` 只记「发起时刻」，而发起时刻 =
+ * cron 触发时刻 + 执行耗时。于是这两种完全不同的情况会得到同一个时间戳：
+ *
+ *   cron 在 :58 触发，执行 4 秒 → 发起 09:06:02，秒数 2（其实是晚了一分钟）
+ *   cron 在 :02 触发，执行 4 秒 → 发起 09:06:02，秒数 2（这一轮很准）
+ *
+ * 只看 checks 永远分不清，而两者的修法相反。Analytics 是分钟粒度、
+ * `wrangler tail` 又常被网络挡住，所以必须把 scheduledTime 与 wokeAt 的差
+ * 固定下来，让「cron 迟到」可以被证实或证伪。
+ */
+async function logRound(env, row) {
+  try {
+    const d = await db(env);
+    await d
+      .prepare(
+        "INSERT OR REPLACE INTO rounds " +
+          "(ts, sched_ts, delay_ms, dur_ms, due_n, started_n, failed_n, collected_n, skipped_n, err) " +
+          "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+      )
+      .bind(
+        row.ts,
+        row.sched_ts ?? null,
+        row.delay_ms ?? null,
+        row.dur_ms ?? null,
+        row.due_n ?? 0,
+        row.started_n ?? 0,
+        row.failed_n ?? 0,
+        row.collected_n ?? 0,
+        row.skipped_n ?? 0,
+        row.err ?? null
+      )
+      .run();
+  } catch {
+    // 表还没建（首次部署且迁移失败）或 D1 抖动：静默跳过。
+    // 观测失败绝不能变成新的故障点 —— 那会把"看不见问题"升级成"站不起来"。
+  }
+}
+
+/**
  * 阶段二：发起本轮测量。
  * @param opts.alreadyUsed 已用于收取的子请求数
  * @param opts.raw         原始设置（读 gp_blocked_until）
@@ -2609,6 +2650,16 @@ export default {
     // 租约到点自动失效，不会死锁（最多少测一轮）。
     const lockUntil = Number(settings.gp_round_lock_until || 0) || 0;
     if (lockUntil > Date.now()) {
+      // 被上一轮的租约挡住 = 那一轮跑了超过 55 秒（或进程被杀）。
+      // 这是「执行慢」最直接的证据，必须落库 —— 原先只有一行 stdout，
+      // 而 tail 常被挡、Analytics 只有分钟粒度，等于看不见。
+      await logRound(env, {
+        ts: new Date(wokeAt).toISOString(),
+        sched_ts: Number.isFinite(nominal) && nominal > 0 ? new Date(nominal).toISOString() : null,
+        delay_ms: cronDelayMs,
+        dur_ms: Date.now() - wokeAt,
+        err: `locked(${lockUntil - Date.now()}ms)`,
+      });
       console.log(
         JSON.stringify({ cron: controller.cron, skipped: "locked", locked_for_ms: lockUntil - Date.now() })
       );
@@ -2683,6 +2734,28 @@ export default {
 
     // 释放轮次租约：正常结束立刻放开，下一轮不必空等满 55 秒
     await stage("roundUnlock", () => saveSetting(env, "gp_round_lock_until", "0"), null);
+
+    // 本轮调度事实落库。这是排期诊断的唯一证据：checks 只记发起时刻，
+    // 分不清「cron 触发晚」与「执行慢跨分钟」，而这两者的修法相反。
+    // gpStarted 里同时含成功项（有 id）与失败项（有 error），所以按 error 拆分计数。
+    const startedOk = (disp.gpStarted || []).filter((x) => x && !x.error).length;
+    await stage(
+      "logRound",
+      () =>
+        logRound(env, {
+          ts: new Date(wokeAt).toISOString(),
+          sched_ts: Number.isFinite(nominal) && nominal > 0 ? new Date(nominal).toISOString() : null,
+          delay_ms: cronDelayMs,
+          dur_ms: Date.now() - wokeAt,
+          due_n: due.length,
+          started_n: startedOk,
+          failed_n: Number(disp.failed || 0),
+          collected_n: collected.collected || 0,
+          skipped_n: (disp.skipped || []).length,
+          err: errors.length ? JSON.stringify(errors) : null,
+        }),
+      null
+    );
 
     console.log(
       JSON.stringify({

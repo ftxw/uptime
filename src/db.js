@@ -82,6 +82,10 @@ export async function cleanupOldChecks(env, keepDays = 30) {
     .bind(dayCutoff)
     .run()
     .catch(() => {});
+  // 调度事实只用于诊断，7 天足够（一天 1440 行 ≈ 130KB）。
+  // 表可能尚不存在（旧库在首次迁移前就跑到这里），失败不算错。
+  const roundCutoff = new Date(Date.now() - 7 * 86400_000).toISOString();
+  await d.prepare("DELETE FROM rounds WHERE ts < ?").bind(roundCutoff).run().catch(() => {});
   return Number(r?.meta?.changes ?? r?.changes ?? 0);
 }
 
