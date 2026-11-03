@@ -1022,65 +1022,52 @@ async function collectGlobalping(env, sitesIn) {
 }
 
 /**
- * 挑出本轮到期的站点。
+ * 本轮该不该查：判据是「上次发起所在的槽」是否落后于「当前槽」。
  *
- * 到期时刻完全由 last_checked_ts 派生（见 nextDueOf），不读任何"排期状态"：
- * 状态一旦写失败就会腐烂，而腐烂后只能靠 fallback 猜，猜错就是相位漂移。
- * 纯函数不会腐烂 —— 排期是「上次发起时刻」的函数，写失败最多晚一轮重测，
- * 而 pending 表本来就挡着重复发起。
+ * 槽 = floor(t / 间隔) × 间隔，以 epoch 为原点，与任何历史时刻无关。
+ *
+ * 为什么是槽而不是「上次 + 间隔」：相对累加会把一次异常永久继承下去 ——
+ * 某轮晚 1 分钟发起，之后每轮都从那个被推迟的时刻往后加，尾数永久偏移，
+ * 而间隔依然精确，事后极难发现。绝对网格每轮都由当前时刻重新定位，
+ * 异常只影响那一次。
+ *
+ * 为什么不是「下次到期时刻」：那需要把结果存进库（v6 之前的 next_due_ts），
+ * 而存下来的东西会被写失败腐蚀，之后只能 fallback 猜锚点，一猜错相位就平移。
+ * 槽是纯函数，无状态可腐蚀；写失败最多晚一轮重测（pending 挡着不会重复发起）。
+ *
+ * 语义按「不漏」：错过一个网格点后立刻补测，下一次仍落回原网格，
+ * 所以补测那一次间隔会短于设定值（物理必然），之后立即恢复。
+ * 但只在槽的**前半段**补 —— 后半段补完下一个槽马上就到，等于连着测两次
+ * （cron 缺 3 轮时实测会压到 2 分钟一次），那种情况宁可跳过本槽。
+ *
+ * 边界：last 缺失 / 不可解析 / 在未来（时钟错乱）一律判到期 ——
+ * 宁可多测一次，也不能因为脏数据让站点永久停摆。
  */
+function isDue(last, intervalMin, nowMs) {
+  const iv = Math.max(1, Number(intervalMin || 5)) * 60_000;
+  const now = Number.isFinite(nowMs) ? nowMs : Date.now();
+  if (!last) return true;
+  const ms = typeof last === "number" ? last : Date.parse(last);
+  if (!Number.isFinite(ms)) return true;
+  if (ms > now) return true; // 时钟错乱 / 未来时刻：别让站点停摆
+
+  const lastSlot = Math.floor(ms / iv);
+  const nowSlot = Math.floor(now / iv);
+  if (lastSlot >= nowSlot) return false; // 本槽已经测过
+
+  // 只在槽的前半段补测。后半段补完，下一个槽马上就到 —— 那等于连着测两次，
+  // 间隔会被压到不足半个周期（cron 缺 3 轮时甚至只剩 1 分钟），既浪费点数
+  // 又让界面上出现"两分钟一次"。宁可跳过这个槽，等下一个网格点。
+  return now - nowSlot * iv < iv / 2;
+}
+
+/** 挑出本轮到期的站点：只看 state.last_checked_ts，不读任何「排期状态」。 */
 async function dueSites(env, sites) {
   const d = await db(env);
   const { results } = await d.prepare("SELECT site, last_checked_ts FROM state").all();
   const lastOf = new Map((results || []).map((r) => [r.site, r.last_checked_ts]));
   const now = Date.now();
-  return sites.filter((s) => {
-    const last = lastOf.get(s.id);
-    if (!last) return true; // 从未检查过
-    const next = nextDueOf(last, s.interval_min, now);
-    // 时间不可解析时按"该检查了"处理，不能因为脏数据让站点永久停摆
-    return !next || now >= Date.parse(next);
-  });
-}
-
-/** 向下取整到整分：发起时刻只可能落在网格点之后（延迟 0~60s），floor 永远回到网格点。 */
-function snapMinute(ms) {
-  return Math.floor(ms / 60_000) * 60_000;
-}
-
-/**
- * 下一次到期时刻 = 上次发起时刻所在的整分 + 间隔。
- *
- * 排期点是等差的（09:21 / 09:26 / 09:31…），锚点只有 last_checked_ts 一个来源，
- * 没有需要维护的独立状态 —— 状态会腐烂，纯函数不会。
- *
- * 两条踩过的坑记在这里：
- *
- * - 用「本轮唤醒时刻」当锚（Date.now 或 scheduledTime）：唤醒时刻一旦跨分钟边界
- *   （scheduledTime 更是恒定早约一分钟），间隔就整体多/少一分钟。
- * - 用四舍五入对齐整分：发起时刻秒数过半就进位，网格相位整体平移一分钟；
- *   平移后间隔依然精确，从数据上几乎看不出来。
- *
- * @param last  上一次发起时刻，毫秒数或 ISO 串
- * @param nowMs 当前时刻
- */
-function nextDueOf(last, intervalMin, nowMs) {
-  const iv = Math.max(1, Number(intervalMin || 5)) * 60_000;
-  const now = Number.isFinite(nowMs) ? nowMs : Date.now();
-  const ms = typeof last === "number" ? last : Date.parse(last);
-  // 锚点在未来 = 时钟错乱，忽略它，否则该站点会永远不到期
-  const base = Number.isFinite(ms) && ms <= now ? snapMinute(ms) : snapMinute(now);
-  const next = base + iv;
-  // 已经跨过这个网格点所在的整分 = 这一轮来晚了（cron 积压 / 中断恢复）。
-  // 此时若"立刻补测"，写进去的发起时刻就落在下一分钟，下一轮的 base 跟着变，
-  // 网格相位被永久带走（X3/X8 → X4/X9），而间隔仍然精确 —— 事后极难察觉。
-  // 顺着原网格找第一个还没过的点：宁可少测这一次，也要保住相位。
-  if (snapMinute(now) > next) {
-    // 用整分差算步数：带秒的差会让 ceil 每轮多进一格，结果永远比 now 大 → 站点再也不到期
-    const steps = Math.ceil((snapMinute(now) - base) / iv);
-    return new Date(base + steps * iv).toISOString();
-  }
-  return new Date(next).toISOString();
+  return sites.filter((s) => isDue(lastOf.get(s.id), s.interval_min, now));
 }
 
 /**
@@ -2618,8 +2605,14 @@ export default {
   },
 
   async scheduled(controller, env, ctx) {
-    // 唤醒时刻只用于日志里的投递延迟测量 —— 排期彻底不依赖它
-    // （排期 = 上次发起时刻 + 间隔，见 nextDueOf）。
+    // 唤醒时刻只用于测量投递延迟（写进 rounds.delay_ms），排期完全不依赖它。
+    // 排期是纯函数 isDue(last_checked_ts, 间隔, now)：判「上次发起所在的槽」
+    // 是否落后于「当前槽」，槽以 epoch 为原点，与任何历史时刻无关。
+    //
+    // 线上实测（rounds 表）：delay_ms 稳定 0.7~0.8s，开始时刻恒在整分后
+    // 0.16~0.25s —— cron 本身极准，不存在「触发时刻漂移」这回事。
+    // 另注意 scheduledTime 是整分前 0.546 秒（:59.454），用 Math.floor 归分钟
+    // 会落到前一分钟，这正是早前把它当锚点、把 5 分钟压成 4 分钟的原因。
     const wokeAt = Date.now();
     const nominal = Number(controller && controller.scheduledTime);
     const cronDelayMs =
