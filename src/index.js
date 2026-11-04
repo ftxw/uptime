@@ -968,7 +968,7 @@ async function collectGlobalping(env, sitesIn) {
 
     // 落库时间用「发起时刻」而不是「回收时刻」：回收时刻取决于测量跑多久、
     // 我们哪一轮来收，会让相邻两条记录的时间差在 4/5/6 分钟之间跳。
-    // 发起时刻才是这次检查真正落在排期网格上的位置。
+    // 发起时刻才是这次检查真正开始的那一刻，也是排期判据（isDue）使用的基准。
     const firedAt = Number.isFinite(born)
       ? new Date(born).toISOString()
       : new Date(collectAt).toISOString();
@@ -1022,43 +1022,43 @@ async function collectGlobalping(env, sitesIn) {
 }
 
 /**
- * 本轮该不该查：判据是「上次发起所在的槽」是否落后于「当前槽」。
+ * 本轮该不该查：判据是「距上次发起是否已满设定间隔」。
  *
- * 槽 = floor(t / 间隔) × 间隔，以 epoch 为原点，与任何历史时刻无关。
+ * 纯函数、无状态：只读 state.last_checked_ts，不保存「下次到期时刻」。
+ * 存下来的排期会被一次写失败腐蚀，之后只能 fallback 猜锚点，一猜错就永久平移；
+ * 纯函数没有可腐蚀的东西，写失败最多晚一轮重测（pending 挡着不会重复发起）。
  *
- * 为什么是槽而不是「上次 + 间隔」：相对累加会把一次异常永久继承下去 ——
- * 某轮晚 1 分钟发起，之后每轮都从那个被推迟的时刻往后加，尾数永久偏移，
- * 而间隔依然精确，事后极难发现。绝对网格每轮都由当前时刻重新定位，
- * 异常只影响那一次。
- *
- * 为什么不是「下次到期时刻」：那需要把结果存进库（v6 之前的 next_due_ts），
- * 而存下来的东西会被写失败腐蚀，之后只能 fallback 猜锚点，一猜错相位就平移。
- * 槽是纯函数，无状态可腐蚀；写失败最多晚一轮重测（pending 挡着不会重复发起）。
- *
- * 语义按「不漏」：错过一个网格点后立刻补测，下一次仍落回原网格，
- * 所以补测那一次间隔会短于设定值（物理必然），之后立即恢复。
- * 但只在槽的**前半段**补 —— 后半段补完下一个槽马上就到，等于连着测两次
- * （cron 缺 3 轮时实测会压到 2 分钟一次），那种情况宁可跳过本槽。
+ * 不追求「落在固定的分钟上」。记录时刻跟随上一次的真实发起时刻，
+ * 429 补测之后相位也跟着走（比如从 X0 变成 X2）——这是「上次时刻 + 间隔」
+ * 这个语义的必然结果，不是缺陷。要固定相位就得改成绝对网格，
+ * 代价是漏测时会在非网格时刻补出一次 7 分钟的间隔。
  *
  * 边界：last 缺失 / 不可解析 / 在未来（时钟错乱）一律判到期 ——
  * 宁可多测一次，也不能因为脏数据让站点永久停摆。
  */
 function isDue(last, intervalMin, nowMs) {
-  const iv = Math.max(1, Number(intervalMin || 5)) * 60_000;
+  const ivMin = Math.max(1, Math.round(Number(intervalMin || 5)));
   const now = Number.isFinite(nowMs) ? nowMs : Date.now();
   if (!last) return true;
   const ms = typeof last === "number" ? last : Date.parse(last);
   if (!Number.isFinite(ms)) return true;
   if (ms > now) return true; // 时钟错乱 / 未来时刻：别让站点停摆
 
-  const lastSlot = Math.floor(ms / iv);
-  const nowSlot = Math.floor(now / iv);
-  if (lastSlot >= nowSlot) return false; // 本槽已经测过
-
-  // 只在槽的前半段补测。后半段补完，下一个槽马上就到 —— 那等于连着测两次，
-  // 间隔会被压到不足半个周期（cron 缺 3 轮时甚至只剩 1 分钟），既浪费点数
-  // 又让界面上出现"两分钟一次"。宁可跳过这个槽，等下一个网格点。
-  return now - nowSlot * iv < iv / 2;
+  // 语义：只看「分」，秒一律截掉。
+  //   09:41:59 属于 41 分，间隔 5 → 下一次在 46 分，即 09:46:xx 里任意时刻。
+  //   09:41:01 同样属于 41 分，结论完全一样。
+  //
+  // 为什么必须截断而不是按毫秒比：cron 只有 60 秒粒度，sched 固定在 :59.454，
+  // 加 0.5~1.5s 执行延迟后，发起时刻在整分前后 ±1 秒抖动。按毫秒比时，
+  // 299.6 秒和 300.4 秒会得到相反结论 —— 而它们本来就是同一轮。于是 300 秒
+  // 的间隔被向上取整成 360 秒，并且此后永久保持。
+  //
+  // now 额外 +1 秒再截断：cron 的「46 分这一轮」实际在 45:59.4 触发、
+  // 45:59.9 左右开始执行，截断后会被算成 45 分，永远差那 0.1 秒，
+  // 结果又变成每轮多等一分钟。进位 1 秒让它归入它真正负责的那一分钟。
+  const lastMin = Math.floor(ms / 60_000);
+  const nowMin = Math.floor((now + 1_000) / 60_000);
+  return nowMin - lastMin >= ivMin;
 }
 
 /** 挑出本轮到期的站点：只看 state.last_checked_ts，不读任何「排期状态」。 */
@@ -1126,6 +1126,10 @@ async function dispatch(env, sites, opts = {}) {
   const raw = opts.raw || {};
   const alreadyVoid = new Set(opts.voided || []);
   const skipped = [];
+  // 发起失败的明细。rounds 里原本只有一个 failed_n 计数，事后只能知道
+  // 「这一轮失败了一个」，分不清 429 / 超时 / 5xx，也看不到限额剩多少。
+  // 攒起来随 rounds.err 落库，让下一次限流可以被直接归因，而不是靠反推。
+  const failures = [];
   const voidSites = [];
 
   // 已挂起的站点本轮不再重复发起：上一轮的测量还没收，重发等于白花额度。
@@ -1199,6 +1203,13 @@ async function dispatch(env, sites, opts = {}) {
       failCount++;
       lastError = msg;
       noteVoid(s.id);
+      failures.push({
+        site: s.id,
+        code: (e && e.code) || (e && e.gp && e.gp.status) || "error",
+        at: new Date().toISOString(),
+        ...(e && e.gp ? { gp: e.gp } : {}),
+        msg: msg.slice(0, 160),
+      });
 
       // 额度用尽：立刻停止本轮后续发起（同一份额度，再试必然还是 429），
       // 并把退避截止时间写进 meta，让下一分钟的 cron 直接跳过。
@@ -1257,6 +1268,7 @@ async function dispatch(env, sites, opts = {}) {
     used,
     gpStarted,
     skipped,
+    failures,
     failed: failCount,
     voided: voidSites.length,
     blocked_until: blockedUntil > Date.now() ? blockedUntil : null,
@@ -2605,9 +2617,9 @@ export default {
   },
 
   async scheduled(controller, env, ctx) {
-    // 唤醒时刻只用于测量投递延迟（写进 rounds.delay_ms），排期完全不依赖它。
-    // 排期是纯函数 isDue(last_checked_ts, 间隔, now)：判「上次发起所在的槽」
-    // 是否落后于「当前槽」，槽以 epoch 为原点，与任何历史时刻无关。
+    // 唤醒时刻只用于测量投递延迟（写进 rounds.delay_ms），排期不依赖它。
+    // 排期是纯函数 isDue(last_checked_ts, 间隔, now)：判「距上次发起是否已满间隔」，
+    // 单位是分钟（理由见 isDue 的注释：cron 的发起时刻在整分前后 ±1 秒抖动）。
     //
     // 线上实测（rounds 表）：delay_ms 稳定 0.7~0.8s，开始时刻恒在整分后
     // 0.16~0.25s —— cron 本身极准，不存在「触发时刻漂移」这回事。
@@ -2732,6 +2744,9 @@ export default {
     // 分不清「cron 触发晚」与「执行慢跨分钟」，而这两者的修法相反。
     // gpStarted 里同时含成功项（有 id）与失败项（有 error），所以按 error 拆分计数。
     const startedOk = (disp.gpStarted || []).filter((x) => x && !x.error).length;
+    // 发起失败的明细并入 err：有了它，429 才能被归因（限额余量 / Retry-After / 响应体），
+    // 而不是只留下一个 failed_n=1 让人反推。写失败不影响主流程（logRound 自己吞异常）。
+    for (const f of disp.failures || []) errors.push({ stage: "dispatch", ...f });
     await stage(
       "logRound",
       () =>

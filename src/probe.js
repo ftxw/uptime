@@ -111,6 +111,19 @@ export async function gpCreate(env, site) {
     const err = new Error(`Globalping 额度用尽（429），${Math.round(ra / 1000)} 秒后重试`);
     err.code = "rate_limit";
     err.retryAfterMs = ra;
+    // 429 的真实来源只有响应头和响应体能说清：小时额度见底、瞬时突发限流、
+    // 还是共享出口 IP 被别人吃掉额度，光看状态码完全分不出来。
+    // 这里原样挂到错误对象上，由调度层随 rounds.err 落库 —— 否则只能在
+    // "又限流了"和"不知道为什么"之间反复猜。
+    err.gp = {
+      status: 429,
+      retryAfter: res.headers.get("retry-after"),
+      limit: res.headers.get("x-ratelimit-limit"),
+      remaining: res.headers.get("x-ratelimit-remaining"),
+      reset: res.headers.get("x-ratelimit-reset"),
+      cost: res.headers.get("x-request-cost"),
+      body: data ? JSON.stringify(data).slice(0, 240) : null,
+    };
     throw err;
   }
   // 非 2xx 显式失败：区分凭据错误与平台抖动
