@@ -463,11 +463,7 @@ const SITE_ID = params.get("id") || "";
 // 趋势窗口固定在服务端决定（上限 24 小时，不满则从首条记录算起），前端不再有 hours 参数。
 const TREND_HOURS = 24;
 
-// 带版本号：缓存里含站点 URL，而 hide_url 改完就不该再让访客看到 ——
-// 换 key 让旧副本（url 还是明文的那份）一次作废，避免首帧抢先渲染出地址。
-// 与 app.js 的 CACHE_KEY 同一处理，改缓存字段语义时两处一起 bump。
-// v7：series 从「每槽一个点（只含有数据的槽）」改成「槽的边界点」（n 个槽 → n+1 个点，
-//     含空槽）。旧副本点数与首末位置都不同，整份作废。
+// 带版本号：缓存含站点 URL，hide_url 改动后旧副本必须作废；v7 = 边界点格式
 const cacheKey = () => `uptime:site:v7:${SITE_ID}`;
 
 function render(d) {
@@ -485,10 +481,7 @@ function render(d) {
   renderIncidents(d.incidents, d.window && d.window.incident_hours);
 
   const w = d.window || {};
-  // 跨度写实际值：新站点数据不足 24 小时时，窗口就是「首条记录 → 最后一次检查」，
-  // 不能笼统写"最近 24 小时"，否则用户会以为中间缺了一大段。
-  // 同时把右端时间写出来：曲线停在最后一次监测上是刻意的（不是数据丢了），
-  // 不写清楚的话，看到"停在一小时前"的人只会以为图表坏了。
+  // 跨度写实际值；右端时间也要写出来，否则「停在一小时前」会被当成图表坏了
   const span = Number(w.span_sec || 0);
   const until = w.last_check_ts ? fmtFull(w.last_check_ts) : "";
   qs("#foot").textContent =
@@ -497,15 +490,10 @@ function render(d) {
     `探测位置 ${d.site.gp_magic || "默认筛选"} · SSL 随探测顺带采集`;
 }
 
-/**
- * 拉详情并渲染。
- * @param manual 用户主动刷新：绕过缓存，不先用 localStorage 顶替
- */
-/**
- * 上次拉数据的时刻：切回标签页的即时刷新按它节流，避免来回切把边缘缓存打穿。
- */
+/** 上次拉数据时刻，切回标签页时按它节流。 */
 let lastFetchAt = 0;
 
+/** 拉详情并渲染。manual = 主动刷新：绕过缓存，不先用 localStorage 顶替。 */
 async function load(manual = false) {
   lastFetchAt = Date.now();
   if (!SITE_ID) {

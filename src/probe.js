@@ -1,8 +1,4 @@
-/**
- * 探测层：走 Globalping 探针。
- * 不用 CF 边缘探测 —— 那是机房到站点，不代表大陆用户的实际路径。
- * 一次 http 测量同时带回延迟、状态码与证书。
- */
+/** 探测层：走 Globalping 探针，一次 http 测量带回延迟、状态码与证书。 */
 
 import { defOf, validMagic, gpLimitNum } from "./settings.js";
 
@@ -18,10 +14,7 @@ function isIpAddress(hostname) {
   return parts.every((p) => /^\d{1,3}$/.test(p) && Number(p) >= 0 && Number(p) <= 255);
 }
 
-/**
- * 判定一次探测是否「正常」：状态码 ∈ expect_codes（空则接受 200-399）。
- * 只判 up/down；degraded 由 index.js 的 stateOf 结合证书与慢阈值算出。
- */
+/** 判定一次探测是否正常：状态码 ∈ expect_codes（空则接受 200-399）。只判 up/down。 */
 export function judge(site, r) {
   if (!r || r.ok === false) return { ok: false, reason: r?.error || "请求失败" };
   const codes = String(site.expect_codes || "")
@@ -56,15 +49,11 @@ function retryAfterMs(raw) {
   return Math.min(3_600_000, Math.max(30_000, Math.round(ms)));
 }
 
-/**
- * 发起一次测量，返回 measurement id（不等待结果）。
- * 额度按探测点数计费（X-Request-Cost === limit），默认 3 是为了有多张票互相兜底。
- */
+/** 发起一次测量，返回 measurement id（不等待结果）。额度按探测点数计费。 */
 export async function gpCreate(env, site) {
   const token = env && env.GLOBALPING_TOKEN;
   const u = new URL(normalizeUrl(site.url));
-  // 位置筛选是全局设置。必须再做一次校验：环境变量绕过后台写入侧的规范化，
-  // 写错同样会把所有 GP 站点一次打死。
+  // 位置筛选是全局设置，这里再校验一次（环境变量可绕过后台规范化）
   const magic = validMagic(env.GP_MAGIC) || defOf("gp_magic");
   const limit = gpLimitNum(env.GP_LIMIT);
   const timeoutSec = gpTimeoutSec(env);
@@ -111,10 +100,7 @@ export async function gpCreate(env, site) {
     const err = new Error(`Globalping 额度用尽（429），${Math.round(ra / 1000)} 秒后重试`);
     err.code = "rate_limit";
     err.retryAfterMs = ra;
-    // 429 的真实来源只有响应头和响应体能说清：小时额度见底、瞬时突发限流、
-    // 还是共享出口 IP 被别人吃掉额度，光看状态码完全分不出来。
-    // 这里原样挂到错误对象上，由调度层随 rounds.err 落库 —— 否则只能在
-    // "又限流了"和"不知道为什么"之间反复猜。
+    // 原样挂上响应头字段，由调度层随 rounds.err 落库归因
     err.gp = {
       status: 429,
       retryAfter: res.headers.get("retry-after"),
@@ -144,8 +130,7 @@ export async function gpCreate(env, site) {
     quota: {
       limit: res.headers.get("x-ratelimit-limit"),
       remaining: res.headers.get("x-ratelimit-remaining"),
-      // 实际计费的点数：与 limit 相等时说明"3 个探测点 = 3 点额度"，
-      // 用它反推"每小时还能测几次"比猜准。
+      // 本次扣掉的点数（= 探测点数）
       cost: res.headers.get("x-request-cost"),
       ts: Date.now(),
     },
@@ -179,11 +164,7 @@ function gpResultReason(rr) {
   return s || "未知状态";
 }
 
-/**
- * 从测量结果里取证书 —— SSL 监测的唯一来源。
- * 握手失败时 tls 为 null，此时返回 null 而不是「证书无效」：
- * 探针没连上，我们对证书一无所知，谎报会让网络抖动变成假降级。
- */
+/** 从测量结果里取证书。握手失败时 tls 为 null，返回 null 而不是「证书无效」。 */
 function tlsOf(rr) {
   const t = rr && rr.tls;
   if (!t || !t.expiresAt) return null;
@@ -201,14 +182,7 @@ function tlsOf(rr) {
   };
 }
 
-/**
- * 收取结果。三种返回：
- *   { done:false } 还在跑，留到下一轮
- *   { done:true, broken:true } 不可用，丢弃 pending 且不记检查
- *   { done:true, results, status } 正常
- * broken 分支不能省：否则会永远 done:false，pending 永不删除，该站点静默停摆。
- * 429 回传 retryAfterMs，由调度层统一退避。
- */
+/** 收取结果：{done:false} 仍在跑 / {done:true,broken:true} 丢弃 / 正常结果。429 回传 retryAfterMs。 */
 export async function gpCollect(env, pending) {
   const token = env && env.GLOBALPING_TOKEN;
   const res = await fetch(
@@ -269,11 +243,7 @@ export async function gpCollect(env, pending) {
   return { done: true, results, status: d.status };
 }
 
-/**
- * 多探针判定：有一台成功即判可达，全灭才判故障（不是投票）。
- * 单点失败率约 25%，"≥2 失败即故障"的误判率比"全灭"高一个数量级。
- * internal 故障票不参与判定；全失败且只剩 1 票时作废重测；代表值取成功票中位数。
- */
+/** 多探针判定：一台成功即判可达，全灭才判故障。internal 故障票不参与，代表值取中位数。 */
 export function gpDecide(site, results) {
   const all = Array.isArray(results) ? results : [];
   if (!all.length) return { void: true, why: "no-results" };
@@ -282,7 +252,6 @@ export function gpDecide(site, results) {
   const platformFaults = all.length - usable.length;
   if (!usable.length) return { void: true, why: "all-internal", platformFaults };
 
-  // 每条探针各自 judge：状态码不在期望集合（如 500）也参与判定。
   const votes = usable.map((r) => ({ r, v: judge(site, r) }));
   const yes = votes.filter((x) => x.v.ok);
   const no = votes.filter((x) => !x.v.ok);
@@ -290,7 +259,7 @@ export function gpDecide(site, results) {
 
   const ok = yes.length > 0;
 
-  // 见规则 ②：all.length 是原始结果数（含被 internal 摘掉的）。
+  // 只剩 1 票且失败（原始结果 ≥2）：作废重测
   if (!ok && total < 2 && all.length >= 2) {
     return { void: true, why: "single-fail", platformFaults, okCount: 0, total };
   }

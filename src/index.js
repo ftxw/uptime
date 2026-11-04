@@ -18,13 +18,13 @@ import {
   bumpDailyManual,
   deleteBySites,
   sslDaysLeftSql,
-  SSL_COLUMNS_SQL,
   BATCH_CHUNK,
   chunk,
   UNGROUPED,
   ensureSchema,
+  minuteIso,
 } from "./db.js";
-import { SCHEMA_STMTS, SCHEMA_VERSION } from "./schema.js";
+import { SCHEMA_STMTS } from "./schema.js";
 import {
   judge,
   normalizeUrl,
@@ -51,20 +51,7 @@ import { formatOrigin } from "./origin.js";
 
 const JSON_HEADERS = { "content-type": "application/json; charset=utf-8" };
 
-/**
- * 只读接口的边缘缓存 TTL（秒）。
- *
- * 300 而不是 60：一次总览就是 N 站 × 24h 明细的聚合，代价随站点数线性放大，
- * 而 D1 免费层是每天 500 万行读取、超了直接拒查到 UTC 零点。
- * TTL 60 时，每个开着的标签页每分钟都会穿透边缘缓存打一次源站
- * （1440 次/天/机房）；300 秒把它压到 288 次，单页最多落后 5 分钟。
- *
- * 想让用户立刻看到最新数据的场景由「刷新」按钮承担：它带 no-cache，
- * 服务端据此跳过边缘缓存并回 no-store，不受这个 TTL 约束。
- *
- * 必须带 max-age=0：只写 s-maxage 时浏览器会用启发式缓存，
- * 用户按 F5 也可能直接吃本地副本，连边缘缓存都到不了。
- */
+/** 只读接口的边缘缓存 TTL（秒）。刷新按钮带 no-cache，会绕过它。 */
 const READ_TTL_SEC = 300;
 const READ_CACHE = `public, max-age=0, s-maxage=${READ_TTL_SEC}, stale-while-revalidate=120`;
 
@@ -78,15 +65,15 @@ const json = (o, status = 200, cache = "no-store", pretty = false) =>
     headers: { ...JSON_HEADERS, "Cache-Control": cache },
   });
 
-/** 把 D1 层报错翻译成可执行的下一步，否则前端只看到空体 500。 */
+/** 把 D1 报错翻译成可执行的下一步。 */
 function dbErrorHint(msg) {
   const m = String(msg || "");
   if (/D1\s*绑定缺失/.test(m))
-    return "wrangler.toml 的 [[d1_databases]] 没随部署生效（database_id 为空串时 wrangler 会跳过绑定）。跑 npm run deploy 会自动建库并写回 database_id。";
+    return "wrangler.toml 的 [[d1_databases]] 没生效（database_id 为空时会被跳过）。跑 npm run deploy 自动建库。";
   if (/no such table/i.test(m))
-    return "D1 里没有表，且 Worker 的自动建表也没成功（正常情况下第一次请求就会自己补上结构）。先打开 /api/health?pretty=1 看 db_bound 与 missing_tables：绑定缺失会显示 db_bound:false；绑定正常却仍缺表，多半是 D1 写额度用尽或库已被删除。手工兜底：npx wrangler d1 execute <库名> --remote --file=schema.sql。";
+    return "库里没有表，且自动建表失败。先看 /api/health?pretty=1 的 db_bound；手工兜底：wrangler d1 execute <库名> --remote --file=schema.sql。";
   if (/no such column/i.test(m))
-    return "D1 表结构与 schema.sql 不一致（缺列）。schema.sql 全是 IF NOT EXISTS，不会给旧表补列：按提示 ALTER TABLE 补列，或换库名重建（会丢数据）。";
+    return "库结构与 schema.sql 不一致。IF NOT EXISTS 不会给旧表补列，按提示 ALTER TABLE 或换库名重建。";
   if (/no such (function|module)/i.test(m)) return "SQLite 版本能力不足，检查 wrangler.toml 的 compatibility_date。";
   return null;
 }
@@ -102,7 +89,7 @@ const hintOf = (e) => {
   return h ? { hint: h } : {};
 };
 
-/** 部署自检。默认只查绑定与版本；?deep=1 且已登录才查表结构与探针健康。 */
+/** 部署自检。默认只查绑定；?deep=1 且已登录才查表结构与探针健康。 */
 async function buildHealth(env, pwdConfigured, pretty, schema, opts = {}) {
   const deep = Boolean(opts.deep && opts.authed);
   const out = {
@@ -112,26 +99,13 @@ async function buildHealth(env, pwdConfigured, pretty, schema, opts = {}) {
     deep,
     password_set: Boolean(pwdConfigured),
     schema: {
-      expected_version: SCHEMA_VERSION,
-      // 本次自动补结构的结果：none 已是最新 / created 新建 / migrated 补了结构。
-      auto_applied:
-        schema && schema.ok
-          ? !schema.migrated
-            ? "none"
-            : schema.from < 0
-              ? "created"
-              : "repaired"
-          : "failed",
+      // created = 本次新建；ready = 已就位；failed = 建表失败
+      applied: schema && schema.ok ? (schema.created ? "created" : "ready") : "failed",
     },
     tables: [],
     missing_tables: [],
   };
 
-  if (deep && schema && schema.ok && schema.migrated) {
-    out.schema.statements = schema.statements;
-    out.schema.from_version = schema.from; // -1 全新库 / 0 旧库无标记 / N 从 N 升级
-    if (schema.backfill) out.schema.backfill = schema.backfill; // done=false 表示规模超限跳过
-  }
   if (schema && !schema.ok) {
     out.schema.error = schema.error;
     const h = dbErrorHint(schema.error);
@@ -196,23 +170,18 @@ function parseJsonOrNull(v) {
   }
 }
 
-/**
- * 探针健康快照。直接吃已经读到的 meta（rawSettings），零额外 D1 读。
- * 三件事必须能分开看：最后一次成功、最后一次失败、是否在 429 退避窗口内。
- */
+/** 探针健康快照，直接吃已读到的 meta。 */
 function probeHealthOf(raw) {
   const blocked = Number(raw?.gp_blocked_until || 0);
-  // 「最近一次尝试」= 成功与失败两个时间戳里较晚的那个（不再单独存一列，省一次写）
   const okAt = raw?.gp_last_ok_ts ? Date.parse(raw.gp_last_ok_ts) : 0;
   const errAt = raw?.gp_last_error_ts ? Date.parse(raw.gp_last_error_ts) : 0;
   const lastAt = Math.max(okAt || 0, errAt || 0);
   return {
-    last_checked_ts: lastAt ? new Date(lastAt).toISOString() : null,
+    last_checked_ts: lastAt ? minuteIso(lastAt) : null,
     last_ok_ts: raw?.gp_last_ok_ts || null,
     last_error: raw?.gp_last_error || null,
     last_error_ts: raw?.gp_last_error_ts || null,
-    // 只在仍处于退避窗口内时给时间：过期了还给，会让人以为还在等
-    blocked_until: blocked > Date.now() ? new Date(blocked).toISOString() : null,
+    blocked_until: blocked > Date.now() ? minuteIso(blocked) : null,
     quota: parseJsonOrNull(raw?.gp_quota),
   };
 }
@@ -244,8 +213,7 @@ async function withEdgeCache(request, ctx, ttl, producer, keyUrl) {
   const key = new Request(keyUrl || request.url, { method: "GET" });
   const cache = caches.default;
 
-  // 手动刷新必须绕过缓存：缓存 key 由参数归一化得出，客户端加时间戳换不掉它，
-  // 只能在这里显式短路，否则用户点「刷新」拿到的还是同一份副本。
+  // 客户端要求绕过缓存（刷新按钮）时直接回源
   const cc = String(request.headers.get("cache-control") || "").toLowerCase();
   const pragma = String(request.headers.get("pragma") || "").toLowerCase();
   const bypass = cc.includes("no-store") || cc.includes("no-cache") || pragma === "no-cache";
@@ -275,7 +243,7 @@ async function withEdgeCache(request, ctx, ttl, producer, keyUrl) {
   const status = res.status;
   const text = await res.text();
 
-  /** 只缓存 200，并原样返回原始状态码，否则 404 会被缓存成 200。 */
+  /** 只缓存 200，并原样返回原始状态码。 */
   const cacheable = status === 200 && !res.headers.get("set-cookie");
   const headers = cacheable
     ? { ...JSON_HEADERS, "Cache-Control": `public, max-age=0, s-maxage=${ttl}` }
@@ -285,7 +253,6 @@ async function withEdgeCache(request, ctx, ttl, producer, keyUrl) {
       };
 
   if (cacheable) {
-    // 用 await 而非 ctx.waitUntil：PUT 是本地同步操作，异步会跨请求边界留时序残影。
     try {
       await cache.put(key, new Response(text, { status: 200, headers }));
     } catch {}
@@ -432,7 +399,7 @@ function shouldCleanup(rawSettings) {
 async function noteCleanup(env, ok) {
   await saveSettings(env, [
     ["last_cleanup_ok", ok ? "1" : "0"],
-    ["last_cleanup_err_ts", ok ? "" : new Date().toISOString()],
+    ["last_cleanup_err_ts", ok ? "" : minuteIso()],
   ]).catch(() => {});
 }
 
@@ -574,10 +541,7 @@ function dayOffsetMs(env) {
   return min * 60000;
 }
 
-/**
- * 按 key 规范化取值。必须在写入侧拦：这些值直接进探测参数与降级判定，
- * 一个非法值（如 gp_timeout_sec="abc"）会让所有站点表现为全线故障。
- */
+/** 按 key 规范化取值，写入前拦截非法值。 */
 function normalizeSetting(k, v) {
   const def = SETTING_META[k]?.def ?? "";
   const num = (min, max) =>
@@ -588,7 +552,6 @@ function normalizeSetting(k, v) {
     case "slow_ms":
       return num(0, 60000);
     case "subreq_budget":
-      // 上限 35：免费层每次调用硬上限 50 个子请求，而一轮 cron 的 D1 往返另有 15~20 次。
       return num(1, 35);
     case "check_keep_days":
       return num(1, 365);
@@ -599,7 +562,6 @@ function normalizeSetting(k, v) {
     case "utc_offset_min":
       return num(-720, 840);
     case "gp_timeout_sec":
-      // Globalping 硬约束：整数秒 5–30，越界直接 422
       return num(5, 30);
     case "gp_ip_version":
       return v === "6" ? "6" : SETTING_META.gp_ip_version.def;
@@ -612,18 +574,14 @@ function normalizeSetting(k, v) {
     case "site_title":
       return v.slice(0, 60);
     case "globalping_token":
-      // 只进 Authorization 头，128 足够；防止误粘贴一整段文本把 meta 撑大
       return String(v ?? "").slice(0, 128);
     default:
-      // 新增设置项忘了写 case 时不能原样落库：超长/非法值会被每轮 cron 读出来用。
-      // 截断而不是抛错 —— 抛错会让整个设置保存失败，用户完全不知道是哪一项。
       return String(v ?? "").slice(0, 200);
   }
 }
 
-/** 会话签名密钥：优先 ADMIN_SECRET，否则用 D1 随机值；首次生成靠「先到先得」避免并发覆盖。 */
+/** 会话签名密钥：优先 ADMIN_SECRET，否则用 D1 随机值。 */
 async function sessionSecret(env, S) {
-  // 环境变量优先：让"轮换密钥 = 作废所有会话"这件事在部署侧可控
   if (env.ADMIN_SECRET) return env.ADMIN_SECRET;
   const s = S || (await loadSettings(env));
   if (s.session_secret) return s.session_secret;
@@ -640,7 +598,7 @@ async function sessionSecret(env, S) {
   return String(row?.value || mine);
 }
 
-/** 会话纪元：吊销所有已签发会话的唯一手段，与密钥来源无关；随 loadSettings 读出，零额外往返。 */
+/** 会话纪元：递增即作废所有已签发会话。 */
 function sessionEpoch(S) {
   const n = Number(S && S.session_epoch);
   return Number.isFinite(n) && n > 0 ? Math.trunc(n) : 0;
@@ -736,11 +694,7 @@ function validExpectCodes(v) {
   return /^\d{3}(,\d{3})*$/.test(s);
 }
 
-/**
- * 登录失败的第二道闸门（D1）。必须按 IP 分桶 —— 全局计数会让任何人用几次
- * 错误密码把管理员锁在门外。
- * 存储：meta.login_fail 一行 JSON `{ "<ip 哈希前16位>": [ts,...] }`。
- */
+/** 登录失败计数，存 meta.login_fail：{ "<ip 哈希前16位>": [ts,...] }。 */
 const LOGIN_MAX_FAILS = 8;
 const LOGIN_WINDOW_MS = 60_000;
 const LOGIN_MAX_KEYS = 64;
@@ -775,7 +729,7 @@ async function recordLoginFail(env, raw, key) {
   arr.push(now);
   map[key] = arr;
 
-  // 只留住最近活跃的 N 个来源：刷 IP 也无法让这一行无界膨胀。
+  // 只保留最近活跃的 N 个来源
   const keep = Object.keys(map)
     .filter((k) => recentFails(map[k], now).length > 0)
     .sort((a, b) => Math.max(...recentFails(map[b], now)) - Math.max(...recentFails(map[a], now)))
@@ -831,8 +785,8 @@ async function isAuthed(request, env, rawSettings, pwdConfigured) {
 
 /* ────────────────────────── 两阶段调度 ────────────────────────── */
 
-/** pending 最长存活时间：永不收尾的 pending 会让该站点永久静默停摆。 */
-const PENDING_TTL_MS = 180_000;
+/** pending 最长存活时间。created_ts 只到分钟，故留足余量。 */
+const PENDING_TTL_MS = 300_000;
 
 /**
  * 阶段一：收取上一轮发起的测量。
@@ -863,31 +817,17 @@ async function collectGlobalping(env, sitesIn) {
   const rows = [];
   const perSite = {};
   const doneIds = [];
-  // 证书随同一次测量回来 —— 攒起来最后一起写，避免每个站点一次独立往返
   const sslWrites = [];
-  // 被丢弃、且没有写检查记录的 pending。正常恒为空，非空即代表有异常需要排查。
-  const dropped = [];
-  // 本轮「发起了测量但拿不到结论」的站点：要累加 void_streak，让静默失效变成可见的降级。
-  // 只统计仍然存在的启用站点 —— 已删除站点的 pending 会在 cleanupOrphans 里清掉。
-  const voidSet = new Set();
-  // 本轮真正发出去的收取请求数（= 出网子请求消耗）。
-  // 返回给 dispatch 当作"已用额度"的起点 —— 否则预算只管发起、不管收取，
-  // 实际出网量会是预算的两倍，站点一多就撞免费层每次调用 50 个子请求的硬上限。
-  let fetched = 0;
-  // 收取侧 429：与 gpCreate 共用同一个 gp_blocked_until，避免"发起退避了、收取还在每分钟打"。
-  let blockedUntil = null;
-  // 还在跑 / 因限流本轮没打的 pending：交给 dispatch，省掉它自己再查一次 pending 表。
-  const remaining = [];
-  // 本轮收取的时刻：所有行的滞后都相对它算，不在循环里逐行取 now（会引入毫秒级噪音）
+  const dropped = []; // 被丢弃且没写检查记录的 pending
+  const voidSet = new Set(); // 拿不到结论的站点
+  let fetched = 0; // 本次收取的子请求数
+  let blockedUntil = null; // 收取侧 429 的退避截止
+  const remaining = []; // 仍在跑的 pending，交给 dispatch 复用
   const collectAt = Date.now();
-  // 「发起 → 回收」的最大滞后。正常 ≈ 一轮 cron（60 秒上下）；变成两轮说明
-  // 本轮投递得早、空窗期只有几秒，测量还没跑完，这条结果就晚一分钟落库。
-  let collectLagMs = 0;
+  let collectLagMs = 0; // 发起 → 回收的最大滞后
 
   for (const p of pending) {
-    // ── 兜底：存活过久的 pending 一律丢弃 ──
-    // 拿不到可解析的 created_ts 也一并丢弃：既然无法给它定上界，就当作可能永久占位处理，
-    // 代价只是多探一次，好过站点悄悄停摆。
+    // 超时或时间无法解析的 pending 直接丢弃
     const born = Date.parse(p.created_ts);
     if (!Number.isFinite(born) || Date.now() - born > PENDING_TTL_MS) {
       dropped.push({
@@ -932,7 +872,7 @@ async function collectGlobalping(env, sitesIn) {
         error: out.error,
       });
       if (byId[p.site]) voidSet.add(p.site);
-      // 限流是平台层面的问题，不是这个站点坏了：记下退避截止时间，让本轮的发起到下一轮都别再撞。
+      // 记录退避截止时间
       if (out.rateLimited) {
         blockedUntil = Math.max(blockedUntil || 0, Date.now() + Number(out.retryAfterMs || 60_000));
       }
@@ -959,19 +899,14 @@ async function collectGlobalping(env, sitesIn) {
     }
 
     const r0 = dec.pick;
-    // 票型标注：全通是常态，标了只是噪音（会让每行都变长）；出现分歧（如 1/3）
-    // 或有失败时才标 —— 那个数字恰是判断"链路在抖 vs 站点真挂了"的关键线索。
+    // 全通不标注，有分歧或失败才标 (1/3)
     const probeLabel =
       dec.ok && dec.unanimous
         ? r0.probe || null
         : `${r0.probe || "?"} (${dec.okCount}/${dec.total})`;
 
-    // 落库时间用「发起时刻」而不是「回收时刻」：回收时刻取决于测量跑多久、
-    // 我们哪一轮来收，会让相邻两条记录的时间差在 4/5/6 分钟之间跳。
-    // 发起时刻才是这次检查真正开始的那一刻，也是排期判据（isDue）使用的基准。
-    const firedAt = Number.isFinite(born)
-      ? new Date(born).toISOString()
-      : new Date(collectAt).toISOString();
+    // 用发起时刻而非回收时刻：后者随测量耗时摆动
+    const firedAt = minuteIso(Number.isFinite(born) ? born : collectAt);
     if (Number.isFinite(born)) collectLagMs = Math.max(collectLagMs, collectAt - born);
 
     rows.push({
@@ -994,8 +929,6 @@ async function collectGlobalping(env, sitesIn) {
       threshold: Number(site.fail_threshold || 3),
       source: p.source,
       probe: probeLabel,
-      // 逐站点传给 bumpState：一轮里多个 pending 的发起时刻各不相同，
-      // 用统一的 now 会把「排期网格时刻」和「回收时刻」混进同一列
       checkedAt: firedAt,
     };
     if (r0.tls) sslWrites.push([p.site, r0.tls]);
@@ -1022,19 +955,8 @@ async function collectGlobalping(env, sitesIn) {
 }
 
 /**
- * 本轮该不该查：判据是「距上次发起是否已满设定间隔」。
- *
- * 纯函数、无状态：只读 state.last_checked_ts，不保存「下次到期时刻」。
- * 存下来的排期会被一次写失败腐蚀，之后只能 fallback 猜锚点，一猜错就永久平移；
- * 纯函数没有可腐蚀的东西，写失败最多晚一轮重测（pending 挡着不会重复发起）。
- *
- * 不追求「落在固定的分钟上」。记录时刻跟随上一次的真实发起时刻，
- * 429 补测之后相位也跟着走（比如从 X0 变成 X2）——这是「上次时刻 + 间隔」
- * 这个语义的必然结果，不是缺陷。要固定相位就得改成绝对网格，
- * 代价是漏测时会在非网格时刻补出一次 7 分钟的间隔。
- *
- * 边界：last 缺失 / 不可解析 / 在未来（时钟错乱）一律判到期 ——
- * 宁可多测一次，也不能因为脏数据让站点永久停摆。
+ * 是否到期：距上次发起已满设定分钟数。
+ * 只比「分」，秒一律截掉；now 补 1 秒是因为 cron 在 :59.4 就触发。
  */
 function isDue(last, intervalMin, nowMs) {
   const ivMin = Math.max(1, Math.round(Number(intervalMin || 5)));
@@ -1044,18 +966,6 @@ function isDue(last, intervalMin, nowMs) {
   if (!Number.isFinite(ms)) return true;
   if (ms > now) return true; // 时钟错乱 / 未来时刻：别让站点停摆
 
-  // 语义：只看「分」，秒一律截掉。
-  //   09:41:59 属于 41 分，间隔 5 → 下一次在 46 分，即 09:46:xx 里任意时刻。
-  //   09:41:01 同样属于 41 分，结论完全一样。
-  //
-  // 为什么必须截断而不是按毫秒比：cron 只有 60 秒粒度，sched 固定在 :59.454，
-  // 加 0.5~1.5s 执行延迟后，发起时刻在整分前后 ±1 秒抖动。按毫秒比时，
-  // 299.6 秒和 300.4 秒会得到相反结论 —— 而它们本来就是同一轮。于是 300 秒
-  // 的间隔被向上取整成 360 秒，并且此后永久保持。
-  //
-  // now 额外 +1 秒再截断：cron 的「46 分这一轮」实际在 45:59.4 触发、
-  // 45:59.9 左右开始执行，截断后会被算成 45 分，永远差那 0.1 秒，
-  // 结果又变成每轮多等一分钟。进位 1 秒让它归入它真正负责的那一分钟。
   const lastMin = Math.floor(ms / 60_000);
   const nowMin = Math.floor((now + 1_000) / 60_000);
   return nowMin - lastMin >= ivMin;
@@ -1070,19 +980,7 @@ async function dueSites(env, sites) {
   return sites.filter((s) => isDue(lastOf.get(s.id), s.interval_min, now));
 }
 
-/**
- * 记录本轮 cron 的调度事实。**观测专用，任何失败都不能影响主流程。**
- *
- * 为什么要落库而不是只打日志：`checks` 只记「发起时刻」，而发起时刻 =
- * cron 触发时刻 + 执行耗时。于是这两种完全不同的情况会得到同一个时间戳：
- *
- *   cron 在 :58 触发，执行 4 秒 → 发起 09:06:02，秒数 2（其实是晚了一分钟）
- *   cron 在 :02 触发，执行 4 秒 → 发起 09:06:02，秒数 2（这一轮很准）
- *
- * 只看 checks 永远分不清，而两者的修法相反。Analytics 是分钟粒度、
- * `wrangler tail` 又常被网络挡住，所以必须把 scheduledTime 与 wokeAt 的差
- * 固定下来，让「cron 迟到」可以被证实或证伪。
- */
+/** 记录本轮调度事实，失败不影响主流程。 */
 async function logRound(env, row) {
   try {
     const d = await db(env);
@@ -1106,18 +1004,12 @@ async function logRound(env, row) {
       )
       .run();
   } catch {
-    // 表还没建（首次部署且迁移失败）或 D1 抖动：静默跳过。
-    // 观测失败绝不能变成新的故障点 —— 那会把"看不见问题"升级成"站不起来"。
+    // 观测失败不能变成新的故障点
   }
 }
 
 /**
  * 阶段二：发起本轮测量。
- * @param opts.alreadyUsed 已用于收取的子请求数
- * @param opts.raw         原始设置（读 gp_blocked_until）
- * @param opts.voided      本轮已计过"无结论"的站点
- * @param opts.pendingSites 仍未收完的站点，传了就不再查 pending
- * @param opts.blockedUntil 收取侧 429 的退避截止时间
  */
 async function dispatch(env, sites, opts = {}) {
   const budget = Number((env && env.SUBREQ_BUDGET) || 30);
@@ -1126,14 +1018,10 @@ async function dispatch(env, sites, opts = {}) {
   const raw = opts.raw || {};
   const alreadyVoid = new Set(opts.voided || []);
   const skipped = [];
-  // 发起失败的明细。rounds 里原本只有一个 failed_n 计数，事后只能知道
-  // 「这一轮失败了一个」，分不清 429 / 超时 / 5xx，也看不到限额剩多少。
-  // 攒起来随 rounds.err 落库，让下一次限流可以被直接归因，而不是靠反推。
-  const failures = [];
+  const failures = []; // 发起失败明细，随 rounds.err 落库
   const voidSites = [];
 
-  // 已挂起的站点本轮不再重复发起：上一轮的测量还没收，重发等于白花额度。
-  // 调用方已经读过 pending 时就复用那份结果 —— 每分钟一轮的 cron 里，省掉一次全表读。
+  // 已在 pending 里的站点跳过；调用方给过就用给的
   let pendingSites = Array.isArray(opts.pendingSites) ? opts.pendingSites : null;
   if (!pendingSites) {
     const { results: pend } = await d.prepare("SELECT site FROM pending").all();
@@ -1141,7 +1029,7 @@ async function dispatch(env, sites, opts = {}) {
   }
   const pendingSet = new Set(pendingSites);
 
-  // 429 退避窗口：窗口内一个都不发。否则每分钟都撞一次 429，日志刷满、结果一条没有。
+  // 429 退避窗口内一个都不发
   let blockedUntil = Math.max(
     Number(raw.gp_blocked_until || 0) || 0,
     Number(opts.blockedUntil || 0) || 0
@@ -1149,9 +1037,7 @@ async function dispatch(env, sites, opts = {}) {
   const blocked = blockedUntil > Date.now();
 
   const gpStarted = [];
-  // 本轮成功发起的 [site, 发起时刻]：攒起来一次 batch 写完。
-  const started = [];
-  // 写 last_checked_ts 失败时记在这里，随返回值透出到 cron 日志
+  const started = []; // 成功发起的 [site, 发起时刻]
   let scheduleError = null;
   let quota = null;
   let lastError = null;
@@ -1168,36 +1054,32 @@ async function dispatch(env, sites, opts = {}) {
     const s = sites[i];
     if (pendingSet.has(s.id)) continue;
     if (blocked) {
-      // 额度窗口内本轮不发起：这些站点这一轮同样没有任何结果，必须计入无结论，
-      // 否则额度耗尽时整页会一直显示"正常"，而实际上已经没人在测了。
-      // 排期不用管：它们仍然处于「已到期」，退避一结束下一轮立刻补上。
+      // 退避中：计为无结论，退避结束下一轮补上
       skipped.push(s.id);
       noteVoid(s.id);
       continue;
     }
     if (used + 1 > budget) {
-      // 预算不足：同理保持「已到期」，下一轮预算重置后自然补上。
+      // 子请求预算不足
       skipped.push(s.id);
       continue;
     }
     used += 1;
     try {
       const { id, source, quota: q } = await gpCreate(env, s);
-      const startedAt = new Date().toISOString();
+      const startedAt = minuteIso();
       await d
         .prepare(
           "INSERT OR REPLACE INTO pending (site, measurement_id, source, created_ts) VALUES (?,?,?,?)"
         )
         .bind(s.id, id, source, startedAt)
         .run();
-      // 发起即视为「已检查」（见下面的批量写入），结果字段不动。
-      // 排期不在这里算：下一轮由 last_checked_ts 派生，唯一来源、无状态可腐烂。
+      // 发起即视为已检查
       started.push([s.id, startedAt]);
       gpStarted.push({ site: s.id, id, source, quota: q });
       okCount++;
       if (q && (q.limit || q.remaining)) quota = q;
     } catch (e) {
-      // 发起失败不写 checks（我们对站点当时的可达性一无所知），下一轮重试
       const msg = String((e && e.message) || e);
       gpStarted.push({ site: s.id, error: msg });
       failCount++;
@@ -1206,13 +1088,12 @@ async function dispatch(env, sites, opts = {}) {
       failures.push({
         site: s.id,
         code: (e && e.code) || (e && e.gp && e.gp.status) || "error",
-        at: new Date().toISOString(),
+        at: minuteIso(),
         ...(e && e.gp ? { gp: e.gp } : {}),
         msg: msg.slice(0, 160),
       });
 
-      // 额度用尽：立刻停止本轮后续发起（同一份额度，再试必然还是 429），
-      // 并把退避截止时间写进 meta，让下一分钟的 cron 直接跳过。
+      // 429：停止本轮后续发起并记退避
       if (e && e.code === "rate_limit") {
         blockedUntil = Math.max(blockedUntil, Date.now() + Number(e.retryAfterMs || 60_000));
         for (let j = i + 1; j < sites.length; j++) {
@@ -1225,10 +1106,9 @@ async function dispatch(env, sites, opts = {}) {
     }
   }
 
-  // 探针健康：不写的话，出问题时只能翻 cron 日志（而日志默认只留 3 天）。
-  // 只在「本轮真的尝试过」时写，空转的 cron 一分钟一行都不写。
+  // 探针健康快照，只在本轮真尝试过时写
   const entries = [];
-  const nowIso = new Date().toISOString();
+  const nowIso = minuteIso();
   if (okCount) entries.push(["gp_last_ok_ts", nowIso]);
   if (lastError) {
     entries.push(["gp_last_error", lastError.slice(0, 240)]);
@@ -1239,10 +1119,9 @@ async function dispatch(env, sites, opts = {}) {
   if (quota) entries.push(["gp_quota", JSON.stringify(quota)]);
   if (blockedUntil > Date.now()) entries.push(["gp_blocked_until", String(blockedUntil)]);
   else if (raw.gp_blocked_until) entries.push(["gp_blocked_until", ""]);
-  // 一次 batch：几行 meta 不该变成几次往返
   if (entries.length) await saveSettings(env, entries).catch(() => {});
 
-  // 一次 batch 写「上次发起时刻」。发起失败的不在这里（保持原值，下一轮重试）。
+  // 写「上次发起时刻」；发起失败的不动，下一轮重试
   if (started.length) {
     await d
       .batch(
@@ -1256,8 +1135,6 @@ async function dispatch(env, sites, opts = {}) {
         )
       )
       .catch((e) => {
-        // 写失败仍然要可见：虽然下一轮能自愈（pending 挡着重复发起），
-        // 但连续失败意味着 dueSites 会反复把这些站点判为到期。
         scheduleError = String((e && e.message) || e);
       });
   }
@@ -1273,19 +1150,18 @@ async function dispatch(env, sites, opts = {}) {
     voided: voidSites.length,
     blocked_until: blockedUntil > Date.now() ? blockedUntil : null,
     quota,
-    // 非 null 表示 last_checked_ts 没写进去：这些站点下一轮会被判为「已到期」重试，
-    // 由 pending 挡住重复发起，不会真的多点一次
+    // 非 null = last_checked_ts 没写进去，下一轮会重试
     scheduleError,
   };
 }
 
 /**
- * 手动测试落库，不推动调度、不累加 consecutive_fail。
- * 必须串行：bumpDailyManual 依赖明细已写入才能数连续失败段。
+ * 手动测试落库。不推动调度、不累加 consecutive_fail。
+ * 必须串行：bumpDailyManual 依赖明细已写入。
  */
 async function persistManualTest(env, site, { source, probe, result }) {
   const v = judge(site, result);
-  const ts = new Date().toISOString();
+  const ts = minuteIso();
   const row = {
     ts,
     site: site.id,
@@ -1297,19 +1173,15 @@ async function persistManualTest(env, site, { source, probe, result }) {
     total_ms: result?.total ?? 0,
     error: v.reason,
   };
-  // ① 明细：后续两步都依赖它（色条要靠它数连续段）
   await insertChecks(env, [row]);
 
-  // ② 状态快照：让首页/后台立刻反映这次手动测试。
-  //    刻意不碰 consecutive_fail 与 last_checked_ts（那是调度用的）。
+  // 状态快照；不碰 consecutive_fail 与 last_checked_ts
   let voidStreakReset = true;
   await upsertLastResult(env, row).catch(() => {
     voidStreakReset = false;
   });
 
-  // ③ 按天汇总：否则「24h 可用率」含手动测试、而 30 天色条不含，
-  //    手动测失败会让可用率掉一截、色条却一点都不变 —— 同一个站点两套口径。
-  //    失败不再静默：写不进去时把原因回给前端，而不是让色条莫名其妙不动。
+  // 按天汇总，与自动探测同一口径
   let daily = { run: 0 };
   let dailyError = null;
   try {
@@ -1318,8 +1190,7 @@ async function persistManualTest(env, site, { source, probe, result }) {
     dailyError = String((e && e.message) || e);
   }
 
-  // ④ 证书：这次测量本来就把 tls 抓回来了，不写等于让后台的证书列停留在旧值
-  //    （手动测往往是"我就想看看现在怎么样"）。与自动探测同一约定：只有握手成功才写。
+  // 证书：只在握手成功时写
   if (result?.tls) await saveSsl(env, site.id, result.tls).catch(() => {});
 
   return {
@@ -1371,10 +1242,7 @@ export default {
       );
     }
 
-    /* ── 站点设置 + 认证闸门 ──────────────────────────────────────────
-       设置存 D1 且优先级高于环境变量；合并回 env 后，下游所有 `env.XXX` 读取
-       自动变成「D1 设置 → 环境变量 → 代码默认」，不必在每个调用点改成读设置。 */
-    // 这一步在 try 之外必须自己兜住：异常逃出 fetch 只会得到空体 500。
+    // 设置存 D1，合并回 env 后下游直接读 env.XXX
     let rawSettings;
     try {
       rawSettings = await loadSettings(env);
@@ -1386,9 +1254,7 @@ export default {
         pretty
       );
     }
-    // 密码只认环境变量 ADMIN_PASSWORD（wrangler secret / Dashboard Variables）。
-    // 不做后台可改密码：那样就得在 D1 里存哈希、还要处理"改了密码如何作废旧会话"，
-    // 而密码本就属于部署期配置，放环境变量更简单也更容易审计。
+    // 密码只认环境变量 ADMIN_PASSWORD，不支持后台改
     const pwdConfigured = Boolean(env.ADMIN_PASSWORD);
 
     const authed = await isAuthed(request, env, rawSettings, pwdConfigured);
@@ -1418,9 +1284,7 @@ export default {
       }
     }
 
-    // 跨站写请求一律拒 —— 放在 认证之后：先回答"你有没有权限"（401 / 403），
-    // 再回答"这个请求从哪来"。反过来的话，明明是没登录，却收到"跨站请求被拒绝"，
-    // 排查起来会被带偏。也放在下面的 bumpConfigVersion 之前，避免无谓的 D1 写。
+    // 跨站写请求一律拒（放在认证之后，先回答有没有权限）
     if (request.method !== "GET" && request.method !== "HEAD" && !sameOriginOk(request, url)) {
       return json(
         { ok: false, error: "跨站请求被拒绝（同源校验失败）" },
@@ -1430,7 +1294,7 @@ export default {
       );
     }
 
-    // 只有真会改配置的写接口才递增配置版本，否则登录失败也会清空全机房缓存。
+    // 只有真会改配置的写接口才递增配置版本
     const isWrite = request.method !== "GET" && request.method !== "HEAD";
     if (isWrite && WRITE_APIS.has(api)) {
       await bumpConfigVersion(env);
@@ -1443,9 +1307,7 @@ export default {
         if (request.method !== "POST") {
           return json({ ok: false, error: "仅支持 POST" }, 405, "no-store", pretty);
         }
-        // 未配密码 → 说清原因就收工。不要落到下面的"密码错误"分支：
-        // 那会记一次登录失败（多试几次还会把 IP 拉黑），而真正的问题在部署配置，
-        // 跟用户输什么完全无关。
+        // 未配密码：直接说清原因，不计失败
         if (!pwdConfigured) {
           return json(
             { ok: false, error: "未设置管理员密码，后台已停用", need_setup: true },
@@ -1455,8 +1317,7 @@ export default {
           );
         }
         const ip = request.headers.get("cf-connecting-ip") || "unknown";
-        // 失败计数按来源 IP 分桶（不落明文地址，只存哈希前 16 位）。
-        // 全局计数会让任何人用 8 次错误密码把管理员锁在门外，见 loginBlocked 的注释。
+        // 失败计数按来源 IP 分桶，只存哈希前 16 位
         const ipKey = (await sha256Hex(ip)).slice(0, 16);
         // 第一道：内存限速（isolate 复用时零成本）
         if (!loginLimiter.check(ip)) {
@@ -1479,13 +1340,12 @@ export default {
 
         const body = await request.json().catch(() => ({}));
         const input = String(body.password || "");
-        // 限制长度：constantTimeEqual 会逐字节遍历，超大 body 足以烧穿 CPU 配额。
+        // 限制长度：常量时间比较会逐字节遍历
         if (input.length > 256) {
           return json({ ok: false, error: "密码长度非法" }, 400, "no-store", pretty);
         }
 
-        // 兜底：走到这里说明 pwdConfigured 为真（上面已拦下未配置的情况），
-        // 仍保留 `expected.length > 0` —— 空密码永不匹配，避免任何意外路径放行空串。
+        // 空密码永不匹配
         const expected = env.ADMIN_PASSWORD || "";
         const pass = expected.length > 0 && constantTimeEqual(input, expected);
 
@@ -1495,17 +1355,8 @@ export default {
           return json({ ok: false, error: "密码错误" }, 401, "no-store", pretty);
         }
 
-        // 登录成功 → 清掉本 IP 的失败计数（有记录才写，避免无谓的 D1 写）。
-        // 顺带删除旧版全局计数键 —— 升级前留下的行留着也会被旧部署读到。
-        if (rawSettings.login_fail || rawSettings.login_fail_window || rawSettings.login_fail_count) {
-          await clearLoginFail(env, rawSettings, ipKey).catch(() => {});
-          if (rawSettings.login_fail_window || rawSettings.login_fail_count) {
-            await saveSettings(env, [
-              ["login_fail_window", ""],
-              ["login_fail_count", ""],
-            ]).catch(() => {});
-          }
-        }
+        // 登录成功 → 清掉本 IP 的失败计数
+        if (rawSettings.login_fail) await clearLoginFail(env, rawSettings, ipKey).catch(() => {});
         loginLimiter.reset(ip);
         const token = await issueSession(
           await sessionSecret(env, rawSettings),
@@ -1526,13 +1377,12 @@ export default {
       if (api === "logout") {
         const bodyP = request.json().catch(() => ({}));
         const body = await bodyP;
-        /** 登出并作废所有会话：会话无状态，只能让旧签名验不过 + 纪元 +1。 */
+        /** 登出；body.all=true 时作废所有会话（需已登录）。 */
         let revoked = false;
-        // 「登出所有设备」要求已登录，否则任何人可反复踢掉管理员。
         if (body.all === true && authed) {
           const ep = await bumpSessionEpoch(env);
           revoked = ep !== null;
-          // 只在真的会被读取时才轮换（省一次 D1 写；配了 ADMIN_SECRET 时写了也没人看）
+          // 配了 ADMIN_SECRET 时不轮换（写了也没人读）
           if (revoked && !env.ADMIN_SECRET) {
             await saveSetting(env, "session_secret", randomHex(32)).catch(() => {});
           }
@@ -1553,13 +1403,13 @@ export default {
         if (request.method === "POST") {
           const body = await request.json().catch(() => ({}));
           const saved = [];
-          // 先把所有键规范化收集起来，最后一次 batch 落库（原先每个键一次 D1 往返）
+          // 收集后一次 batch 落库
           const entries = [];
 
           for (const k of SETTING_KEYS) {
             if (!(k in body)) continue;
             const v = body[k];
-            // token 传 __KEEP__ 或空 → 视为「不修改」，避免每次保存都把已配置的 token 清掉
+            // __KEEP__ 或空 = 不修改
             if (k === "globalping_token" && (v === "__KEEP__" || v === null || v === undefined)) {
               continue;
             }
@@ -1574,9 +1424,7 @@ export default {
 
           await saveSettings(env, entries);
 
-          // 密码不在这里改 —— 它只来自环境变量 ADMIN_PASSWORD，
-          // 改密码 = 改 Cloudflare 上的变量/secret 后重新部署，不需要（也不该）走后台。
-          // 配置版本由入口处的 WRITE_APIS 统一递增，这里不再重复 bump 一次。
+          // 密码不在这里改
           return json({ ok: true, saved }, 200, "no-store", pretty);
         }
 
@@ -1584,13 +1432,12 @@ export default {
         return json({ ok: true, settings: publicSettings(env, rawSettings) }, 200, "no-store", pretty);
       }
 
-      // ── 前台一次性取全量：统计卡 + 分组 + 每站点 30 天色条 + SSL ──
-      // 刻意做成"单接口返回全部"，避免前端对 N 个站点发 N 个请求
+      // ── 前台一次性取全量：统计 + 分组 + 色条 + SSL ──
       if (api === "overview") {
-        // days 必须钳制：公开接口，每个不同 days 都是独立缓存条目，可用于灌满边缘缓存。
+        // days 必须钳制：每个取值都是独立缓存条目
         const maxD = maxDays(env);
         const days = queryInt(url.searchParams.get("days"), Math.min(30, maxD), 1, maxD);
-        // 缓存 key 带上配置版本：后台一改配置版本就 +1，所有机房的旧 key 立即不再命中
+        // 缓存 key 带配置版本，改配置即失效
         const ver = configVersionOf(rawSettings);
         const keyUrl = `${url.origin}/api/overview?days=${days}&pretty=${pretty ? 1 : 0}&v=${ver}`;
         return await withEdgeCache(request, ctx, READ_TTL_SEC, async () => {
@@ -1605,11 +1452,7 @@ export default {
           // 可用率口径：最近 24 小时（滚动），与详情页趋势图同一个窗口。
           const since24 = new Date(Date.now() - 86400000).toISOString();
 
-          // 站点/状态/证书/分类一次 JOIN。
-          // 24h 聚合改成「先 GROUP BY 算一遍，再 JOIN 回来」：
-          // 原先每个站点带两个相关子查询（COUNT + SUM），同一段索引要扫两遍，
-          // 其中 SUM(ok) 那遍还得回表 —— 单站 ≈576 行。改成子查询后走
-          // idx_checks_ts_site_ok 做一次覆盖扫描（不回表），总读量减半且只有一次扫描。
+          // 站点/状态/证书/分类一次 JOIN；24h 聚合走覆盖索引
           const siteRows = await d
             .prepare(
               `SELECT s.id, s.name, s.url, s.group_name,
@@ -1643,35 +1486,24 @@ export default {
             .bind(UNGROUPED, since24)
             .all();
 
-          // 30 天色条：每站每格 1 行，仍是一次小范围读（与明细量无关）。
+          // 30 天色条
           const dayRows = await d
             .prepare(`SELECT site, day, n, ok, max_fail_run FROM checks_daily WHERE day >= ?`)
             .bind(axis[axis.length - 1])
             .all();
-          // 24h 聚合已经并入上面的 siteRows —— 这里只做形状适配，下游不必改。
-          const u24 = {
-            results: (siteRows.results || [])
-              .filter((r) => r.u_n !== null && r.u_n !== undefined)
-              .map((r) => ({ site: r.id, n: r.u_n, ok: r.u_ok })),
-          };
-
           const bySite = {};
           for (const r of dayRows.results || []) {
             (bySite[r.site] = bySite[r.site] || {})[r.day] = r;
           }
 
-          // 每站点「最近 24 小时」可用率 + 全局分子/分母。
-          // 只累计 enabled 站点（siteRows 已过滤）—— 已暂停站点的历史明细
-          // 不能进分母，否则统计卡会和下面的列表对不上。
-          const enabledIds = new Set((siteRows.results || []).map((s) => s.id));
+          // 每站点 24h 可用率 + 全局分子/分母
           const u24map = {};
           let n24 = 0;
           let ok24 = 0;
-          for (const r of u24.results || []) {
-            if (!enabledIds.has(r.site)) continue;
-            const un = Number(r.n || 0);
-            const uok = Number(r.ok || 0);
-            u24map[r.site] = un ? Math.round((uok / un) * 1000) / 10 : null;
+          for (const r of siteRows.results || []) {
+            const un = Number(r.u_n || 0);
+            const uok = Number(r.u_ok || 0);
+            u24map[r.id] = un ? Math.round((uok / un) * 1000) / 10 : null;
             n24 += un;
             ok24 += uok;
           }
@@ -1681,8 +1513,7 @@ export default {
           for (const s of siteRows.results || []) {
             const map = bySite[s.id] || {};
             const uptime24 = u24map[s.id] ?? null;
-            // 色条颜色与「故障记录」同一口径：当天出现「连续失败 ≥ fail_threshold」
-            // 的段才标红（fault）；只有零星抖动的天标黄（blip）。
+            // 有连续失败段标红，零星抖动标黄
             const thr = Number(s.fail_threshold || 3);
             const bars = axis.map((dkey) => {
               const c = map[dkey];
@@ -1734,21 +1565,18 @@ export default {
             }
           }
           const total = seen.size;
-          // 一条数据都没有时给 null（前端显示 --），不要给 100：
-          // 刚部署、还没跑过一轮的实例，第一屏就是「24 小时可用率 100%」，
-          // 那是编出来的满分，和详情页的「暂无数据」自相矛盾。
+          // 无数据给 null，不给 100
           const uptime = n24 ? Math.round((ok24 / n24) * 1000) / 10 : null;
 
           return json(
             {
               ok: true,
-              now: new Date().toISOString(),
+              now: minuteIso(),
               // 前台需要的展示类设置（改完靠 config_version 换缓存 key 立即生效）
               settings: {
                 default_theme: rawSettings.default_theme || defOf("default_theme"),
                 site_title: rawSettings.site_title || defOf("site_title"),
-                // 降级阈值必须回显给前台页脚：页脚文案要按实际配置写，
-                // 否则后台把 ssl_warn_days 改成别的值后，页面还在说 "≤14 天"。
+                // 页脚文案要按实际配置写
                 ssl_warn_days: sslWarnDays(env),
               },
               stats: {
@@ -1772,20 +1600,17 @@ export default {
       if (api === "site") {
         const id = url.searchParams.get("id");
         if (!id) return json({ ok: false, error: "缺少 id 参数" }, 400, "no-store", pretty);
-        // 先校验格式再查库，避免用噪声 id 白跑查询
         if (!validSiteId(id)) {
           return json({ ok: false, error: "站点不存在" }, 404, "no-store", pretty);
         }
 
-        // 色条天数上限与明细保留期联动
         const maxD = maxDays(env);
-        // days / recent / incident 都会进缓存 key，公开可调会让缓存被刷爆，
-        // 所以只允许已登录的管理员覆盖。
+        // 这几个参数进缓存 key，只允许登录后覆盖
         const canTune = authed;
         const daysFor = canTune
           ? queryInt(url.searchParams.get("days"), Math.min(30, maxD), 1, maxD)
           : Math.min(30, maxD);
-        // 「最近检查」条数：后台设置 recent_limit（默认 20），登录后 ?recent= 可临时覆盖
+        // 「最近检查」条数：后台设置 recent_limit，登录后 ?recent= 可临时覆盖
         const recentN = canTune
           ? clampInt(
               url.searchParams.get("recent") || env.RECENT_LIMIT || defOf("recent_limit"),
@@ -1794,7 +1619,7 @@ export default {
               Number(defOf("recent_limit"))
             )
           : clampInt(env.RECENT_LIMIT || defOf("recent_limit"), 5, 200, Number(defOf("recent_limit")));
-        // 「故障记录」显示条数：纯展示上限，后台可改（默认 10）
+        // 「故障记录」显示条数
         const incidentN = clampInt(
           env.INCIDENT_LIMIT || defOf("incident_limit"),
           1,
@@ -1802,7 +1627,6 @@ export default {
           Number(defOf("incident_limit"))
         );
         const verS = configVersionOf(rawSettings);
-        // 这三个参数决定响应体内容，必须进缓存 key
         const keyUrl = `${url.origin}/api/site?id=${encodeURIComponent(
           id
         )}&days=${daysFor}&recent=${recentN}&incident=${incidentN}&pretty=${
@@ -1816,8 +1640,7 @@ export default {
             .toISOString()
             .slice(0, 10);
 
-          // 先取元信息：站点不存在时直接 404；窗口起点决定后续桶宽。
-          // MIN(ts) 走 (site, ts) 索引最左端，是一次 O(1) 查找，不扫行。
+          // 元信息。MIN(ts) 走 (site, ts) 索引最左端，不扫行。
           const meta = await d
             .prepare(
               `SELECT s.id, s.name, s.url, s.group_name,
@@ -1849,27 +1672,25 @@ export default {
             return json({ ok: false, error: `站点不存在：${id}` }, 404, "no-store", pretty);
           }
 
-          // 窗口右端取最后一次检查（用 now 收尾会让曲线看起来停在一小时前），左端再往前 24h
+          // 窗口右端取最后一次检查，左端再往前 24h
           const nowSec = Math.floor(Date.now() / 1000);
           const firstSec = meta.first_check ? Math.floor(Date.parse(meta.first_check) / 1000) : 0;
           const lastSec = meta.last_check ? Math.floor(Date.parse(meta.last_check) / 1000) : 0;
-          // 没有记录时退化成 now（前端显示"暂无数据"），有记录则严格收在最后一条上
           const endSec = lastSec > 0 ? Math.min(nowSec, lastSec) : nowSec;
           const startSec =
             firstSec > 0
-              ? Math.max(endSec - TREND_HOURS * TREND_BUCKET_SEC, firstSec) // 老站点仍按 24h
-              : endSec - TREND_HOURS * TREND_BUCKET_SEC; // 一条记录都没有
-          // 真实跨度：0 表示只有一条记录（或一条都没有），此时不该虚构时间轴
+              ? Math.max(endSec - TREND_HOURS * TREND_BUCKET_SEC, firstSec)
+              : endSec - TREND_HOURS * TREND_BUCKET_SEC;
+          // 0 表示只有一条记录（或没有），此时不虚构时间轴
           const realSpanSec = Math.max(0, endSec - startSec);
           const spanSec = Math.max(60, realSpanSec);
-          // 槽宽 = max(监测间隔, 跨度/24)：既限制槽数，又避免大量空槽
+          // 槽宽 = max(监测间隔, 跨度/24)：限制槽数，同时避免大量空槽
           const ivSec = Math.max(60, Math.round(Number(meta.interval_min || 5) * 60));
           const bucketSec = Math.max(ivSec, Math.ceil(spanSec / TREND_HOURS));
           const nBuckets = Math.max(1, Math.min(TREND_HOURS, Math.ceil(spanSec / bucketSec)));
           const since = new Date(startSec * 1000).toISOString();
 
-          // 三段 UNION ALL：序列分桶 / 最近 N 条 / 状态翻转点。
-          // 列类型必须一致（SQLite 按首段定亲和性），聚合列显式 CAST。
+          // 三段 UNION ALL：序列分桶 / 最近 N 条 / 状态翻转点。列类型按首段定，聚合列显式 CAST。
           const [trend, dayRows] = await Promise.all([
             d
               .prepare(
@@ -1879,7 +1700,7 @@ export default {
                    WHERE site = ?1 AND ts >= ?2
                  ),
                  bucketed AS (
-                   SELECT MIN(?4, CAST((?5 - strftime('%s', substr(ts,1,19))) / ?3 AS INTEGER)) AS b,
+                   SELECT MIN(?4, CAST((?5 - strftime('%s', ts)) / ?3 AS INTEGER)) AS b,
                           COUNT(*) AS n, SUM(ok) AS okl,
                           AVG(CASE WHEN ok=1 THEN ttfb_ms END) AS av,
                           MAX(CASE WHEN ok=1 THEN ttfb_ms END) AS mx,
@@ -1901,7 +1722,7 @@ export default {
                         CAST(okl AS INTEGER) AS okl,
                         av, mx,
                         CAST(tsum AS INTEGER) AS tsum,
-                        -- 与首段类型对齐：统一用 TEXT 兜住所有字符串列
+                        -- 与首段类型对齐
                         CAST(NULL AS TEXT) AS ts, NULL AS ok, NULL AS status,
                         NULL AS ttfb_ms, NULL AS total_ms,
                         CAST(NULL AS TEXT) AS source, CAST(NULL AS TEXT) AS probe,
@@ -1921,7 +1742,7 @@ export default {
               )
               .bind(id, since, bucketSec, nBuckets - 1, endSec, recentN)
               .all(),
-            // 按天汇总来自物化表 checks_daily，不再扫明细（30 天从 4 万行降到 30 行）。
+            // 按天汇总走物化表 checks_daily，不扫明细
             d
               .prepare(
                 `SELECT day, n, ok, max_fail_run
@@ -1931,7 +1752,7 @@ export default {
               .all(),
           ]);
 
-          // 把合并结果拆回三个形状，下游一行代码都不用改。
+          // 拆回三个形状
           const trendRows = trend.results || [];
           const seriesRows = { results: trendRows.filter((r) => r.kind === "bucket") };
           const recentRows = {
@@ -1947,7 +1768,7 @@ export default {
 
           const { state, degrade_reason, ssl } = stateOf(meta, env);
 
-          // 槽 → 边界点：n 个槽对应 n+1 个点，值取右侧槽；空槽保留为断口
+          // 槽 → 边界点：n 个槽对应 n+1 个点，值取右侧槽，空槽保留为断口
           const byB = new Map();
           for (const r of seriesRows.results || []) byB.set(Number(r.b), r);
 
@@ -1960,8 +1781,7 @@ export default {
             tsum += Number(r.tsum || 0);
           }
 
-          // 端点用**精确时间**（带毫秒）：末点必须和 window.last_check_ts 完全一致，
-          // 否则前端写「截至 HH:MM:SS」与末点会差几百毫秒。
+          // 端点用精确时间，末点必须和 window.last_check_ts 一致
           const startMs = startSec * 1000;
           const endMs =
             lastSec > 0
@@ -1972,7 +1792,7 @@ export default {
             t: new Date(tMs).toISOString(),
             n: r ? Number(r.n || 0) : 0,
             ok: r ? Number(r.okl || 0) : 0,
-            // v = 该槽成功请求的平均延迟；整槽全失败或空槽为 null（前端在此断线）
+            // v = 该槽成功请求的平均延迟；整槽全失败或空槽为 null（前端断线）
             v: r && r.av != null ? Number(r.av) : null,
             max: r && r.mx != null ? Number(r.mx) : null,
           });
@@ -1980,41 +1800,31 @@ export default {
           const series = [];
           if (lastSec > 0) {
             if (realSpanSec <= 0) {
-              // 只有一条记录：就画一个点。为了凑时间轴而虚构 24 小时的跨度，
-              // 会让一个点孤零零贴在左边或右边，反而像数据丢了。
+              // 只有一条记录：只画一个点，不虚构跨度
               series.push(mkPoint(endMs, byB.get(0)));
             } else {
               for (let i = 0; i <= nBuckets; i++) {
-                // i 从左端往右；槽从左到右是 b = nBuckets-1 … 0。
-                // 最后一个边界右边没有槽了，沿用最右槽（b=0），所以最右 1 小时是平的
-                // —— 那正是这一段的数据，不是补出来的。
+                // 最后一个边界右边没有槽，沿用 b=0
                 const b = i === nBuckets ? 0 : nBuckets - 1 - i;
                 series.push(mkPoint(Math.round(startMs + i * stepMs), byB.get(b)));
               }
             }
           }
-          // 一条记录都没有时 series 为空，前端显示「暂无数据」——
-          // 不下发一排 n=0 的假点，那只会让人以为"测过但全挂了"。
-          // 均值 = Σ(成功请求的 ttfb) / 成功次数 —— 精确，不是"各槽均值的平均"
+          // 无记录时 series 为空，前端显示「暂无数据」
+          // 均值 = Σ成功 ttfb / 成功次数
           const avgTtfb = okl ? Math.round(tsum / okl) : null;
 
           const intervalMin = Number(meta.interval_min || 5);
 
-          // 故障段：连续失败条数 ≥ fail_threshold。次数按区间 COUNT(*) 实算，
-          // 不能用时长倒推（5 分钟间隔的单次失败会被算成 0~1 次）。
+          // 故障段：连续失败条数 ≥ fail_threshold
           const failThreshold = Number(meta.fail_threshold || 3);
           const evtsAll = [];
           {
-            // 取窗口内所有失败行（按 ts 升序）与所有成功行的 ts，用于切段
             const rows = (changeRows.results || [])
               .slice()
               .sort((a, b) => (a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0));
-            // changeRows 只有翻转点，但「一段失败」至少有一个翻转点作为起点；
-            // 结束点要么是下一个翻转点（成功），要么仍在进行中。
-            let run = null; // { start, end, error, n }
-            // ⚠️ 这里**不能**按 run.n 过滤：run.n 只数到翻转点，中间的连续失败行
-            // 不在 changeRows 里（它只含翻转点）。真实次数要等下面按区间查 checks 才知道，
-            // 所以这里先把所有段都留下来，过滤放到拿到真实计数之后。
+            let run = null;
+            // 不按 run.n 过滤：它只数到翻转点，真实次数由下面按区间查 checks 得出
             const push = () => {
               if (run) evtsAll.push(run);
               run = null;
@@ -2029,16 +1839,11 @@ export default {
                 push();
               }
             }
-            // 仍在故障中（没有后续成功点）：end 留空，由下面的 nFail 计算兜住"至少 1 次"。
+            // 仍在故障中：end 留空，下面按「至少 1 次」兜住
             if (run) push();
           }
 
-          // 上面的 n 是「翻转点条数」，不等于真实失败次数 —— 中间的连续失败行不会出现在
-          // changeRows 里。所以还要按段区间数真实记录，判定与展示都用这个数。
-          //
-          // 但不能再「每段一条 COUNT(*)」：段数最多等于故障记录条数，等于 10 次串行往返，
-          // 而它们扫过的行数总和与下面这一次查询完全相同 —— 纯亏往返。
-          // 一次取回窗口内所有失败行的时间戳，段升序且互不相交，双指针即可计数。
+          // 一次取回窗口内所有失败行时间戳，段升序且互不相交，双指针计数
           const failTs = (
             (
               await d
@@ -2051,14 +1856,13 @@ export default {
             ).results || []
           ).map((r) => r.ts);
 
-          const endNow = new Date().toISOString();
-          let fi = 0; // failTs 上的游标：段按时间升序，只往前走
+          const endNow = minuteIso();
+          let fi = 0;
           const evts = evtsAll.map((e) => {
             const endIso = e.end || endNow;
             while (fi < failTs.length && failTs[fi] < e.start) fi++;
             let j = fi;
             while (j < failTs.length && failTs[j] <= endIso) j++;
-            // [start, end] 内全是失败行，j - fi 就是真实失败次数
             const nFail = Math.max(1, j - fi || Number(e.n) || 1);
             fi = j;
             const t0 = Date.parse(e.start);
@@ -2069,21 +1873,19 @@ export default {
               ongoing: !e.end,
               duration_s: Math.max(0, Math.round((t1 - t0) / 1000)),
               error: e.error,
-              checks: nFail, // 真实失败次数
+              checks: nFail,
               reached: nFail >= failThreshold,
             };
           });
 
           const shown = evts
-            // 未达阈值的单次抖动不算故障事件（与色条 red/yellow 的判据同一个）
+            // 未达阈值的单次抖动不算故障
             .filter((e) => e.ongoing || e.reached)
-            // 上面的遍历是按时间正序，这里翻成最新在前，再按设置只留最近 N 条
             .reverse()
             .slice(0, incidentN);
 
-          // 30 天色条（最左最新 → 最右最早，与首页一致）
-          // 颜色语义与「故障记录」一致：只有出现「连续失败 ≥ fail_threshold」的段才算
-          // 真故障（红，fault）；只有零星抖动的天是黄（blip），不再一律涂红。
+          // 色条：最左最新 → 最右最早
+          // 与「故障记录」同口径：连续失败 ≥ fail_threshold 才算红，零星抖动为黄
           const dayMap = {};
           for (const r of dayRows.results || []) dayMap[r.day] = r;
           const bars = [];
@@ -2110,8 +1912,7 @@ export default {
           return json(
             {
               ok: true,
-              now: new Date().toISOString(),
-              // 详情页也要页头品牌名一致，所以一并带上展示类设置
+              now: minuteIso(),
               settings: {
                 site_title: rawSettings.site_title || defOf("site_title"),
                 default_theme: rawSettings.default_theme || defOf("default_theme"),
@@ -2119,7 +1920,7 @@ export default {
               site: {
                 id: meta.id,
                 name: meta.name,
-                // 与 /api/overview 同一口径：隐藏地址的站点不下发 url（见那边的注释）
+                // 隐藏地址的站点不下发 url
                 url: meta.hide_url ? null : meta.url,
                 hide_url: !!meta.hide_url,
                 group_name: meta.group_name || UNGROUPED,
@@ -2144,27 +1945,17 @@ export default {
                 error: meta.last_error,
               },
               ssl,
-              // 只下发前端真正显示的几个数（KPI 卡「可用率」+ 图下方那行说明）。
-              // since / bucket_sec / ok 从没被读过 —— 每多下发一个字段，缓存条目就大一分，
-              // 而这份响应是要经过边缘缓存、按请求体量计费的。
+              // 只下发前端真正显示的数：响应要过边缘缓存，按体积计费
               window: {
                 hours: TREND_HOURS,
-                // 实际跨度：满 24 小时就是 86400；不满则等于「首条记录 → 最后一次检查」
                 span_sec: spanSec,
-                // 实际点数 = 槽数 + 1（要含两端边界，满窗口时正好 25）
                 points: series.length,
-                // 窗口右端 = 最后一次检查。前端据此写「截至 HH:MM:SS」，
-                // 让"曲线为什么停在那里"有解释（而不是让人以为数据丢了）。
                 last_check_ts: meta.last_check || null,
                 checks: n,
                 failures: n - okl,
                 uptime: n ? Math.round((okl / n) * 1000) / 10 : null,
-                // 「故障记录」实际扫描的窗口（小时），与趋势窗口同源，前台据此写「最近 X」
                 incident_hours: Math.max(1, Math.round(spanSec / 3600)),
               },
-              // p95 / avg_total / min / max 已删：详情页只显示 latency.avg（「平均响应」卡片）。
-              // 其中 p95 是这里最贵的查询（排序 + OFFSET + 子查询把同一次过滤重数一遍），
-              // 30 天窗口下等于两次全表扫描，换一个前端从不显示的数字。
               latency: {
                 avg: avgTtfb,
               },
@@ -2191,8 +1982,7 @@ export default {
       }
 
       // ── 分类管理 ──
-      // 站点的分类归属存在 sites.group_name；这里维护显式分类表（支持空分类 + 顺序）。
-      // 重命名 / 删除都会连带更新所有站点的 group_name，保证不会出现"孤儿分类"。
+      // 站点的分类归属存在 sites.group_name；这里维护显式分类表（支持空分类 + 顺序）
       if (api === "categories") {
         const d = await db(env);
 
@@ -2200,12 +1990,10 @@ export default {
           const body = await request.json().catch(() => ({}));
           const action = String(body.action || "").toLowerCase();
           const name = String(body.name || "").trim();
-          // reorder 操作的是 names 数组，不需要单个 name
           if (action !== "reorder" && !name) {
             return json({ ok: false, error: "分类名不能为空" }, 400, "no-store", pretty);
           }
-          // 与站点 group_name 的 64 字符上限保持一致：分类名会写进 sites.group_name，
-          // 两边不一致就会出现「建得进去、存到站点上被截断」的错位。
+          // 与 sites.group_name 的 64 字符上限一致
           if (action !== "reorder" && name.length > 64) {
             return json({ ok: false, error: "分类名最多 64 个字符" }, 400, "no-store", pretty);
           }
@@ -2236,7 +2024,7 @@ export default {
               return json({ ok: false, error: "分类名最多 64 个字符" }, 400, "no-store", pretty);
             }
             if (nn === name) return json({ ok: true, action, name }, 200, "no-store", pretty);
-            // 目标名已存在 → 直接合并过去，避免留下重复分类
+            // 目标名已存在则合并过去
             await d.batch([
               d
                 .prepare("INSERT OR IGNORE INTO categories (name, sort) VALUES (?,?)")
@@ -2248,7 +2036,7 @@ export default {
           }
 
           if (action === "delete") {
-            // 站点不跟着删，统一落到「未分组」—— 删分类不该顺带删监控
+            // 站点落到「未分组」，删分类不删监控
             await d.batch([
               d
                 .prepare("UPDATE sites SET group_name = ? WHERE group_name = ?")
@@ -2263,7 +2051,7 @@ export default {
             if (!names.length) {
               return json({ ok: false, error: "names 不能为空" }, 400, "no-store", pretty);
             }
-            // reorder 也会把分类名 upsert 进 categories，长度必须和 create 一样拦住
+            // reorder 也会 upsert 分类名，长度同样要拦
             if (names.some((n) => n.length > 64)) {
               return json({ ok: false, error: "分类名最多 64 个字符" }, 400, "no-store", pretty);
             }
@@ -2281,7 +2069,7 @@ export default {
           return json({ ok: false, error: `未知 action：${action}` }, 400, "no-store", pretty);
         }
 
-        // GET：显式分类 ∪ 站点上出现的 group_name（并集，各带站点计数）
+        // GET：显式分类 ∪ 站点上出现的 group_name
         return json({ ok: true, categories: await buildCategories(d) }, 200, "no-store", pretty);
       }
 
@@ -2290,12 +2078,10 @@ export default {
         if (request.method === "DELETE") {
           const id = url.searchParams.get("id");
           if (!id) return json({ ok: false, error: "缺少 id" }, 400);
-          // 一张表一条，但一次 batch（原子）：见 db.deleteSite 的注释
           await deleteSite(env, id);
           return json({ ok: true, deleted: id });
         }
         if (request.method === "POST") {
-          // request.json() 失败必须 .catch，否则非法 JSON 会被兜成 500。
           const parsed = await request.json().catch(() => null);
           if (!parsed || typeof parsed !== "object") {
             return json(
@@ -2305,13 +2091,13 @@ export default {
               pretty
             );
           }
-          // 站点排序：只传顺序，按下标写 sort。
+          // 站点排序：只传顺序，按下标写 sort
           if (!Array.isArray(parsed) && parsed.action === "reorder") {
             const ids = Array.isArray(parsed.ids) ? parsed.ids.map(String).filter(Boolean) : [];
             if (!ids.length) {
               return json({ ok: false, error: "ids 不能为空" }, 400, "no-store", pretty);
             }
-            // 上限只是挡畸形请求（正常一次就几十条，且 D1 batch 也不能无限长）
+            // 上限只是挡畸形请求
             if (ids.length > 500) {
               return json(
                 { ok: false, error: "一次最多重排 500 个站点" },
@@ -2329,7 +2115,7 @@ export default {
           }
 
           const list = Array.isArray(parsed) ? parsed : [parsed];
-          let upserted = 0; // 真实写入条数 —— 不是 list.length（空 id/url 的会被跳过）
+          let upserted = 0; // 真实写入条数，空 id/url 会被跳过
           const stmt = d.prepare(
             `INSERT INTO sites (id,name,url,group_name,expect_codes,hide_url,fail_threshold,interval_min,enabled,sort)
                  VALUES (?,?,?,?,?,?,?,?,?,?)
@@ -2342,14 +2128,13 @@ export default {
                    interval_min=excluded.interval_min, enabled=excluded.enabled,
                    sort=excluded.sort`
           );
-          // 未指定 sort 的新站点排到队尾，取一次全局最大值递增分配。
+          // 未指定 sort 的新站点排到队尾
           const stmts = [];
           let nextSort = null;
           for (const s of list) {
             if (!s.id || !s.url) continue;
             const id = String(s.id).trim();
             const url = normalizeUrl(String(s.url).trim());
-            // ── 服务端校验：非法直接拒绝，不要静默写坏数据
             if (!validSiteId(id)) {
               return json(
                 { ok: false, error: `站点 ID 非法（1–64 个字符，只能用字母、数字、点、下划线、连字符）：${String(s.id).slice(0, 40)}` },
@@ -2374,8 +2159,7 @@ export default {
                 pretty
               );
             }
-            // 顺序要留给拖拽来定：没给 sort 就分配队尾，给了（编辑回带）就用原值。
-            // sort 只在同一分类内比较，所以全局取最大值不影响别的分类。
+            // 顺序留给拖拽定：没给 sort 就分配队尾
             let sortValue;
             if (s.sort === undefined || s.sort === null || s.sort === "") {
               if (nextSort === null) {
@@ -2397,12 +2181,10 @@ export default {
                 String(s.group_name ?? UNGROUPED).trim().slice(0, 64) || UNGROUPED,
                 String(s.expect_codes ?? "").trim(),
                 boolInt(s.hide_url),
-                // 阈值 1–20、间隔 1–1440 分钟（≤1 天）：防负数/超大值污染调度
+                // 阈值 1–20、间隔 1–1440 分钟
                 clampInt(s.fail_threshold, 1, 20, 3),
                 clampInt(s.interval_min, 1, 1440, 5),
-                // 缺省视为启用；显式传 0 / false / "0" 都必须落成 0。
-                // 原先写的是 `s.enabled === false ? 0 : 1`，只认布尔 false，
-                // `{"enabled":0}` 会被当成"启用"—— 公开契约上的坑。
+                // 缺省启用；0 / false / "0" 都落成 0
                 s.enabled == null ? 1 : boolInt(s.enabled),
                 sortValue
               )
@@ -2412,18 +2194,16 @@ export default {
           for (const part of chunk(stmts, BATCH_CHUNK)) await d.batch(part);
           return json({ ok: true, upserted });
         }
-        // GET 不支持：读取一律走 /api/admin（一次返回站点+状态+分类+设置）
+        // GET 不支持：读取走 /api/admin
         return json({ ok: false, error: "请用 /api/admin" }, 405, "no-store", pretty);
       }
 
-      /** 后台聚合接口：一次请求拿全，省掉三次串行往返。 */
+      // 后台聚合接口：一次请求拿全
       if (api === "admin") {
         const payload = await buildAdminPayload(env);
-        // 复用请求开头已读到的 rawSettings，不再多查一次 D1
         const settings = publicSettings(env, rawSettings);
         return json(
-          // probe 直出「探针最近一次成功/失败/是否在退避」，后台据此提示额度问题：
-          // 站点显示"探针无结论"时，这里能立刻分清是 GP 挂了还是额度用光了。
+          // probe 直出「最近一次成功/失败/是否退避中」
           { ok: true, ...payload, settings, probe: probeHealthOf(rawSettings) },
           200,
           "no-store",
@@ -2448,8 +2228,7 @@ export default {
           pendingSites: collect.remaining,
           blockedUntil: collect.blockedUntil,
         });
-        // rows / perSite 只在服务端内部用，不下发给浏览器：
-        // 后台只需要「收了几条、发起了几个」，把整份明细塞进响应纯属浪费。
+        // rows / perSite 只在服务端内部用，不下发
         return json({
           ok: true,
           collect: { collected: collect.collected, fetched: collect.fetched, dropped: collect.dropped },
@@ -2457,12 +2236,11 @@ export default {
         });
       }
 
-      // 即时测试：必须带 site=<id>（结果写入 checks）。不允许指定任意 target。
+      // 即时测试：必须带 site=<id>，结果写入 checks
       if (api === "test") {
         const m2 = requirePost(request, pretty);
         if (m2) return m2;
-        // 频率闸门：后台连续点「测」会把额度打空，也会占住同步等待时间。
-        // 按站点 10 秒一次，内存级即可（多 isolate 不共享，这里只防手滑，不防攻击）。
+        // 频率闸门：按 10 秒一次，内存级，只防手滑
         if (!testLimiter.check("global")) {
           return json(
             { ok: false, error: "测试过于频繁，请 10 秒后再试" },
@@ -2477,9 +2255,9 @@ export default {
         const site = siteId
           ? await d.prepare("SELECT * FROM sites WHERE id = ?").bind(siteId).first()
           : null;
-        // 只允许测已登记的站点。接受任意 target 等于让人借你的额度探测任意地址。
+        // 只允许测已登记的站点，否则等于借额度探测任意地址
         if (!site) {
-          testLimiter.reset("global"); // 请求本身无效，别占额度
+          testLimiter.reset("global"); // 请求无效，不占额度
           return json(
             {
               ok: false,
@@ -2492,11 +2270,10 @@ export default {
         }
         const target = site.url;
 
-        // 位置筛选统一取全局设置，不再支持按请求覆盖 ——
-        // 否则"测出来的结果"和"真实探测"可能用的不是同一个筛选，失去参考价值。
+        // 位置筛选统一取全局设置，不支持按请求覆盖
         const { id, source, quota } = await gpCreate(env, { url: target });
 
-        /** 等结果：自适应间隔 + 总时长上限，固定间隔既慢又没有上界。 */
+        // 等结果：自适应间隔 + 总时长上限
         const startedAt = Date.now();
         const waitBudgetMs = (Number(env.GP_TIMEOUT_SEC) || 15) * 1000 + 8000;
         let finished = null;
@@ -2507,12 +2284,8 @@ export default {
           const out = await gpCollect(env, { measurement_id: id });
           if (out.done) finished = out;
         }
-        // 后台 toast 要显示「这次测试实际等了多久」—— 它本身就是排查信息
-        // （同一个站点等 3 秒 vs 25 秒，含义完全不同）。
         const elapsedMs = Date.now() - startedAt;
-        // 结果不可用（id 失效 / API 报错）→ 明确报错并不落库。
-        // gpCollect 把这种响应判成 done+broken（见其返回契约），照旧往下走会把
-        // "压根没拿到数据"存成一条假的失败记录，反而污染页面。
+        // gpCollect 把「id 失效 / API 报错」判成 done+broken，这种不能落库
         if (finished?.broken) {
           return json(
             { ok: false, kind: "globalping", source, quota, error: finished.error },
@@ -2522,12 +2295,10 @@ export default {
           );
         }
         const results = finished?.results || [];
-        // 判定必须走 gpDecide，与自动探测同一条判定链。
+        // 判定走 gpDecide，与自动探测同一条判定链
         const dec = gpDecide(site || { expect_codes: "" }, results);
         if (dec.void) {
-          // 无结论（探针全部是平台自身故障 / 一条结果都没收到 / 只剩 1 台且失败）→
-          // 明确报错且不落库。与 broken 分支同一约定：把"没拿到结论"存成一条记录，
-          // 等于凭空造出一个 up 或 down，直接污染可用率。
+          // 无结论不落库：存成记录等于凭空造出一个 up 或 down
           const why =
             dec.why === "single-fail"
               ? "只剩 1 台有效探针且失败，不足以判定"
@@ -2550,8 +2321,7 @@ export default {
           );
         }
         const best = dec.pick;
-        // 票型标注规则与 collectGlobalping 一致：全通是常态（不标），
-        // 分歧或有失败才标 `City/ASN (1/3)`
+        // 票型：全通不标，分歧或有失败才标 `City/ASN (1/3)`
         const probeLabel =
           dec.ok && dec.unanimous
             ? best.probe || null
@@ -2566,11 +2336,8 @@ export default {
         }
         return json({
           ok: true, kind: "globalping", source, quota, elapsed_ms: elapsedMs,
-          // 与后台表格 / 前台同一口径的来源标签（见 origin.js）
           origin: formatOrigin(source, probeLabel),
-          // 判定结论与票型 —— 后台据此用"判定成功"而不是"传输成功"上色。
-          // 同时下发判定所用的代表值（best）：后台 toast 如果自行取 results[0]，
-          // 拿到的可能是失败的那条探针，就会出现"HTTP 500 · 已记录 · 绿色"。
+          // 下发判定所用代表值：后台若自行取 results[0]，可能拿到失败的那条探针
           verdict: {
             ok: dec.ok,
             reason: dec.reason ?? null,
@@ -2584,8 +2351,7 @@ export default {
         });
       }
 
-      // 未知接口一律 404 —— 返回 200 + 服务信息会让删掉的接口"看起来还在"，
-      // 掩盖调用方的错误。
+      // 未知接口一律 404
       return json(
         {
           ok: false,
@@ -2617,19 +2383,12 @@ export default {
   },
 
   async scheduled(controller, env, ctx) {
-    // 唤醒时刻只用于测量投递延迟（写进 rounds.delay_ms），排期不依赖它。
-    // 排期是纯函数 isDue(last_checked_ts, 间隔, now)：判「距上次发起是否已满间隔」，
-    // 单位是分钟（理由见 isDue 的注释：cron 的发起时刻在整分前后 ±1 秒抖动）。
-    //
-    // 线上实测（rounds 表）：delay_ms 稳定 0.7~0.8s，开始时刻恒在整分后
-    // 0.16~0.25s —— cron 本身极准，不存在「触发时刻漂移」这回事。
-    // 另注意 scheduledTime 是整分前 0.546 秒（:59.454），用 Math.floor 归分钟
-    // 会落到前一分钟，这正是早前把它当锚点、把 5 分钟压成 4 分钟的原因。
+    // 唤醒时刻只用于记录投递延迟，排期不依赖它
     const wokeAt = Date.now();
     const nominal = Number(controller && controller.scheduledTime);
     const cronDelayMs =
       Number.isFinite(nominal) && nominal > 0 && nominal <= wokeAt ? wokeAt - nominal : null;
-    /** 分段容错：每段单独 try/catch，任何一段失败都不中断整轮。 */
+    // 分段容错：任何一段失败都不中断整轮
     const errors = [];
     const stage = async (name, fn, fallback) => {
       try {
@@ -2640,24 +2399,15 @@ export default {
       }
     };
 
-    // 必须先建表补结构，再读设置。
     await stage("ensureSchema", () => ensureSchema(env), null);
 
-    // cron 是独立入口，必须先合并后台设置再往下走。
     const settings = await stage("loadSettings", () => loadSettings(env), {});
     env = await effectiveEnv(env, settings);
 
-    // ── 轮次互斥锁 ──
-    // cron 不保证「上一轮结束才触发下一轮」。两轮重叠时：collect 会读到同一批 pending，
-    // dispatch 会对同站点再 gpCreate 一次，`INSERT OR REPLACE INTO pending` 覆盖掉旧的
-    // measurement_id —— 旧测量永远收不回来，点数白烧。
-    // 用 55 秒租约互斥：正常一轮 10 秒内结束，不影响下一分钟；万一进程被 kill，
-    // 租约到点自动失效，不会死锁（最多少测一轮）。
+    // ── 轮次互斥锁：55 秒租约，防止两轮重叠重复发起 ──
     const lockUntil = Number(settings.gp_round_lock_until || 0) || 0;
     if (lockUntil > Date.now()) {
-      // 被上一轮的租约挡住 = 那一轮跑了超过 55 秒（或进程被杀）。
-      // 这是「执行慢」最直接的证据，必须落库 —— 原先只有一行 stdout，
-      // 而 tail 常被挡、Analytics 只有分钟粒度，等于看不见。
+      // 被租约挡住 = 上一轮跑了超过 55 秒，必须落库留证
       await logRound(env, {
         ts: new Date(wokeAt).toISOString(),
         sched_ts: Number.isFinite(nominal) && nominal > 0 ? new Date(nominal).toISOString() : null,
@@ -2678,8 +2428,7 @@ export default {
 
     const sites = await stage("loadSites", () => loadSites(env), []);
 
-    // 先收取上一轮 Globalping 的结果 —— 必须全量收，不受间隔影响：
-    // 那些测量已经发出去了，不收就白花了额度。
+    // 先全量收取上一轮结果，不受间隔影响
     const collected = await stage("collectGlobalping", () => collectGlobalping(env, sites), {
       collected: 0,
       fetched: 0,
@@ -2692,9 +2441,7 @@ export default {
       collectLagMs: 0,
     });
 
-    // 再按各站点的监测间隔，只对「已到期」的发起新一轮。
-    // 预算要减掉本轮收取已经花掉的次数（见 dispatch 的注释）。
-    // 到期判断只看 state.last_checked_ts，排期无独立状态。
+    // 再按监测间隔对「已到期」的发起新一轮；预算要减掉本轮收取已花掉的次数
     const due = await stage("dueSites", () => dueSites(env, sites), []);
     const disp = await stage(
       "dispatch",
@@ -2702,50 +2449,37 @@ export default {
         dispatch(env, due, {
           alreadyUsed: collected.fetched,
           raw: settings,
-          // 同一轮里「收取没结论」已经计过数的站点，不要在发起失败时再 +1
+          // 本轮收取已计过「无结论」的站点，不在发起失败时重复计数
           voided: collected.voidSites,
-          // 收取阶段已经读过 pending 全表：传下去，dispatch 不再查一次。
-          // 注意 remaining 只含「本轮没被收走的」，其余 pending 已在 collect 里删掉 —— 语义与
-          // 「dispatch 自己去 SELECT * FROM pending」完全等价，但少一次 D1 往返。
+          // 复用收取阶段读到的 pending，省一次全表读
           pendingSites: collected.remaining,
-          // 收取侧撞到 429 时，发起端本轮也一起停 —— 否则两边各撞各的。
+          // 收取侧撞到 429 时，发起端本轮一起停
           blockedUntil: collected.blockedUntil,
         }),
       { used: 0, gpStarted: [], skipped: [], voided: 0, blocked_until: null, quota: null }
     );
     const subreqBudget = Number((env && env.SUBREQ_BUDGET) || 30);
 
-    // 这里不再递增 config_version，否则每分钟都让前台缓存全失效。
-
-    // 每天一次的过期明细清理（保留 N 天）。
-    // 按「距上次成功清理的时间」判断而不是卡某个钟点 —— 后者只要那一轮 cron
-    // 失败或漂移，当天就再也不清理了，checks 会一路膨胀。按时间间隔判断自带自愈。
+    // 每天一次的过期明细清理，按「距上次成功清理」判断，避免卡钟点
     let cleaned = 0;
     let orphans = 0;
     if (shouldCleanup(settings)) {
       try {
         cleaned = await cleanupOldChecks(env, Number(env?.CHECK_KEEP_DAYS || 30));
-        // 顺带清掉「站点已删除」的遗留行（state / ssl / pending）。
-        // 级联删除是后加的，改造前删掉的站点会留下孤儿行；它们不影响正确性
-        // （读侧都由 sites 驱动），只是白占空间、让行数对不上。
         orphans = await cleanupOrphans(env);
         await saveSetting(env, "last_cleanup_ts", String(Date.now()));
         await noteCleanup(env, true);
       } catch (e) {
-        cleaned = -1; // -1 表示失败，便于在日志里区分"删了 0 条"和"没跑成"
+        cleaned = -1; // -1 = 失败，与「删了 0 条」区分
         await noteCleanup(env, false);
       }
     }
 
-    // 释放轮次租约：正常结束立刻放开，下一轮不必空等满 55 秒
+    // 释放轮次租约
     await stage("roundUnlock", () => saveSetting(env, "gp_round_lock_until", "0"), null);
 
-    // 本轮调度事实落库。这是排期诊断的唯一证据：checks 只记发起时刻，
-    // 分不清「cron 触发晚」与「执行慢跨分钟」，而这两者的修法相反。
-    // gpStarted 里同时含成功项（有 id）与失败项（有 error），所以按 error 拆分计数。
+    // 本轮调度事实落库。gpStarted 同时含成功项与失败项，按 error 拆分计数
     const startedOk = (disp.gpStarted || []).filter((x) => x && !x.error).length;
-    // 发起失败的明细并入 err：有了它，429 才能被归因（限额余量 / Retry-After / 响应体），
-    // 而不是只留下一个 failed_n=1 让人反推。写失败不影响主流程（logRound 自己吞异常）。
     for (const f of disp.failures || []) errors.push({ stage: "dispatch", ...f });
     await stage(
       "logRound",
@@ -2768,41 +2502,24 @@ export default {
     console.log(
       JSON.stringify({
         cron: controller.cron,
-        // 投递延迟：名义触发时刻 → 实际开始跑。线上实测常态是 0~5s（秒级抖动），
-        // 偶尔 60s+ 说明那一轮真的被推迟了一个周期。排期已是纯网格累加，
-        // 这个值现在只用于判断 cron 健不健康，不再影响任何站点的间隔。
         cronDelayMs,
         sites: sites.length,
-        due: due.length, // 本轮按间隔筛选后实际该查的站点数
+        due: due.length,
         collected: collected.collected,
-        // 「发起 → 回收」的最大滞后。≈1 个 cron 周期（60s）属正常；
-        // 接近或超过 120s 说明那一轮空窗太短、测量没跑完，结果多等了一轮。
         collectLagMs: collected.collectLagMs || 0,
-        // 丢弃且未记检查记录的 pending（ttl / broken / throw）。正常恒为 []；
-        // 非空说明 Globalping 那边有异常，且该站点本轮没有产出检查记录。
         gpDropped: collected.dropped,
         gpStarted: disp.gpStarted,
-        // 本轮「没拿到结论」而被计数的站点数：> 0 说明这一轮它们没有产出检查记录
         gpVoided: disp.voided,
-        // 发起失败的站点数（凭据错 / 参数非法 / 429）。与 gpStarted 里的 error 一起看。
         gpFailed: disp.failed,
-        // 非空说明正处于 429 退避窗口，此轮起一个都没发
         gpBlockedUntil: disp.blocked_until,
         skipped: disp.skipped,
-        // 出网子请求：本轮已用（收取 + 发起）/ 预算。
-        // 站点多时会贴着预算跑，此时 skipped 非空属正常节流（下一轮补上）；
-        // 若 skipped 长期非空，说明要么站点太多、要么间隔太密，需要二选一。
         subreqUsed: disp.used,
         subreqBudget,
         persisted: collected.collected,
-        // 本轮顺带更新的证书数量（与探测同一次请求，不额外消耗额度）
         ssl: collected.sslWritten || 0,
-        cleaned, // 0 = 不在清理时点或无过期数据；-1 = 清理失败
-        orphans, // 本次清掉的孤儿行数（站点已删除的 state/ssl/pending）
-        // 非 null 表示本轮没写成 last_checked_ts。下一轮会把这些站点判为到期重试，
-        // pending 挡着不会重复发起，但连续出现说明 D1 写在出问题
+        cleaned, // 0 = 未到清理时点或无过期数据；-1 = 清理失败
+        orphans,
         scheduleError: disp.scheduleError || null,
-        // 分段错误：正常恒为 []。非空说明本轮有阶段失败，但其余阶段仍照常跑完了。
         errors,
       })
     );

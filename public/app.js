@@ -52,10 +52,7 @@ function renderStats(s) {
     { label: "运行中", value: s.up, icon: "up", cls: "i-success" },
     { label: "离线", value: s.down, icon: "down", cls: "i-destructive" },
     {
-      // 口径是「最近 24 小时（滚动）」—— 与详情页趋势图同一个窗口、同一批行。
-      // 后端在「24h 内一次都没测成功」时刻意返回 null（见 /api/overview 的注释），
-      // 这里必须原样显示「--」：给个 100 会让新实例第一屏就是"可用率 100.0%"，
-      // 与详情页的"暂无数据"自相矛盾。
+      // 后端在「24h 内一次都没测成功」时返回 null，这里显示「--」而不是 100
       label: "24 小时可用率",
       value: s.uptime_24h == null ? "--" : Number(s.uptime_24h).toFixed(1) + "%",
       icon: "shield",
@@ -116,10 +113,7 @@ function monitorRow(m) {
     ? ` <span class="muted" title="降级原因">· ${escapeHtml(m.degrade_reason)}</span>`
     : "";
 
-  // URL 直接做成可点链接，放在「间隔时间」前面，点它就打开站点本身 ——
-  // 独立成列的「打开链接」按钮连同它占的那一列网格都撤掉了，目标地址即入口。
-  // 隐藏地址的站点：服务端本就不下发 url，这里整段不渲染（连「已隐藏」也不写）——
-  // 既然访客点不到、也没有入口，再挂一行说明只是噪音。
+  // URL 做成可点链接；隐藏地址的站点服务端不下发 url，这里整段不渲染
   const hidden = m.hide_url === true;
   const urlCell = hidden
     ? ""
@@ -208,10 +202,7 @@ function renderChips() {
     .join("");
 }
 
-/**
- * 应用服务端设置（标题与默认主题）。优先级：手动切换 > 服务端默认 > 跟随系统。
- * 同时写入 theme-default，供下次访问的 <head> 内联脚本提前应用，避免闪白。
- */
+/** 应用服务端设置（标题与默认主题）。优先级：手动切换 > 服务端默认 > 跟随系统。 */
 function applySettings(st) {
   if (!st) return;
   if (st.site_title) {
@@ -252,19 +243,10 @@ function render(data) {
 
 /* ── 数据 ──────────────────────────────────────────────── */
 
-/**
- * 拉数据并渲染。
- * @param manual 用户主动刷新（点按钮 / F5）：绕过一切缓存，且不先用 localStorage 顶替
- *
- * 手动刷新必须带 no-cache：边缘缓存 TTL 内直接返回旧副本，
- * 用户点"刷新"却什么都没变，会以为页面坏了。
- */
-/**
- * 上次拉数据的时刻。切回标签页时的即时刷新按它节流 ——
- * 否则来回切标签页会把边缘缓存整个打穿（每次都是 no-store 直击源站）。
- */
+/** 上次拉数据时刻，切回标签页时按它节流，避免打穿边缘缓存。 */
 let lastFetchAt = 0;
 
+/** 拉数据并渲染。manual = 用户主动刷新：绕过一切缓存，不先用 localStorage 顶替。 */
 async function load(manual = false) {
   lastFetchAt = Date.now();
   let cached = null;
@@ -371,7 +353,5 @@ document.addEventListener("visibilitychange", () => {
 
 load();
 // 轮询不再绕过缓存：TTL 内直接吃边缘副本（最多落后 5 分钟），
-// 想立刻看最新数据点「刷新」—— 那一按钮走的是 no-cache + 跳过边缘缓存。
-// 原先每分钟 load(true)，等于每个开着的标签页每天打 1440 次源站，
-// 5 个站点就足以吃满 D1 免费层的日读额度。
+// 想立刻看最新数据点「刷新」，那走 no-cache 并跳过边缘缓存
 setInterval(() => { if (!document.hidden) load(false); }, 60000);

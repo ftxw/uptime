@@ -106,9 +106,7 @@ async function api(path, opts = {}) {
     throw e;
   }
 
-  // 403 + need_setup = 服务端没配 ADMIN_PASSWORD，后台整体停用。
-  // 这时不能弹登录框 —— 密码根本没配置，输什么都进不去，
-  // 用户只会以为是自己记错了密码。改弹说明页，直接告诉他去设变量。
+  // 403 + need_setup = 服务端没配 ADMIN_PASSWORD，改为显示说明页
   if (r.status === 403 && d && d.need_setup) {
     showSetup();
     const e = new Error(d.error || "未设置管理员密码");
@@ -313,9 +311,7 @@ function sslCell(s) {
 async function renderRows() {
   const list = visibleSites();
   const title = FILTER || "全部";
-  // 拖拽排序只在具体分类视图下开放：「全部」视图里列表混着多个分类，而 sort
-  // 只在同一分类内比较 —— 跨分类拖拽改了 sort 也不改变它所在的位置，表现为
-  // 「拖了没反应」。与其让用户对着一个静默失败的手势猜，不如先要求选个分类。
+  // 拖拽排序只在具体分类视图下开放（sort 只在同分类内比较）
   const canDrag = Boolean(FILTER);
   qs("#sites-title").innerHTML = `站点 <span class="sec-sub">${escapeHtml(title)} · ${list.length} 个 · ${
     canDrag ? "可拖拽排序" : "选择分类后可拖拽排序"
@@ -330,9 +326,7 @@ async function renderRows() {
 
   qs("#rows").innerHTML = list
     .map((s) => {
-      // 三态（与前台同一口径）：后端在 buildAdminPayload 里用 stateOf() 算好，
-      // 这里不能只看 last_ok —— 那会把「证书快过期 / 响应偏慢」的站点显示成绿色「正常」，
-      // 而后台恰恰是最该看到降级的地方。
+      // 三态由后端 stateOf() 算好，不能只看 last_ok
       const st =
         s.state === "up"
           ? "正常"
@@ -426,9 +420,7 @@ qs("#cats").addEventListener("click", async (e) => {
 
 qs("#cats").addEventListener("keydown", (e) => {
   if (e.key !== "Enter" && e.key !== " ") return;
-  // 分类项里还嵌着「编辑 / 删除」两个按钮。Enter / Space 在按钮上的默认动作就是"点击"，
-  // 而下面那句 preventDefault() 会把这个默认动作吃掉 —— 不放行按钮的话，
-  // 键盘用户按下去毫无反应（鼠标点击是另一条路径，所以只有键盘会撞上）。
+  // 让按钮自身的键盘点击照常工作
   if (e.target.closest("button")) return;
   const item = e.target.closest(".cat-item");
   if (!item) return;
@@ -702,9 +694,7 @@ function openForm(site) {
   qs("#dlg-title").textContent = site ? "编辑站点" : "添加站点";
   qs("#f-id").value = site?.id || "";
   qs("#f-id").readOnly = Boolean(site);
-  // ⚠️ 必须清掉「用户手动改过 ID」的标记：它挂在 DOM 元素上，会跟着弹窗活到下一次打开。
-  //    不清的话，第一次新建时手动改过一次 ID，此后每次「添加站点」输名称都不再联动生成 ID，
-  //    看起来就像"自动生成功能坏了"。编辑态由 readOnly 挡住，不需要这个标记。
+  // 清掉「手动改过 ID」标记，否则自动生成 ID 会永久失效
   delete qs("#f-id").dataset.touched;
   qs("#f-name").value = site?.name || "";
   qs("#f-url").value = site?.url || "";
@@ -799,9 +789,7 @@ document.addEventListener("click", async (e) => {
     try {
       // 位置由后端从全局设置取，前端不传；带 site=<id> 让结果落库。
       const d = await post("/test", { site: site.id });
-      // 展示用的状态码/延迟必须取「判定所用的代表值」（verdict），
-      // 不能用 results[0] —— 那是探针返回顺序的第一条，多探针分歧时
-      // 可能是失败的那条，于是出现"HTTP 500 · 已记录 · 绿色"这种自相矛盾的提示。
+      // 状态码/延迟取判定所用的代表值（verdict），不能取 results[0]
       const v = d.verdict || {};
       const res = (d.results || [])[0] || {};
       const showStatus = v.status != null ? v.status : res.status;
@@ -1001,9 +989,7 @@ function quotaStats(limitOverride) {
   let need = 0;
   for (const site of SITES) {
     if (site.enabled === 0 || site.enabled === false) continue;
-    // 实际间隔不能低于 2 分钟：两阶段模型（本轮发起、下轮收取）下，1 分钟档位
-    // 真实落库间隔约 120s。按 1 分钟算额度会**高估**消耗，让用户以为额度不够用。
-    const iv = Math.max(2, Number(site.interval_min) || 5);
+    const iv = Number(site.interval_min) || 5;
     n++;
     need += (60 / iv) * limit;
   }

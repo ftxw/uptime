@@ -1,10 +1,5 @@
--- uptime 数据模型：sites / checks / state / pending / ssl / categories / meta
---
--- 本文件是结构唯一真源，但 Worker 读不到它。`scripts/gen-schema.mjs` 生成
--- `src/schema.js` 供代码 import，那份是生成物不要手改。
---
--- 改结构时：版本号 +1，并在 src/migrations.js 补一条增量迁移（旧库才需要）。
--- schema-version: 6
+-- 结构唯一真源。改完跑 `npm run schema` 生成 src/schema.js。
+-- 所有语句都是 IF NOT EXISTS，Worker 首次请求时自动建表。
 
 CREATE TABLE IF NOT EXISTS sites (
   id             TEXT PRIMARY KEY,
@@ -12,15 +7,14 @@ CREATE TABLE IF NOT EXISTS sites (
   url            TEXT NOT NULL,
   group_name     TEXT,                -- 所属分类；空 = 未分组
   expect_codes   TEXT,                -- "200,301"；空 = 接受 2xx/3xx
-  -- 1 = 前台不下发 url，也不渲染「打开站点」按钮（站点仍在监测，只是地址不公开）
-  hide_url       INTEGER NOT NULL DEFAULT 0,
+  hide_url       INTEGER NOT NULL DEFAULT 0,  -- 1 = 前台下发 url:null
   fail_threshold INTEGER NOT NULL DEFAULT 3,  -- 连续失败几次判故障
-  interval_min   INTEGER NOT NULL DEFAULT 5,  -- 期望检查间隔（分钟）
+  interval_min   INTEGER NOT NULL DEFAULT 5,
   enabled        INTEGER NOT NULL DEFAULT 1,
   sort           INTEGER NOT NULL DEFAULT 0
 );
 
--- 探测明细，按 check_keep_days 清理。
+-- 探测明细，按 check_keep_days 清理。ts 为分钟精度。
 CREATE TABLE IF NOT EXISTS checks (
   site     TEXT NOT NULL,
   ts       TEXT NOT NULL,
@@ -32,20 +26,11 @@ CREATE TABLE IF NOT EXISTS checks (
   total_ms INTEGER,
   error    TEXT
 );
--- 查询只有两种形态：「按站点取一段」与「按站点取最新」，故以 (site, ts) 为主力索引。
 CREATE INDEX IF NOT EXISTS idx_checks_site_ts ON checks(site, ts DESC);
--- 跨站点的按时间查询（清理过期行、近 24h 聚合）与详情页时间序列。
--- 带上 site/ok 让 24h 聚合变成覆盖索引扫描，不回表 —— 少读一半。
 CREATE INDEX IF NOT EXISTS idx_checks_ts_site_ok ON checks(ts DESC, site, ok);
--- 24h 聚合的专用覆盖索引。查询形态是「site = ? AND ts > ?」：
--- 上面那条以 ts 打头，只能做时间范围扫描；site 虽是第二列，仍要把 24h 内
--- 所有站点的索引项逐条走过才能过滤 —— N 个站点就等于把同一段行读 N 遍。
--- 这条让 (site, ts) 直接定范围、ok 从索引里取，完全不用回表。
 CREATE INDEX IF NOT EXISTS idx_checks_site_ts_ok ON checks(site, ts DESC, ok);
 
--- 按天物化汇总：色条与按天统计的唯一数据源。
--- 每次检查增量累加（每站每天 1 行），把「30 天色条」的读代价从
--- 每站 4 万行（扫 checks）压到 30 行。max_fail_run 是当天最长连续失败段。
+-- 按天物化汇总，色条与按天统计的唯一数据源。
 CREATE TABLE IF NOT EXISTS checks_daily (
   site         TEXT NOT NULL,
   day          TEXT NOT NULL,        -- YYYY-MM-DD，按 utc_offset_min 划分
@@ -54,28 +39,16 @@ CREATE TABLE IF NOT EXISTS checks_daily (
   max_fail_run INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (site, day)
 );
--- 色条与按天统计都是「WHERE day >= ?」的区间查询，主键 (site, day) 用不上
--- 最左前缀，只能全表扫。保留期 100 天 × N 站的行数会被每个总览请求读一遍。
 CREATE INDEX IF NOT EXISTS idx_daily_day ON checks_daily(day);
 
--- 运行态。last_* 是最后一次结果的反范式缓存，避免每次展示都对 checks 跑窗口函数。
--- last_checked_ts 记上一次发起（只记自动探测），是**排期的唯一来源**：
--- 下次到期 = floor(last_checked_ts 到整分) + interval_min，纯派生、无独立排期状态。
--- last_ts 供展示（含手动测试）。
+-- 运行态。last_* 是最后一次结果的反范式缓存。
+-- last_checked_ts 记上一次发起，是排期的唯一来源（见 index.js 的 isDue）。
 CREATE TABLE IF NOT EXISTS state (
   site             TEXT PRIMARY KEY,
   consecutive_fail INTEGER NOT NULL DEFAULT 0,
-  -- 「拿不到结论」的连续轮数：探针全灭 / 平台故障 / 收取失败时 +1，成功落一条记录时清零。
-  -- 没有它的话，Globalping 挂掉的所有站点都会永远停在最后一次的「正常」，
-  -- 页面只是「X 分钟前」越变越大 —— 用户无法区分「站点好了」和「我们瞎了」。
-  void_streak      INTEGER NOT NULL DEFAULT 0,
+  void_streak      INTEGER NOT NULL DEFAULT 0,  -- 连续「拿不到结论」的轮数
   last_checked_ts  TEXT,
-  -- 已废弃：不读也不写，保留列只为免去重建表（SQLite 删列要整表重建）。
-  -- 它以前存「计划的下一次发起时刻」，但这是个会被写失败腐蚀的冗余状态：
-  -- 写不进去就只能 fallback 猜锚点，猜错一次网格相位就永久平移。
-  -- 现在排期由 last_checked_ts 派生（见 nextDueOf），不需要它了。
-  next_due_ts      TEXT,
-  last_ok          INTEGER,  -- 1 正常 / 0 故障
+  last_ok          INTEGER,
   last_status      INTEGER,
   last_ttfb_ms     INTEGER,
   last_total_ms    INTEGER,
@@ -85,7 +58,7 @@ CREATE TABLE IF NOT EXISTS state (
   last_error       TEXT
 );
 
--- 两阶段探测的待收结果：每个站点 2 个子请求（本轮发起、下轮收取），不轮询。
+-- 两阶段探测的待收结果：本轮发起，下轮收取。
 CREATE TABLE IF NOT EXISTS pending (
   site           TEXT PRIMARY KEY,
   measurement_id TEXT NOT NULL,
@@ -93,8 +66,7 @@ CREATE TABLE IF NOT EXISTS pending (
   created_ts     TEXT
 );
 
--- 证书随可用性探测顺带写入（Globalping 结果里带 tls），零额外额度。
--- 剩余天数不落库：相对时间一存就过期，读侧用 julianday 现算（db.sslDaysLeftSql）。
+-- 证书随同一次测量写入；剩余天数不落库，读时现算。
 CREATE TABLE IF NOT EXISTS ssl (
   site       TEXT PRIMARY KEY,
   checked_ts TEXT,
@@ -107,7 +79,7 @@ CREATE TABLE IF NOT EXISTS ssl (
   error      TEXT
 );
 
--- 显式分类表：支持空分类与自定义排序，站点归属仍存 sites.group_name。
+-- 显式分类表，支持空分类与排序；站点归属仍存 sites.group_name。
 CREATE TABLE IF NOT EXISTS categories (
   name TEXT PRIMARY KEY,
   sort INTEGER NOT NULL DEFAULT 0
@@ -119,26 +91,16 @@ CREATE TABLE IF NOT EXISTS meta (
   value TEXT
 );
 
--- 每轮 cron 的调度事实。**排期问题的唯一证据来源。**
---
--- 为什么必须有这张表：`checks` 只记录「发起时刻」，而发起时刻 =
--- cron 触发时刻 + 执行耗时。两个成因会得到完全相同的时间戳：
---   cron 在 :58 触发，执行 4 秒 → 记录 09:06:02
---   cron 在 :02 触发，执行 4 秒 → 记录 09:06:02
--- 但前者说明触发在漂、后者说明一切正常，修法完全不同。
--- Analytics 只有分钟粒度，`wrangler tail` 又常被网络挡住，于是只能靠猜。
--- 这张表把 scheduledTime 与实际开始时刻的差固定下来，让「迟到」可以被证实或证伪。
---
--- 体积：一行约 90 字节，保留 7 天 ≈ 10080 行 / 900KB，对免费额度可忽略。
+-- 每轮 cron 的调度事实，保留 7 天。时间戳保留毫秒（delay_ms 依赖它）。
 CREATE TABLE IF NOT EXISTS rounds (
-  ts          TEXT PRIMARY KEY,   -- 本轮实际开始时刻（ISO，毫秒精度，天然去重）
-  sched_ts    TEXT,               -- controller.scheduledTime 原值；NULL = 运行时未提供
-  delay_ms    INTEGER,            -- 实际开始 - 名义触发。cron 真正的投递延迟
-  dur_ms      INTEGER,            -- 本轮总耗时。> 60000 说明这一轮跨了分钟
-  due_n       INTEGER,            -- 按间隔筛选后应查的站点数
-  started_n   INTEGER,            -- 真正发出测量的站点数
-  failed_n    INTEGER,            -- 发起失败的站点数
-  collected_n INTEGER,            -- 本轮收取并落库的结果数
-  skipped_n   INTEGER,            -- 因预算/退避被跳过的站点数
-  err         TEXT                -- 非空 = 有阶段失败，或被上一轮的租约挡住
+  ts          TEXT PRIMARY KEY,
+  sched_ts    TEXT,
+  delay_ms    INTEGER,
+  dur_ms      INTEGER,
+  due_n       INTEGER,
+  started_n   INTEGER,
+  failed_n    INTEGER,
+  collected_n INTEGER,
+  skipped_n   INTEGER,
+  err         TEXT
 );
