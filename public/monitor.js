@@ -26,7 +26,7 @@ function escapeHtml(s) {
 function relTime(iso) {
   if (!iso) return "从未检查";
   const s = Math.max(0, Math.round((Date.now() - new Date(iso).getTime()) / 1000));
-  if (s < 60) return `${s} 秒前`;
+  if (s < 60) return "刚刚";
   if (s < 3600) return `${Math.floor(s / 60)} 分钟前`;
   if (s < 86400) return `${Math.floor(s / 3600)} 小时前`;
   return `${Math.floor(s / 86400)} 天前`;
@@ -36,7 +36,7 @@ function fmtFull(iso) {
   const d = new Date(iso);
   return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(
     d.getHours()
-  )}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
+  )}:${pad2(d.getMinutes())}`;
 }
 
 function fmtAxis(t, hours) {

@@ -159,13 +159,13 @@
   // 和服务端设置耦合起来，改一次默认值要记得回来同步这里。真数据到达时整块被替换。
   put("recent", Array(21).join(
     '<div class="lst-row skel" aria-hidden="true">' + sk("正常", "badge") +
-      sk("200") + sk("155 ms") + sk("cfapi · H2", "grow") + sk("2026-01-01 00:00:00") + "</div>"
+      sk("200") + sk("155 ms") + sk("cfapi · H2", "grow") + sk("2026-01-01 00:00") + "</div>"
   ));
 
   // 故障记录：占位一行。绝大多数站点此刻没有故障，真为空时卡片只会比占位矮约 10px
   put("incidents", '<div class="inc-row skel" aria-hidden="true">' + sk("已恢复", "badge") +
     '<div class="grow" style="min-width:0">' + sk("HTTP 500") +
-    '<div style="margin-top:3px">' + sk("2026-01-01 00:00:00 → 00:00:00 · 历时 1 分 0 秒") +
+    '<div style="margin-top:3px">' + sk("2026-01-01 00:00 → 00:00 · 历时 1 分 0 秒") +
     "</div></div></div>");
 })();
 </script>

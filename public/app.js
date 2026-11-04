@@ -24,11 +24,12 @@ const svg = (n, cls = "") =>
     stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${ICONS[n]}</svg>`;
 
 const qs = (s) => document.querySelector(s);
+const pad2 = (n) => String(n).padStart(2, "0");
 
 function relTime(iso) {
   if (!iso) return "从未检查";
   const s = Math.max(0, Math.round((Date.now() - new Date(iso).getTime()) / 1000));
-  if (s < 60) return `${s} 秒前`;
+  if (s < 60) return "刚刚";
   if (s < 3600) return `${Math.floor(s / 60)} 分钟前`;
   if (s < 86400) return `${Math.floor(s / 3600)} 小时前`;
   return `${Math.floor(s / 86400)} 天前`;
@@ -233,7 +234,7 @@ function render(data) {
   qs("#subtitle").textContent =
     `共 ${data.stats.total} 个监控` +
     (d ? ` · ${d} 个降级` : "") +
-    ` · 更新于 ${t.toLocaleTimeString("zh-CN")}`;
+    ` · 更新于 ${pad2(t.getHours())}:${pad2(t.getMinutes())}`;
   // 阈值从服务端设置取 —— 后台改了 ssl_warn_days 后这里的文案必须跟着变
   const warnDays = Number(data.settings?.ssl_warn_days ?? 14);
   qs("#foot").textContent =
