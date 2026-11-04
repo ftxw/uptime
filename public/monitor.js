@@ -13,36 +13,15 @@ const svg = (n, cls = "") =>
     stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${ICONS[n] || ""}</svg>`;
 
 const qs = (s) => document.querySelector(s);
+const { fmtFull, fmtAxis } = window.T;
+const relTime = (iso) => window.T.relTime(iso, "从未检查");
 
 const STATE_LABEL = { up: "正常", down: "故障", degraded: "降级", unknown: "未知" };
-const pad2 = (n) => String(n).padStart(2, "0");
 
 function escapeHtml(s) {
   return String(s ?? "").replace(/[&<>"']/g, (c) =>
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])
   );
-}
-
-function relTime(iso) {
-  if (!iso) return "从未检查";
-  const s = Math.max(0, Math.round((Date.now() - new Date(iso).getTime()) / 1000));
-  if (s < 60) return "刚刚";
-  if (s < 3600) return `${Math.floor(s / 60)} 分钟前`;
-  if (s < 86400) return `${Math.floor(s / 3600)} 小时前`;
-  return `${Math.floor(s / 86400)} 天前`;
-}
-
-function fmtFull(iso) {
-  const d = new Date(iso);
-  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(
-    d.getHours()
-  )}:${pad2(d.getMinutes())}`;
-}
-
-function fmtAxis(t, hours) {
-  const d = new Date(t);
-  const hm = `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
-  return hours <= 24 ? hm : `${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${hm}`;
 }
 
 function fmtDur(sec) {

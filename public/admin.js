@@ -34,14 +34,7 @@ function escapeHtml(s) {
   );
 }
 
-function relTime(iso) {
-  if (!iso) return "—";
-  const s = Math.max(0, Math.round((Date.now() - new Date(iso).getTime()) / 1000));
-  if (s < 60) return "刚刚";
-  if (s < 3600) return `${Math.floor(s / 60)} 分钟前`;
-  if (s < 86400) return `${Math.floor(s / 3600)} 小时前`;
-  return `${Math.floor(s / 86400)} 天前`;
-}
+const relTime = window.T.relTime;
 
 /** 顶部滑出 toast：短文案、自动消失。 */
 const TOAST_MS = { info: 3000, warn: 5000, error: 6000 };
