@@ -33,7 +33,7 @@ function fmtDur(sec) {
 }
 
 const fmtInterval = (min) => (min >= 60 ? `${min / 60} 小时` : `${min} 分钟`);
-const ms = (v) => (v === null || v === undefined ? "--" : `${v} ms`);
+const ms = (v) => (v === null || v === undefined ? "--" : `${Math.round(v)} ms`);
 
 /** 小时数 → 人话（168 → "7 天"，24 → "24 小时"）。故障记录窗口用得上 */
 function fmtHours(h) {
@@ -294,10 +294,10 @@ function renderChart(series, hours) {
       best.n === 0
         ? `<span class="muted">该时段无检查记录</span>`
         : (best.v != null
-            ? `平均 ${best.v} ms<br>`
+            ? `平均 ${Math.round(best.v)} ms<br>`
             : `<span class="muted">该时段全部失败</span><br>`) +
           `成功 ${best.ok}/${best.n}` +
-          (best.max != null ? `<br>最高 ${best.max} ms` : "");
+          (best.max != null ? `<br>最高 ${Math.round(best.max)} ms` : "");
     tip.innerHTML = `<b>${fmtFull(best.t)}</b><br>` + detail;
     tip.classList.add("show");
     const tw = tip.offsetWidth;
