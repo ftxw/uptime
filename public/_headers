@@ -1,9 +1,5 @@
-# Workers Static Assets 自定义响应头，随部署一起生效
-# 文档: https://developers.cloudflare.com/workers/static-assets/headers/
-#
-# 刻意不加 CSP：三个 HTML 都含内联 <script>（主题预设 / 首屏首包），
-# 严格 script-src 会让它们全部失效、页面白屏。要上 CSP 须先给内联脚本加 nonce/哈希。
-# 下列几项都不影响现有功能，属免费安全加固。
+# Workers Static Assets 响应头
+# 不加 CSP：三个页面都含内联 <script>，严格 script-src 会直接白屏
 
 /*
   X-Content-Type-Options: nosniff
@@ -16,21 +12,11 @@
 /*.svg
   Cache-Control: public, max-age=86400
 
-# 后台页不要进搜索引擎 / 不要被外站引用：<meta name="robots"> 只对遵守约定的爬虫有效，
-# HTTP 头则是所有抓取方都能看到的。X-Robots-Tag 是零成本的一层保险。
+# 后台页不进搜索引擎
 /admin.html
   X-Robots-Tag: noindex, nofollow
 /admin.js
   X-Robots-Tag: noindex, nofollow
 
-# ⚠️ 这里**刻意不给 `/*.js` 与 `/*.css` 加长缓存**。
-# 前端文件名都**不带内容哈希**（app.js / app.css 固定名），所以
-# `max-age=300` 之类的长缓存必然产生版本错配：部署后的 5 分钟里，
-# 浏览器可能拿到"新的 HTML / JS + 旧的 CSS"，表现为样式诡异、点不动，
-# 而且刷新也不一定好 —— 这是最难排查的一类问题。
-#
-# 现在没有 Service Worker 了，缓存完全由 HTTP 头决定：不加 max-age 时浏览器走
-# 启发式缓存（可能短时间不回源）。若确实踩到版本错配，给这两类文件加
-#   Cache-Control: no-cache
-# （= 每次用前都 304 校验，命中时只多一次 RTT，但保证永远不错配），
-# 而不是改成 no-store —— 后者连 304 都省掉，等于每次全量下载。
+# /*.js 与 /*.css 不要加长缓存：文件名不带内容哈希，会错配成「新 HTML + 旧 CSS」。
+# 确需强制回源用 no-cache（保留 304），不要用 no-store（每次全量下载）

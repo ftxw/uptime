@@ -934,7 +934,7 @@ function fillSettingsForm(s) {
   qs("#s-gp-token").value = "";
   qs("#s-gp-token-hint").textContent = s.has_globalping_token
     ? `已配置：${s.globalping_token_masked}（留空则保留）`
-    : "未配置（额度 250 次/小时；配置后 500 次/小时）";
+    : "未配置（250 点/小时，每次扣 3 点；配 Token 翻倍到 500）";
   renderProbeInfo();
 }
 
@@ -1056,14 +1056,14 @@ setdlg.addEventListener("close", () => {
 
 /** 「清除 Token」是删除已配置 Token 的唯一入口。 */
 qs("#s-gp-token-clear").addEventListener("click", async () => {
-  if (!confirm("清除已保存的 Globalping Token？\n清除后额度回落到匿名档（250 次/小时）。")) return;
+  if (!confirm("清除已保存的 Globalping Token？\n清除后额度回落到匿名档（250 点/小时）。")) return;
   const btn = qs("#s-gp-token-clear");
   btn.disabled = true;
   try {
     const r = await post("/settings", { clear_globalping_token: true });
     if (!r.ok) throw new Error(r.error || "清除失败");
     qs("#s-gp-token").value = "";
-    qs("#s-gp-token-hint").textContent = "未配置（额度 250 次/小时；配置后 500 次/小时）";
+    qs("#s-gp-token-hint").textContent = "未配置（250 点/小时，每次扣 3 点；配 Token 翻倍到 500）";
     banner("Token 已清除", "info");
     await loadAll();
   } catch (err) {

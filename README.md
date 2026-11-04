@@ -108,10 +108,8 @@ npm run deploy
 > 保留它们的价值在于：结构缺列这种事在部署日志里一行就能看到，
 > 而不是等到线上某个接口报 `no such column`。
 
-> 加字段怎么办：改 `schema.sql`，把顶部的 `-- schema-version:` 加 1，
-> 并在 `src/migrations.js` 里补一条 `ALTER TABLE ... ADD COLUMN`。
-> 新库直接按完整定义建；已经跑了一段时间的旧库靠那条迁移自动补列，
-> 不需要重建、不会丢数据。详见 [改表结构](#改表结构)。
+> 加字段怎么办：改 `schema.sql` → `npm run schema` 重新生成 → 已有库手工
+> `ALTER TABLE ... ADD COLUMN`。本项目不做自动迁移，详见 [改表结构](#改表结构)。
 
 > ⚠️ **`wrangler.toml` 里的 `database_id` 不要提交**：第 2 步写回去的是**本机账号的实际
 > uuid**，只对当前账号有效。跑完 `setup` / `deploy` 后 `git status` 里 `wrangler.toml` 会
@@ -197,7 +195,7 @@ npm run deploy
 | 外观 | 站点标题 | 站点状态 | 前台标题与页头品牌名 |
 | | 前台默认主题 | 跟随系统 | 跟随系统 / 浅色 / 深色（用户手动切换优先） |
 | | 展示时区 · UTC 偏移 | 480 分钟 | 即 UTC+8。决定 30 天色条「一天」从哪一刻起算，服务端口径一致 |
-| 探测 | Globalping Token | 空 | 空 = 匿名档 250 次/小时；配置后 500 次/小时 |
+| 探测 | Globalping Token | 空 | 空 = 匿名档 250 点/小时；配置后 500 点/小时（**点**不是次数，每次探测扣 `每次探测点数`） |
 | | 探测位置筛选 | CN+datacenter-network | **全局**。下拉：中国 · 云机房 / 中国 · **全部网络**（`CN`，云机房 + 家宽）/ 中国 · 家庭宽带 / 东亚 / 西欧 / 北美，或选「自定义…」填任意 magic |
 | | 每次探测点数 | 3 | 三档下拉：`1` 单点采样 / `3` 多探针兜底（默认）/ `5` 更稳；⚠️ 额度按点数计费，`cost = 点数` |
 | | 探针超时 | 15 秒 | 整数秒 5–30，这是"告知远端探针最多跑多久"，不是"我们等多久" |
@@ -235,18 +233,19 @@ npm run deploy
 > Better Stack 用 3/4（75%）是因为它的探针在优质机房、单点失败率远低于 25%，
 > 直接套用到国内链路上会天天误报。
 >
-> 代价是额度按点数计费（`cost = 点数`）：5 分钟间隔的站点是 12 次/小时，
-> 免费额度 250/小时下约可支撑 20 个站点，配 token（500/小时）翻倍；
-> 1 分钟间隔则只有 4 / 8 个。具体上限见「容量」一节的三道卡口。
-> 档位由后台下拉的 `<option>` 定义（当前 **1 / 3 / 5**），选定即原样生效 ——
-> 服务端**刻意不做校验**（要加档位只加一行 `<option>` 即可）。
+> 代价是额度按点数计费（`cost = 点数`）：5 分钟间隔的站点是 12 次/小时 × 3 点 = **36 点/小时**，
+> 匿名档 250 点/小时下约可支撑 **6 个**站点，配 Token（500 点）翻倍到 **13 个**；
+> 1 分钟间隔每站 180 点/小时，两种档位分别只有 **1 / 2 个**。具体上限见「容量」一节。
+> 档位由后台下拉的 `<option>` 定义（当前 **1 / 3 / 5**）。服务端只认这三个值，
+> 其它数会被 `gpLimitNum()` 回落到默认 3 —— 要加档位得**同时**改 `admin.html` 的
+> `<option>` 和 `settings.js` 的 `gpLimitNum()`，只加前者保存后会被改回 3。
 
 ### 敏感值（都用环境变量）
 
 | 名称 | 说明 |
 |---|---|
 | `ADMIN_PASSWORD` | **必设**。后台唯一的登录凭据；**不设则后台整体停用**（`/admin` 只显示设置指引，后台接口一律 403） |
-| `GLOBALPING_TOKEN` | 可选。Globalping 额度 250 → 500 次/小时（也能在后台「设置 → 探测」里填，存 D1） |
+| `GLOBALPING_TOKEN` | 可选。Globalping 额度 250 → 500 **点**/小时（也能在后台「设置 → 探测」里填，存 D1） |
 
 ```bash
 npx wrangler secret put ADMIN_PASSWORD
@@ -263,7 +262,7 @@ npx wrangler secret put GLOBALPING_TOKEN
 
 | 方法 | 路径 | 权限 | 说明 |
 |---|---|---|---|
-| GET | `/api/health` | 公开 | **部署自检**：D1 绑定是否生效、8 张表缺哪张、密码配没配、本次是否自动补了结构，外加 `probe`（Globalping 最近一次成功/失败/429 退避窗口）。排障先看这个 |
+| GET | `/api/health` | 公开 | **部署自检**：D1 绑定是否生效、9 张表缺哪张、密码配没配、本次是否自动补了结构，外加 `probe`（Globalping 最近一次成功/失败/429 退避窗口）。排障先看这个 |
 | GET | `/api/overview` | 公开 | 统计 + 分组 + 30 天色条 + SSL，边缘缓存 300s（`config_version` 变更即换 key）。「可用率」口径是**滚动 24 小时**，与详情页趋势图同一个窗口、同一批行；已暂停站点不计入分母。站点勾了「隐藏 URL」时，该条目的 `url` 为 `null` |
 | GET | `/api/site?id=` | 公开 | 详情页：24h 窗口统计 + 延迟序列（**25 个边界点画出 24 段**）+ 最近检查 + 故障记录（同上，`url` 可能为 `null`）。窗口右端收在**最后一次检查**上（不是 now），左端再往前 24 小时或到首条记录为止。n 个 1 小时的槽有 n+1 个边界点：首点 = 窗口左边界，末点 = 最后一次检查，中间每段正好 1 小时；槽宽 = `max(监测间隔, 跨度/24)`，数据不足 24 小时时槽宽变小、点数相应减少（40 分钟 + 5 分钟间隔 → 9 点）。空槽保留为 `n=0 / v=null`，前端断线而不是把两侧连起来。跨度见 `window.span_sec`，右端时间见 `window.last_check_ts`。`id` 先按 `[A-Za-z0-9._-]{1,64}` 校验，格式不合法直接 404、不查库 |
 | GET | `/api/admin` | 登录 | 站点 + 状态 + 分类 + 证书 + 设置 + `probe`（探针健康，**一次拿全**） |
@@ -285,17 +284,18 @@ Token 类设置**只写不读**——读取接口只返回掩码（`glp_****ghij
 curl -s https://<你的域名>/api/health?pretty=1
 ```
 
-健康时返回 `ok: true` 与 8 张表名；不健康时 `ok: false` 并有 `hint` 说明下一步。
+健康时返回 `ok: true` 与 9 张表名；不健康时 `ok: false` 并有 `hint` 说明下一步。
 
 `/api/health` 同时也是**自愈入口**：它在读取状态之前会先让库结构就位，
-所以库是空的时候打开它，表会被直接建好。返回里 `schema.auto_applied` 会说明这次做了什么：
+所以库是空的时候打开它，表会被直接建好。返回里 `schema.applied` 会说明这次做了什么：
 
-| `schema.auto_applied` | 含义 |
+| `schema.applied` | 含义 |
 |---|---|
-| `none` | 结构本来就是最新的（绝大多数时候） |
-| `created` | 这个库原本一张表都没有，本次建好了（`from_version: -1`） |
-| `repaired` | 库已存在但缺表/结构旧，本次补齐了（`from_version` 是补之前的版本） |
-| `failed` | 自动补结构失败，原因见 `schema.error` |
+| `ready` | 结构本来就在（绝大多数时候） |
+| `created` | 这个库原本没有表，本次建好了 |
+| `failed` | 自动建表失败，原因见 `schema.error` |
+
+浅检查只验 `db_bound`（D1 绑定在不在）。要看 `tables` / `missing_tables` 得登录后加 `?deep=1`。
 
 典型返回与处理：
 
@@ -321,7 +321,6 @@ src/
   index.js      路由（鉴权、接口、cron 调度）
   db.js         数据层：所有 SQL 集中在此 + 库结构自举（ensureSchema）
   schema.js     ⚠️ 生成物：schema.sql 转出的建表语句数组，不要手改
-  migrations.js 增量迁移：给已有的旧库补列（新库用不到）
   probe.js      Globalping 发起 / 收取 / 判定（含证书提取）
   origin.js     「探测来源」标签的唯一拼装处（GP:CN · Beijing/9808）
   settings.js   运行参数元信息：唯一默认值来源 + 合法值校验
@@ -330,6 +329,7 @@ public/
   index.html / app.js        前台总览
   monitor.html / monitor.js  站点详情（图表为原生 SVG，无图表库）
   admin.html / admin.js      后台
+  time.js                    三页共用的时间格式化（分钟精度 + 本地时区）
   app.css                    样式
 scripts/
   setup-d1.mjs   自动准备 D1：建库 + 写绑定 + 建表（幂等）；目标 production / local
@@ -338,9 +338,10 @@ schema.sql        建表语句的**唯一真源**（全部 IF NOT EXISTS，可�
 wrangler.toml     只有绑定配置（D1 / 静态资源），**不含域名**；运行参数一律在后台「设置」里改
 ```
 
-数据表：`sites` `checks` `state` `pending` `ssl` `checks_daily` `categories` `meta`
-索引：`checks` 上两个 —— `(site, ts DESC)` 供详情页取某站一段，
+数据表：`sites` `checks` `state` `pending` `ssl` `checks_daily` `categories` `meta` `rounds`
+索引：`checks` 上三个 —— `(site, ts DESC)` 供详情页取某站一段，
 `(ts DESC, site, ok)` 供清理过期行（`DELETE ... WHERE ts < ?`）按时间范围定位，
+`(site, ts DESC, ok)` 供详情页只数成功票；
 不用再为「近 24h 跨站聚合」服务 —— 那个聚合已经从扫明细改成读 `checks_daily` 了
 
 `checks_daily` 是按天物化的汇总（每站每天 1 行：次数、成功数、当天最长连续失败段），
@@ -379,127 +380,71 @@ D1 免费计划每天 **500 万行读 / 10 万行写**（按 UTC 0 点重置，�
 
 **另外两道卡口**（与 D1 无关，但会先撞上）：
 
-| 限制 | 1 分钟间隔的上限 |
-|---|---|
-| Globalping 500 次/小时（注册用户；未注册 250） | 8 站（未注册 4 站） |
-| 子请求预算 30/分钟 ÷ 每站 2 次 | 15 站 |
+| 限制 | 匿名 250 点 | Token 500 点 |
+|---|---|---|
+| Globalping（每次探测扣 `gp_limit` 点，默认 3） | 250 ÷ 3 ≈ **83 次探测/小时** | 500 ÷ 3 ≈ **166 次探测/小时** |
+| ↳ 折成 1 分钟间隔的站点（每站 180 点/小时） | **1 站** | **2 站** |
+| ↳ 折成 5 分钟间隔的站点（每站 36 点/小时） | **6 站** | **13 站** |
+| ↳ 折成 10 分钟间隔的站点（每站 18 点/小时） | **13 站** | **27 站** |
+| 子请求预算 30/分钟 ÷ 每站 2 次 | 15 站 | 15 站 |
 
-三者的最小值就是真实上限。1 分钟间隔下是 **7 站**，瓶颈在 D1 写入。
+三者取最小值：
+
+| 间隔 | D1 写入 | Globalping（Token） | 子请求 | **真实上限** | 瓶颈 |
+|---|---|---|---|---|---|
+| 1 分钟 | 7 站 | 2 站 | 15 站 | **2 站** | Globalping |
+| 5 分钟 | 38 站 | 13 站 | 15 站 | **13 站** | Globalping |
+| 10 分钟 | 77 站 | 27 站 | 15 站 | **15 站** | 子请求预算 |
+
+> 把「每次探测点数」从 3 降到 1，Globalping 档位能撑的站点数直接 ×3
+> （1 分钟 → 4 / 8 站，5 分钟 → 20 / 41 站），代价是失去多探针兜底、误报变多。
 
 > 想知道自己用了多少：Cloudflare 控制台 → Workers & Pages → D1 → 选中库 →
 > Metrics → Row Metrics。出现 `daily limits exceeded` 就是超了。
 
 ---
 
-## 库结构自举（为什么建表不靠命令）
+## 库结构自举
 
-**Worker 在第一次请求时自己检查库结构，缺表就按 `schema.sql` 建好。**
-不需要任何人先跑 `npm run deploy`。
+**Worker 第一次请求时自己检查库结构，缺表就按 `schema.sql` 建好**，不需要先跑任何命令。
 
-### 为什么必须这样
+因为部署路径有好几条，只有 `npm run deploy` 才会执行 `setup-d1.mjs`：在 Dashboard 直接改代码、
+CI 里跑 `wrangler deploy`、GitHub 自动构建只填 `npx wrangler deploy` 的，都没人建表。
+现象很误导：Worker 部署成功、静态页能开，但每个接口都 500，日志里只有 `no such table: meta`。
 
-建表原先只发生在 `npm run deploy` 里的 `scripts/setup-d1.mjs`。问题在于
-**部署路径有好几条，只有一条会执行那个脚本**：
+实现是 `ensureSchema(env)`：读 `meta.schema_ready`，没有就跑 `schema.js` 里的全部
+`CREATE ... IF NOT EXISTS`，成功后写回标记。按 D1 绑定对象用 `WeakMap` 缓存
+（并发请求共享同一个 Promise），失败不缓存 —— D1 抖动下一刻可能就好了。
 
-| 部署方式 | 会不会跑 setup-d1.mjs | 旧行为 |
-|---|---|---|
-| 本地 `npm run deploy` | ✅ | 正常 |
-| 控制台连 GitHub 自动构建，Deploy command 填 `npm run deploy` | ✅ | 正常 |
-| 同上，但填的是 `npx wrangler deploy` | ❌ | **部署成功、接口全报 `no such table: meta`** |
-| CI / 脚本里直接 `wrangler deploy` | ❌ | 同上 |
-| Dashboard 里直接改代码 | ❌ | 同上 |
+### `schema.sql` 要变成 JS 才进得了包
 
-失败时的现象很误导人：Worker 部署成功、静态页面能打开，但每个接口都是
-`500`，日志里只有一句 `no such table: meta` —— 而「怎么建表」这件事
-在界面上没有任何入口。
+Worker 运行期没有文件系统，读不到 `schema.sql`。Wrangler 的 `[[rules]] type = "Text"`
+实测走不通：构建不报错，但产物里多出一个独立文件，`import` 进来的是 `undefined` —— 静默失败。
 
-### 怎么做的
-
-```
-请求进来
-  → ensureSchema(env)
-      读 meta.schema_v
-        · 已是最新版本  → 直接返回（每个 isolate 只多 1 次单行读）
-        · 版本更旧/没有 → 跑 schema.js 里的全部 CREATE ... IF NOT EXISTS
-                        → 跑 migrations.js 里「比库里版本新」的那些 ALTER
-                        → 把版本号写回 meta
-  → 之后才是设置加载与认证闸门
-```
-
-三个关键点：
-
-- **幂等**：所有建表语句都是 `IF NOT EXISTS`；迁移里重复补列的错误被识别并吞掉。
-- **只跑一次**：缓存按 **D1 绑定对象**记（`WeakMap`），同一库只查一次版本号；
-  并发请求共享同一个 Promise，不会并发建表。
-- **失败不缓存**：D1 抖动、额度暂时耗尽这类问题下一刻可能就好了，
-  缓存住失败会让这个 isolate 的余生都返回同一个错误。
-
-### 代价
-
-| 项 | 量 |
-|---|---|
-| 正常状态下每个 isolate 生命周期 | **多 1 次 D1 读**（最多 1 行） |
-| 库为空/结构旧时 | 一次性的 10 条 DDL + 1 条版本写入，之后不再发生 |
-| Worker CPU | 不变 —— DDL 在 D1 侧执行，等 I/O 不计入那 10ms 上限 |
-
-### 一个坑：`schema.sql` 要变成 JS 才进得了包
-
-Worker 的包由 wrangler 打包，**运行期没有文件系统**，读不到 `schema.sql`。
-想让代码直接用那份 SQL，直觉是配 Wrangler 的 module rule 把它当文本导入：
-
-```toml
-[[rules]]
-type = "Text"
-globs = ["**/*.sql"]
-```
-
-**实测这条路走不通**：构建不报错，但产物里反而多出一个独立的 `schema.sql` 文件，
-`import` 进来的是 `undefined` —— 静默失败，比报错更难发现。
-
-所以改成生成：`scripts/gen-schema.mjs` 把 `schema.sql` 解析成语句数组写进
-`src/schema.js`（生成物，提交进仓库）。`schema.sql` 仍是唯一真源，
-`npm run deploy` / `npm run dev` 会自动重新生成；`npm run check:schema`
-用来确认两边没漂移。
-
-> 生成物要提交，是因为云平台上直接 `wrangler deploy` 时**只会用仓库里的文件**，
-> 不会跑生成脚本。这也是为什么改完 `schema.sql` 必须 `npm run schema` 再提交。
+所以 `scripts/gen-schema.mjs` 把 `schema.sql` 解析成语句数组写进 `src/schema.js`（生成物，提交进仓库）。
+`schema.sql` 仍是唯一真源；`npm run dev` / `npm run deploy` 会自动重新生成，
+`npm run check:schema` 用来确认两边没漂移。生成物必须提交 —— 云端 `wrangler deploy`
+只用仓库里的文件，不会跑生成脚本。
 
 ---
 
 ## 改表结构
 
-`schema.sql` 里的建表语句全是 `IF NOT EXISTS`，对「表已存在但少一列」**什么都不做**。
-所以加字段要走迁移，不能只改 `schema.sql`（那只对新建的库有效）：
+建表语句全是 `IF NOT EXISTS`，对「表已存在但少一列」**什么都不做**，只对新建的库有效。
 
-1. 改 `schema.sql`，把顶部的 `-- schema-version:` 加 1
-2. 在 `src/migrations.js` 里追加一条（v2 = `checks_daily` 建立，v3 = `state.void_streak`，
-   下一个可用版本号是 **v4**）：
+本项目不做自动迁移。历史版本里的 `migrations.js`、`meta.schema_v` 版本比较、
+`checks_daily` 回填逻辑已全部删除 —— 那套机制要求每条 `ALTER` 都幂等、每类错误都分类吞掉，
+维护成本高于收益。加字段走手工流程：
 
-   ```js
-   export const MIGRATIONS = [
-     { v: 4, stmts: ["ALTER TABLE sites ADD COLUMN note TEXT"] },
-   ];
-   ```
+1. 改 `schema.sql`
+2. `npm run schema` 重新生成 `src/schema.js`，一起提交
+3. 新库直接按完整定义建好；已有库手工执行 `ALTER TABLE ... ADD COLUMN`
+   （`NOT NULL` 必须同时给 `DEFAULT`，否则已有行没法填充）
 
-3. `npm run schema` 重新生成 `src/schema.js`，连同上面两处一起提交
-
-之后：**新库**直接按完整定义建表，跳过迁移；**旧库**先补缺失的表/索引，
-再跑「比库里版本新」的迁移，然后写回新版本号。不重建库、不丢数据。
-
-需要**搬数据**的迁移（比如 v2 把明细汇总成 `checks_daily`）不写在 `MIGRATIONS` 里 ——
-静态语句没法判断库有多大，写进 `db.js` 才能先量行数、超限就跳过，
-避免一次回填把当天读额度用光。v2 的回填上限是 10 万行明细，结果在 `/api/health`
-的 `schema.backfill` 里（`done: false` 表示因规模跳过，历史色条会是空的）。
-
-三条约束：
-
-- 迁移语句必须幂等。重复补列会报 `duplicate column name`，这一条被吞掉；
-  其它错误照常抛出，不会伪装成成功。
-- 只写 `ADD COLUMN` 这类安全操作。SQLite 删列/改类型要重建整张表，
-  不适合在请求路径上自动做 —— 那种变更应当人工处理。
-- 加 `NOT NULL` 列时必须同时给 `DEFAULT`，否则已有行没法填充。
+删列 / 改类型在 SQLite 里要重建整张表，只能在停机窗口手工处理。
 
 ---
+
 
 ## 几点设计取舍
 
