@@ -2,6 +2,9 @@
 
 import { defOf, validMagic, gpLimitNum } from "./settings.js";
 
+/** Globalping 要求非浏览器客户端自报标识，缺 UA 会被边缘风控优先拦。 */
+const UA = "Uptime-Monitor/1.0 (+https://github.com/ftxw/uptime)";
+
 export function normalizeUrl(u) {
   return /^https?:\/\//i.test(u) ? u : `https://${u}`;
 }
@@ -70,6 +73,7 @@ export async function gpCreate(env, site) {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
+      "User-Agent": UA,
       ...(token ? { Authorization: `Bearer ${token}` } : {}),
     },
     body: JSON.stringify({
@@ -187,7 +191,7 @@ export async function gpCollect(env, pending) {
   const token = env && env.GLOBALPING_TOKEN;
   const res = await fetch(
     `https://api.globalping.io/v1/measurements/${pending.measurement_id}`,
-    { headers: token ? { Authorization: `Bearer ${token}` } : {} }
+    { headers: { "User-Agent": UA, ...(token ? { Authorization: `Bearer ${token}` } : {}) } }
   );
 
   // 429 先处理：它带 Retry-After，要留给调度层做退避，而不是当成"这条结果坏了"丢掉。
@@ -203,11 +207,13 @@ export async function gpCollect(env, pending) {
     };
   }
   if (!res.ok) {
+    // 带上响应体前 160 字：403/404 的正文才能区分为「被边缘拦」还是「测量不存在」
+    const body = await res.text().catch(() => "");
     return {
       done: true,
       broken: true,
       results: [],
-      error: `收取失败：HTTP ${res.status}`,
+      error: `收取失败：HTTP ${res.status} ${body.slice(0, 160)}`.trim(),
     };
   }
 

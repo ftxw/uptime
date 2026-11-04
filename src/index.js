@@ -890,6 +890,7 @@ async function collectGlobalping(env, sitesIn) {
         site: p.site,
         id: p.measurement_id,
         why: "vote-" + dec.why,
+        status: out.status ?? null,
         ok_votes: dec.okCount ?? null,
         total: dec.total ?? null,
         platform_faults: dec.platformFaults ?? 0,
@@ -2481,6 +2482,17 @@ export default {
     // 本轮调度事实落库。gpStarted 同时含成功项与失败项，按 error 拆分计数
     const startedOk = (disp.gpStarted || []).filter((x) => x && !x.error).length;
     for (const f of disp.failures || []) errors.push({ stage: "dispatch", ...f });
+    // 收取阶段被判「无结论」的明细也要落库，否则漏一次检查事后无从归因
+    for (const dr of (collected.dropped || []).slice(0, 5)) {
+      errors.push({
+        stage: "collect",
+        site: dr.site,
+        why: dr.why,
+        ...(dr.status ? { status: dr.status } : {}),
+        ...(dr.ok_votes != null ? { votes: `${dr.ok_votes}/${dr.total}` } : {}),
+        ...(dr.error ? { error: String(dr.error).slice(0, 140) } : {}),
+      });
+    }
     await stage(
       "logRound",
       () =>

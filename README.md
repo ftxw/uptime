@@ -308,6 +308,19 @@ curl -s https://<你的域名>/api/health?pretty=1
 > 表结构与代码不一致（`no such column`）不在自愈范围内 —— 自动建表只会**建缺的表**，
 > 不会改已有的表。这类问题看 [改表结构](#改表结构)。
 
+### 漏了一次检查，是谁的问题
+
+`rounds` 每轮一行，`err` 按阶段标了归因：
+
+| `err` 里的 stage | 含义 |
+|---|---|
+| `dispatch` | 我们发起就失败了：403 被边缘拦 / 429 额度用尽 / 5xx |
+| `collect` | 测量发出也收回了，但结果不可用：无结果、探针全灭、收取被限流 |
+
+两条道路都不会写 `checks`、不会动 `consecutive_fail`，只在 `state.void_streak` +1，
+所以漏一次**不会**被误判成故障。发起失败也不推进 `state.last_checked_ts`，
+下一分钟（与站点间隔无关）就会自动重试。
+
 > 所有 5xx 现在都会返回 JSON（`{ok:false, error, hint?}`），不会再出现
 > 「空格 500」——异常逃出 Worker 时浏览器只显示 `Failed to load resource: 500 ()`，
 > 前端拿不到任何文案，那是最难排查的一种失败态。
