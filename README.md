@@ -422,6 +422,12 @@ D1 免费计划每天 **500 万行读 / 10 万行写**（按 UTC 0 点重置，�
 > 想知道自己用了多少：Cloudflare 控制台 → Workers & Pages → D1 → 选中库 →
 > Metrics → Row Metrics。出现 `daily limits exceeded` 就是超了。
 
+**额度窗口怎么算**：周期 1 小时，但**不是整点重置**。官方只说「每小时 250 / 500 次免费测试」，
+`reset` 字段的定义也只有一句「距重置的秒数」，窗口模型没写。实测锚点落在
+「新窗口里的第一次创建请求」上，所以每小时会漂几十秒 —— 要准确秒数就直接读响应头
+`x-ratelimit-reset` 或 `GET /v1/limits`。本项目的额度行读的是 `meta.gp_quota`
+（每次创建都会回写 `limit / remaining / reset / cost`）。
+
 ---
 
 ## 库结构自举
