@@ -17,6 +17,7 @@ let DRAG_SITE = null;    // 正在拖拽的站点 id
 let AUTHED = false;
 let SETTINGS = null;     // /admin 一次性带回的设置，用于设置面板预填
 let PROBE = null;        // 探针健康：最近成功 / 失败 / 额度退避
+let DELIVERY = null;     // 近 24h 投递率：发起 vs 落库
 
 const UNGROUPED = "未分组";
 const ALL = "__all__";
@@ -388,12 +389,14 @@ async function loadAll() {
   SITES = sortSites(d.sites || []);
   if (d.settings) SETTINGS = d.settings; // 供设置面板预填，打开时不必先等网络
   PROBE = d.probe || null;
+  DELIVERY = d.delivery || null;
   applyBrandTitle(SETTINGS);
 
   renderCats();
   await renderRows();
   // 额度账随「站点数 / 间隔 / 是否配 Token」变，这三者都由 /admin 带回，故在这里统一重算
   renderQuota();
+  renderDelivery();
 }
 
 /* ── 分类：切换 / 新建 / 改名 / 删除 / 排序 ─────────────── */
@@ -964,6 +967,9 @@ function renderProbeInfo() {
   } else {
     text = "探针状态：还没有发起过测量";
   }
+  // 同轮补测战绩：只在真发生过时追加，避免平时多一行噪音
+  const rt = p.retry || {};
+  if (rt.ok || rt.fail) text += `｜同轮补测成功 ${rt.ok} 次 / 失败 ${rt.fail} 次`;
   el.textContent = text;
   el.style.color = warn ? "hsl(var(--destructive))" : "";
 }
@@ -1038,8 +1044,30 @@ function renderQuota(limitOverride) {
   el.style.color = "hsl(var(--destructive))";
 }
 
-qs("#settings-open").addEventListener("click", openSettings);
+/** 近 24h 投递率：发起了多少次、真正落库多少条，差值是 GP 侧失败吃掉的数据点。 */
+function renderDelivery() {
+  const el = qs("#delivery");
+  if (!el) return;
+  const d = DELIVERY;
+  if (!d || !d.attempts) {
+    el.textContent = "";
+    return;
+  }
+  const parts = [
+    `近 24 小时投递率 ${((1 - d.miss_rate) * 100).toFixed(1)}%（${d.delivered}/${d.attempts}）`,
+    d.missing ? `缺 ${d.missing} 个数据点` : "无缺口",
+  ];
+  if (d.rounds_with_403) parts.push(`${d.rounds_with_403} 轮撞 403`);
+  el.textContent = parts.join(" · ");
+  // 3% 以上就不再是偶发抖动了，标红提醒换通道
+  el.style.color = d.miss_rate >= 0.03 ? "hsl(var(--destructive))" : "";
+  el.title =
+    `${d.rounds} 轮里发起 ${d.attempts} 次、落库 ${d.delivered} 条。` +
+    "缺口来自 Globalping 侧（403 短时封禁 / 5xx 平台抖动），不是站点故障；" +
+    "这些轮次不写检查记录、不计入连续失败，下一分钟自动补。";
+}
 
+qs("#settings-open").addEventListener("click", openSettings);
 // 改「每次探测点数」时当场重算额度（不必先保存再看结果）。
 // 不写回 SETTINGS：取消对话框后，列表底部那行仍按已保存的值显示。
 qs("#s-limit").addEventListener("change", () => {

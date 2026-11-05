@@ -152,6 +152,7 @@ async function buildHealth(env, pwdConfigured, pretty, schema, opts = {}) {
         "SELECT key, value FROM meta WHERE key LIKE 'gp\\_%' ESCAPE '\\'"
       ).all();
       out.probe = probeHealthOf(Object.fromEntries((r.results || []).map((x) => [x.key, x.value])));
+      out.delivery = await deliveryOf(env).catch(() => null);
     }
   } catch (e) {
     out.probe = { error: String((e && e.message) || e) };
@@ -170,6 +171,32 @@ function parseJsonOrNull(v) {
   }
 }
 
+/** 近 24 小时投递率：发起次数 vs 实际落库条数，差值是 GP 侧失败造成的数据点缺口。 */
+async function deliveryOf(env) {
+  const d = await db(env);
+  const r = await d
+    .prepare(
+      "SELECT COUNT(*) AS rounds, SUM(started_n + failed_n) AS attempts, " +
+        "SUM(collected_n) AS delivered, " +
+        "SUM(CASE WHEN err LIKE '%access_forbidden%' THEN 1 ELSE 0 END) AS e403, " +
+        "SUM(CASE WHEN err IS NOT NULL AND err<>'' THEN 1 ELSE 0 END) AS err_rounds " +
+        "FROM rounds WHERE ts >= strftime('%Y-%m-%dT%H:%M','now','-24 hours')"
+    )
+    .first();
+  const attempts = Number(r?.attempts || 0);
+  const delivered = Number(r?.delivered || 0);
+  return {
+    window: "24h",
+    rounds: Number(r?.rounds || 0),
+    attempts,
+    delivered,
+    missing: Math.max(0, attempts - delivered),
+    miss_rate: attempts ? Math.round((1 - delivered / attempts) * 10000) / 10000 : 0,
+    rounds_with_403: Number(r?.e403 || 0),
+    err_rounds: Number(r?.err_rounds || 0),
+  };
+}
+
 /** 探针健康快照，直接吃已读到的 meta。 */
 function probeHealthOf(raw) {
   const blocked = Number(raw?.gp_blocked_until || 0);
@@ -183,6 +210,11 @@ function probeHealthOf(raw) {
     last_error_ts: raw?.gp_last_error_ts || null,
     blocked_until: blocked > Date.now() ? minuteIso(blocked) : null,
     quota: parseJsonOrNull(raw?.gp_quota),
+    // 同轮补测的累计战绩（403/5xx 后等 20 秒重试一次）
+    retry: {
+      ok: Number(raw?.gp_retry_ok_n || 0),
+      fail: Number(raw?.gp_retry_fail_n || 0),
+    },
   };
 }
 
@@ -1012,6 +1044,11 @@ async function logRound(env, row) {
 /**
  * 阶段二：发起本轮测量。
  */
+// 403/5xx 多为 GP 边缘的短时封禁：同分钟内补测成功，记录会落在正确的分钟上；
+// 等下一轮只能顺延，那一个数据点就永久丢了。等待有上限，避免撞 55 秒轮次租约。
+const RETRY_WAIT_MS = 20_000;
+const RETRY_DEADLINE_MS = 30_000;
+
 async function dispatch(env, sites, opts = {}) {
   const budget = Number((env && env.SUBREQ_BUDGET) || 30);
   const d = await db(env);
@@ -1045,12 +1082,39 @@ async function dispatch(env, sites, opts = {}) {
   let okCount = 0;
   let failCount = 0;
 
+  const voidedHere = new Set(); // 本轮自己标的无结论，重试成功后要撤回
   const noteVoid = (id) => {
     if (alreadyVoid.has(id)) return;
     alreadyVoid.add(id);
     voidSites.push(id);
+    voidedHere.add(id);
+  };
+  const unvoid = (id) => {
+    if (!voidedHere.has(id)) return;
+    voidedHere.delete(id);
+    alreadyVoid.delete(id);
+    const k = voidSites.indexOf(id);
+    if (k >= 0) voidSites.splice(k, 1);
   };
 
+  const fire = async (s) => {
+    used += 1;
+    const { id, source, quota: q } = await gpCreate(env, s);
+    const startedAt = minuteIso();
+    await d
+      .prepare(
+        "INSERT OR REPLACE INTO pending (site, measurement_id, source, created_ts) VALUES (?,?,?,?)"
+      )
+      .bind(s.id, id, source, startedAt)
+      .run();
+    // 发起即视为已检查
+    started.push([s.id, startedAt]);
+    gpStarted.push({ site: s.id, id, source, quota: q });
+    okCount++;
+    if (q && (q.limit || q.remaining)) quota = q;
+  };
+
+  const transient = []; // 403 / 5xx：本轮可补测
   for (let i = 0; i < sites.length; i++) {
     const s = sites[i];
     if (pendingSet.has(s.id)) continue;
@@ -1065,26 +1129,12 @@ async function dispatch(env, sites, opts = {}) {
       skipped.push(s.id);
       continue;
     }
-    used += 1;
     try {
-      const { id, source, quota: q } = await gpCreate(env, s);
-      const startedAt = minuteIso();
-      await d
-        .prepare(
-          "INSERT OR REPLACE INTO pending (site, measurement_id, source, created_ts) VALUES (?,?,?,?)"
-        )
-        .bind(s.id, id, source, startedAt)
-        .run();
-      // 发起即视为已检查
-      started.push([s.id, startedAt]);
-      gpStarted.push({ site: s.id, id, source, quota: q });
-      okCount++;
-      if (q && (q.limit || q.remaining)) quota = q;
+      await fire(s);
     } catch (e) {
       const msg = String((e && e.message) || e);
       gpStarted.push({ site: s.id, error: msg });
       failCount++;
-      lastError = msg;
       noteVoid(s.id);
       failures.push({
         site: s.id,
@@ -1104,8 +1154,37 @@ async function dispatch(env, sites, opts = {}) {
         }
         break;
       }
+      if (e && (e.status === 403 || (e.status >= 500 && e.status < 600))) transient.push(s);
     }
   }
+
+  let retryOk = 0;
+  // 本轮撞过 429 时不要补测：那是小时窗口打满，20 秒后同样会拒
+  if (
+    transient.length &&
+    blockedUntil <= Date.now() &&
+    Date.now() - (opts.roundStart || Date.now()) < RETRY_DEADLINE_MS
+  ) {
+    await new Promise((r) => setTimeout(r, RETRY_WAIT_MS));
+    for (const s of transient) {
+      if (used + 1 > budget) break;
+      try {
+        await fire(s);
+        unvoid(s.id);
+        failCount--;
+        retryOk++;
+        const f = failures.findIndex((x) => x.site === s.id);
+        if (f >= 0) failures.splice(f, 1);
+        const g = gpStarted.findIndex((x) => x.site === s.id && x.error);
+        if (g >= 0) gpStarted.splice(g, 1);
+      } catch {
+        // 仍失败：保留原始失败记录，下一轮自动补
+      }
+    }
+  }
+
+  // 重试可能改写了失败集合，错误摘要按最终结果算
+  lastError = failures.length ? String(failures[failures.length - 1].msg || "") : null;
 
   // 探针健康快照，只在本轮真尝试过时写
   const entries = [];
@@ -1120,6 +1199,11 @@ async function dispatch(env, sites, opts = {}) {
   if (quota) entries.push(["gp_quota", JSON.stringify(quota)]);
   if (blockedUntil > Date.now()) entries.push(["gp_blocked_until", String(blockedUntil)]);
   else if (raw.gp_blocked_until) entries.push(["gp_blocked_until", ""]);
+  // 同轮补测的累计战绩，用来判断这条补救到底值不值得留
+  if (retryOk) entries.push(["gp_retry_ok_n", String(Number(raw.gp_retry_ok_n || 0) + retryOk)]);
+  const retryFail = transient.length - retryOk;
+  if (retryFail)
+    entries.push(["gp_retry_fail_n", String(Number(raw.gp_retry_fail_n || 0) + retryFail)]);
   if (entries.length) await saveSettings(env, entries).catch(() => {});
 
   // 写「上次发起时刻」；发起失败的不动，下一轮重试
@@ -1151,6 +1235,7 @@ async function dispatch(env, sites, opts = {}) {
     voided: voidSites.length,
     blocked_until: blockedUntil > Date.now() ? blockedUntil : null,
     quota,
+    retried: { tried: transient.length, ok: retryOk },
     // 非 null = last_checked_ts 没写进去，下一轮会重试
     scheduleError,
   };
@@ -2205,7 +2290,13 @@ export default {
         const settings = publicSettings(env, rawSettings);
         return json(
           // probe 直出「最近一次成功/失败/是否退避中」
-          { ok: true, ...payload, settings, probe: probeHealthOf(rawSettings) },
+          {
+            ok: true,
+            ...payload,
+            settings,
+            probe: probeHealthOf(rawSettings),
+            delivery: await deliveryOf(env).catch(() => null),
+          },
           200,
           "no-store",
           pretty
@@ -2450,6 +2541,8 @@ export default {
         dispatch(env, due, {
           alreadyUsed: collected.fetched,
           raw: settings,
+          // 同轮补测的等待要用整轮已耗时判断，避免把轮次拖过 55 秒租约
+          roundStart: wokeAt,
           // 本轮收取已计过「无结论」的站点，不在发起失败时重复计数
           voided: collected.voidSites,
           // 复用收取阶段读到的 pending，省一次全表读
@@ -2524,6 +2617,7 @@ export default {
         gpVoided: disp.voided,
         gpFailed: disp.failed,
         gpBlockedUntil: disp.blocked_until,
+        gpRetry: disp.retried,
         skipped: disp.skipped,
         subreqUsed: disp.used,
         subreqBudget,
