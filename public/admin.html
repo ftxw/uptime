@@ -7,16 +7,10 @@
 <title>管理 · 站点状态</title>
 <meta name="robots" content="noindex, nofollow">
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-<link rel="stylesheet" href="/app.css">
-<script>
-(function () {
-  try {
-    var t = localStorage.getItem("theme");
-    if (!t) t = matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
-    if (t === "dark") document.documentElement.classList.add("dark");
-  } catch (e) {}
-})();
-</script>
+<script src="/theme.js"></script>
+<link rel="stylesheet" href="/base.css">
+<link rel="stylesheet" href="/components.css">
+<link rel="stylesheet" href="/pages.css">
 </head>
 <body>
 
@@ -417,6 +411,7 @@
      几秒后自动消失，没有常驻条目，也不需要点关闭。 -->
 <div class="toast-host" id="toast-host" aria-live="polite"></div>
 
+<script src="/common.js" defer></script>
 <script src="/time.js" defer></script>
 <script src="/admin.js" defer></script>
 </body>

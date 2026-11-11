@@ -3,6 +3,7 @@
  */
 
 import { SCHEMA_STMTS } from "./schema.js";
+import { dayOffsetMs } from "./settings.js";
 
 export const UNGROUPED = "未分组";
 
@@ -25,9 +26,21 @@ export function minuteIso(t = Date.now()) {
   return new Date(Math.floor(ms / 60_000) * 60_000).toISOString().slice(0, 16) + "Z";
 }
 
-/** 证书剩余天数，读时现算。 */
-export const sslDaysLeftSql = (alias = "") =>
-  `CAST(julianday(${alias}expires_at) - julianday('now') AS INTEGER)`;
+/**
+ * 证书剩余天数（向上取整），读时现算。
+ *
+ * SQLite 的 CAST(x AS INTEGER) 是「向零截断」：对负数恰好等价于 CEIL，
+ * 但对正数会少一天 —— 剩余 0.5 天被算成 0，配合 stateOf 的 `days_left > 0`
+ * 会把「还有半天」误判成「证书无效」，ssl_warn_days=0 的语义也会失效。
+ * 这里给正数补 0.999999 抬到下一天；刻意不用 CEIL()，避免依赖 SQLite 数学函数编译选项。
+ */
+export const sslDaysLeftSql = (alias = "") => {
+  const diff = `julianday(${alias}expires_at) - julianday('now')`;
+  return (
+    `CASE WHEN ${diff} > 0 THEN CAST(${diff} + 0.999999 AS INTEGER) ` +
+    `ELSE CAST(${diff} AS INTEGER) END`
+  );
+};
 
 /** 分类 = 显式分类表 ∪ 站点上出现过的 group_name，各带站点数。 */
 export async function buildCategories(d) {
@@ -146,15 +159,21 @@ function invalidateSettings() {
   settingsCache = null;
 }
 
-export async function loadSettings(env) {
+/**
+ * @param fresh=true 时绕过缓存直读，且不回写缓存。
+ * 会话密钥 / 纪元必须走这条路：否则「登出所有设备」在其它 isolate 里最长还能
+ * 用旧密钥验签 30 秒。展示类设置仍走缓存。
+ */
+export async function loadSettings(env, fresh = false) {
   const d = await db(env);
   const now = Date.now();
-  if (settingsCache && settingsCache.binding === d && settingsCache.expires > now) {
+  if (!fresh && settingsCache && settingsCache.binding === d && settingsCache.expires > now) {
     return { ...settingsCache.data };
   }
   const out = {};
   const { results } = await d.prepare("SELECT key, value FROM meta").all();
   for (const r of results || []) out[r.key] = r.value;
+  if (fresh) return out;
   settingsCache = { binding: d, expires: now + SETTINGS_TTL_MS, data: out };
   return { ...out };
 }
@@ -215,9 +234,13 @@ export async function loadSites(env) {
 export async function insertChecks(env, rows) {
   const d = await db(env);
   if (!rows.length) return { stored: 0 };
+  // ts 是分钟精度，手动测试与自动探测可能落在同一分钟。checks 没有唯一约束
+  // （给已有库补唯一索引会因历史重复行直接建表失败），这里用 NOT EXISTS 在写入侧去重，
+  // 避免可用率分母与故障段计数被重复行污染。
   const stmt = d.prepare(
     `INSERT INTO checks (ts, site, source, probe, ok, status, ttfb_ms, total_ms, error)
-     VALUES (?,?,?,?,?,?,?,?,?)`
+     SELECT ?,?,?,?,?,?,?,?,?
+     WHERE NOT EXISTS (SELECT 1 FROM checks WHERE site = ? AND ts = ?)`
   );
   const stmts = rows.map((r) =>
     stmt.bind(
@@ -229,11 +252,17 @@ export async function insertChecks(env, rows) {
       r.status ?? 0,
       r.ttfb_ms ?? 0,
       r.total_ms ?? 0,
-      r.error || null
+      r.error || null,
+      r.site,
+      r.ts
     )
   );
-  for (const part of chunk(stmts, BATCH_CHUNK)) await d.batch(part);
-  return { stored: stmts.length };
+  let stored = 0;
+  for (const part of chunk(stmts, BATCH_CHUNK)) {
+    const res = await d.batch(part);
+    for (const r of res || []) stored += Number(r?.meta?.changes ?? r?.changes ?? 0);
+  }
+  return { stored };
 }
 
 /* ── 状态 ── */
@@ -310,12 +339,6 @@ export async function bumpState(env, perSite, voidSites = [], checkedAt) {
   for (const site of voids) batch.push(d.prepare(VOID_BUMP).bind(site));
 
   for (const part of chunk(batch, BATCH_CHUNK)) await d.batch(part);
-}
-
-function dayOffsetMs(env) {
-  const n = Number(env?.UTC_OFFSET_MIN);
-  const min = Number.isFinite(n) ? n : 480;
-  return min * 60000;
 }
 
 function dayKey(iso, offsetMs) {
@@ -464,12 +487,41 @@ export async function saveSsl(env, siteId, r) {
   await d.prepare(SSL_UPSERT).bind(...sslParams(siteId, r, minuteIso())).run();
 }
 
-/** 清掉站点已不存在的孤儿行。 */
+/** 清掉站点已不存在的孤儿行（含明细，否则 24h 聚合仍会扫到这些行）。 */
 export async function cleanupOrphans(env) {
   const d = await db(env);
-  const stmts = ["state", "ssl", "pending", "checks_daily"].map((t) =>
+  const stmts = ["state", "ssl", "pending", "checks_daily", "checks"].map((t) =>
     d.prepare(`DELETE FROM ${t} WHERE site NOT IN (SELECT id FROM sites)`)
   );
   const res = await d.batch(stmts);
   return res.reduce((a, r) => a + Number(r?.meta?.changes ?? r?.changes ?? 0), 0);
+}
+
+/* ── 轮次互斥（原子租约）────────────────────────────────────── */
+
+/**
+ * 用一条 UPSERT 的 CAS 抢锁：只有现存租约已过期（或键不存在）时才写入成功。
+ * 原来的「先读 meta 再写」在多个 cron / 多 PoP 同时触发时两边都会通过。
+ */
+export async function acquireRoundLock(env, leaseUntil) {
+  const d = await db(env);
+  const r = await d
+    .prepare(
+      "INSERT INTO meta (key, value) VALUES ('gp_round_lock_until', ?1) " +
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value " +
+        "WHERE CAST(meta.value AS INTEGER) <= ?2"
+    )
+    .bind(String(leaseUntil), String(Date.now()))
+    .run();
+  return Number(r?.meta?.changes ?? r?.changes ?? 0) > 0;
+}
+
+/** 只释放自己持有的那把锁，避免误放后一轮抢到的新租约。 */
+export async function releaseRoundLock(env, leaseUntil) {
+  const d = await db(env);
+  await d
+    .prepare("UPDATE meta SET value = '0' WHERE key = 'gp_round_lock_until' AND value = ?")
+    .bind(String(leaseUntil))
+    .run()
+    .catch(() => {});
 }

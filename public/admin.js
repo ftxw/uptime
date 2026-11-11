@@ -3,11 +3,7 @@
 const API = "/api";
 const qs = (s) => document.querySelector(s);
 
-/** 间隔的友好显示：60 → "1 小时"，其余 → "N 分钟" */
-const fmtInterval = (min) => {
-  const n = Number(min) || 5;
-  return n >= 60 ? `${n / 60} 小时` : `${n} 分钟`;
-};
+const { escapeHtml, fmtInterval } = window.U;
 
 let SITES = [];   // 顺序 = 前台渲染顺序（分类 → sort → id）
 let CATS = [];
@@ -28,12 +24,6 @@ const ICON = {
   pen: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/></svg>',
   x: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>',
 };
-
-function escapeHtml(s) {
-  return String(s ?? "").replace(/[&<>"']/g, (c) =>
-    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])
-  );
-}
 
 const relTime = window.T.relTime;
 
@@ -368,6 +358,10 @@ async function renderRows() {
 
 /** 页头品牌名跟随站点标题（数据已由 /admin 带回，不必再单独请求 /api/overview） */
 function applyBrandTitle(st) {
+  // 后台也跟随「前台默认主题」与展示时区：以前这里只改标题，
+  // 结果前台设了深色、后台还跟着系统走，时间口径也和前台不一致。
+  window.U.applyThemeDefault(st && st.default_theme);
+  window.U.setTimezoneOffset(st && st.utc_offset_min);
   const t = st && st.site_title;
   if (!t) return;
   document.title = `${t} · 管理`;

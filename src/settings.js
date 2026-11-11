@@ -24,6 +24,23 @@ export const SETTING_KEYS = Object.keys(SETTING_META);
 /** 某项设置的内置默认值 */
 export const defOf = (k) => SETTING_META[k]?.def ?? "";
 
+/** 钳到整数区间；非数字返回默认值（而不是 NaN 落库）。全项目唯一实现。 */
+export function clampInt(v, min, max, dflt) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return dflt;
+  return Math.min(max, Math.max(min, Math.trunc(n)));
+}
+
+/**
+ * 「一天」从哪一刻起算（毫秒偏移）。
+ * 写入侧（db.js 的 dayKey）与读取侧（色条日期轴）必须共用这一个函数、同一个钳制范围：
+ * 否则环境变量写成非法值时，写入侧会算出 "Invalid Date" 而读取侧仍正常，色条直接错位。
+ */
+export function dayOffsetMs(env) {
+  const dflt = Number(defOf("utc_offset_min"));
+  return clampInt(env?.UTC_OFFSET_MIN ?? dflt, -720, 840, dflt) * 60_000;
+}
+
 /**
  * magic 的合法形状。含空白/引号会让 Globalping 每次发起都 422，
  * 表现为「全部 GP 站点失败」而站点本身正常，极易误判。

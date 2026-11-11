@@ -1,5 +1,6 @@
 # Workers Static Assets 响应头
-# 不加 CSP：三个页面都含内联 <script>，严格 script-src 会直接白屏
+# 所有内联脚本已外置（theme.js / skeleton.js / common.js），因此可以启用严格 CSP。
+# style-src 仍需 'unsafe-inline'：页面里有大量 style 属性与 SVG 内联 style。
 
 /*
   X-Content-Type-Options: nosniff
@@ -8,15 +9,25 @@
   Permissions-Policy: geolocation=(), microphone=(), camera=(), payment=()
   Cross-Origin-Opener-Policy: same-origin
   Cross-Origin-Resource-Policy: same-origin
+  Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; font-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'self'; form-action 'self'
+  Cache-Control: no-cache
 
 /*.svg
   Cache-Control: public, max-age=86400
 
-# 后台页不进搜索引擎
+/*.js
+  Cache-Control: public, max-age=0, must-revalidate
+
+/*.css
+  Cache-Control: public, max-age=0, must-revalidate
+
+# 后台页不进搜索引擎。构建后 admin.js 会变成 admin.<hash>.js，用通配符同时覆盖两者。
 /admin.html
   X-Robots-Tag: noindex, nofollow
-/admin.js
+/admin*.js
   X-Robots-Tag: noindex, nofollow
 
-# /*.js 与 /*.css 不要加长缓存：文件名不带内容哈希，会错配成「新 HTML + 旧 CSS」。
-# 确需强制回源用 no-cache（保留 304），不要用 no-store（每次全量下载）
+# HTML 每次回源验证（/* 的 no-cache）。JS/CSS 在构建产物里带内容哈希，
+# scripts/build.mjs 会把下面两条改成 immutable 长缓存；若直接部署未构建的 public/，
+# must-revalidate 也能保证不会出现「新 HTML + 旧 JS/CSS」。
+# 注意：以上规则只作用于静态资源；/api/* 由 Worker 返回，安全头已在 JSON_HEADERS 里自带。

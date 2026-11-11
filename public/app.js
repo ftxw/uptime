@@ -2,40 +2,16 @@
 
 const API = "/api/overview";
 // 带版本号：缓存含站点 URL，hide_url 改了要让旧副本立刻失效。改字段语义时 bump。
-const CACHE_KEY = "uptime:overview:v4";
+const CACHE_KEY = "uptime:overview:v5";
 
 /* 分类：GROUPS 为接口返回的全部分组，FILTER 为空表示"全部" */
 let GROUPS = [];
 let FILTER = "";
 
-const ICONS = {
-  activity: '<path d="M22 12h-4l-3 9L9 3l-3 9H2"/>',
-  up: '<path d="M12 19V5M5 12l7-7 7 7"/>',
-  down: '<path d="M12 5v14M19 12l-7 7-7-7"/>',
-  shield: '<path d="M20 13c0 5-3.5 7.5-7.7 8.9a1 1 0 0 1-.6 0C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.2-2.7a1 1 0 0 1 1.6 0C14.5 3.8 17 5 19 5a1 1 0 0 1 1 1z"/>',
-  globe: '<circle cx="12" cy="12" r="10"/><path d="M2 12h20M12 2a15 15 0 0 1 0 20 15 15 0 0 1 0-20"/>',
-  clock: '<circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/>',
-  external: '<path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><path d="M15 3h6v6M10 14 21 3"/>',
-  lock: '<rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>',
-};
-
-const svg = (n, cls = "") =>
-  `<svg class="${cls}" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-    stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${ICONS[n]}</svg>`;
-
+const { svg, escapeHtml, STATE_LABEL, fmtInterval } = window.U;
 const qs = (s) => document.querySelector(s);
-const { fmtClock } = window.T;
+const { fmtFull } = window.T;
 const relTime = (iso) => window.T.relTime(iso, "从未检查");
-
-const STATE_LABEL = { up: "正常", down: "故障", degraded: "降级", unknown: "未知" };
-
-function escapeHtml(s) {
-  return String(s ?? "").replace(/[&<>"']/g, (c) =>
-    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])
-  );
-}
-
-const fmtInterval = (min) => (min >= 60 ? `${min / 60} 小时` : `${min} 分钟`);
 
 /* ── 渲染 ──────────────────────────────────────────────── */
 
@@ -82,8 +58,9 @@ function barHtml(m) {
         : "当天有抖动";
       // title + aria-label + tabindex：移动端没有 hover（自定义 tooltip 摸不到），
       // 键盘/读屏也够不到一个不可聚焦的 <span>。三样一起补，才不是"只有鼠标能用"。
-      return `<span class="${cls}" tabindex="0" title="${b.d} · ${label}"
-        aria-label="${b.d} ${label}" data-d="${b.d}" data-s="${label}"></span>`;
+      return `<span class="${cls}" tabindex="0" title="${escapeHtml(b.d)} · ${escapeHtml(label)}"
+        aria-label="${escapeHtml(b.d)} ${escapeHtml(label)}"
+        data-d="${escapeHtml(b.d)}" data-s="${escapeHtml(label)}"></span>`;
     })
     .join("");
   return `<div class="bar" role="img" aria-label="最近 30 天运行历史">${segs}</div>`;
@@ -195,7 +172,7 @@ function renderChips() {
     .join("");
 }
 
-/** 应用服务端设置（标题与默认主题）。优先级：手动切换 > 服务端默认 > 跟随系统。 */
+/** 应用服务端设置（标题 / 默认主题 / 展示时区），统一走 common.js 的口径。 */
 function applySettings(st) {
   if (!st) return;
   if (st.site_title) {
@@ -203,14 +180,8 @@ function applySettings(st) {
     const b = document.getElementById("brand-name");
     if (b) b.textContent = st.site_title;
   }
-  try {
-    if (st.default_theme) localStorage.setItem("theme-default", st.default_theme);
-  } catch (e) {}
-  try {
-    if (localStorage.getItem("theme")) return; // 用户手动选过 → 尊重其选择
-    if (!st.default_theme || st.default_theme === "auto") return;
-    document.documentElement.classList.toggle("dark", st.default_theme === "dark");
-  } catch (e) {}
+  window.U.applyThemeDefault(st.default_theme);
+  window.U.setTimezoneOffset(st.utc_offset_min);
 }
 
 function render(data) {
@@ -225,7 +196,8 @@ function render(data) {
   qs("#subtitle").textContent =
     `共 ${data.stats.total} 个监控` +
     (d ? ` · ${d} 个降级` : "") +
-    ` · 更新于 ${fmtClock(data.now)}`;
+    // 带完整日期：只有 HH:MM 时，隔天的陈旧缓存看起来和今天一模一样。
+    ` · 更新于 ${fmtFull(data.now)}`;
   // 阈值从服务端设置取 —— 后台改了 ssl_warn_days 后这里的文案必须跟着变
   const warnDays = Number(data.settings?.ssl_warn_days ?? 14);
   qs("#foot").textContent =
@@ -265,11 +237,15 @@ async function load(manual = false) {
     if (data && data.ok !== false) {
       render(data);
       try { localStorage.setItem(CACHE_KEY, JSON.stringify(data)); } catch (e) {}
-    } else if (manual) {
-      qs("#subtitle").textContent = (data && data.error) || "加载失败";
+    } else {
+      // 首屏用的是 localStorage 副本：接口挂了必须说清「这是缓存」，不能装作实时。
+      qs("#subtitle").textContent =
+        ((data && data.error) || "加载失败") + (cached ? " · 当前为缓存数据" : "");
     }
   } catch (e) {
-    if (!cached) qs("#subtitle").textContent = "加载失败，稍后重试";
+    qs("#subtitle").textContent = cached
+      ? "加载失败 · 当前为缓存数据"
+      : "加载失败，稍后重试";
   } finally {
     qs("#refresh").disabled = false;
     qs("#refresh").classList.remove("spin");
@@ -298,7 +274,8 @@ const tip = qs("#tip");
 document.addEventListener("mouseover", (e) => {
   const seg = e.target.closest(".bar span");
   if (!seg) return;
-  tip.innerHTML = `<b>${seg.dataset.s}</b><br>${seg.dataset.d}`;
+  // dataset 读出来是解码后的原文，拼进 innerHTML 前必须再转义一次。
+  tip.innerHTML = `<b>${escapeHtml(seg.dataset.s)}</b><br>${escapeHtml(seg.dataset.d)}`;
   tip.classList.add("show");
 });
 document.addEventListener("mousemove", (e) => {
@@ -319,7 +296,8 @@ document.addEventListener("pointerdown", (e) => {
     tip.classList.remove("show");
     return;
   }
-  tip.innerHTML = `<b>${seg.dataset.s}</b><br>${seg.dataset.d}`;
+  // dataset 读出来是解码后的原文，拼进 innerHTML 前必须再转义一次。
+  tip.innerHTML = `<b>${escapeHtml(seg.dataset.s)}</b><br>${escapeHtml(seg.dataset.d)}`;
   tip.classList.add("show");
   tip.style.left = Math.min(e.clientX + 12, innerWidth - tip.offsetWidth - 8) + "px";
   tip.style.top = Math.max(e.clientY - tip.offsetHeight - 10, 8) + "px";
@@ -330,7 +308,8 @@ document.addEventListener("focusin", (e) => {
   const seg = e.target.closest && e.target.closest(".bar span");
   if (!seg) return;
   const r = seg.getBoundingClientRect();
-  tip.innerHTML = `<b>${seg.dataset.s}</b><br>${seg.dataset.d}`;
+  // dataset 读出来是解码后的原文，拼进 innerHTML 前必须再转义一次。
+  tip.innerHTML = `<b>${escapeHtml(seg.dataset.s)}</b><br>${escapeHtml(seg.dataset.d)}`;
   tip.classList.add("show");
   tip.style.left = Math.min(r.left + r.width / 2, innerWidth - tip.offsetWidth - 8) + "px";
   tip.style.top = Math.max(r.top - tip.offsetHeight - 10, 8) + "px";

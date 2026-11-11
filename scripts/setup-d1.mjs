@@ -33,28 +33,48 @@ const TARGETS = {
 };
 
 /**
- * 优先用项目本地安装的 wrangler（CI 里 npm install 之后就有），跳过下载；
- * 没装才退回 npx。Windows 的本地可执行文件是 .cmd，路径含空格要加引号。
+ * D1_NAME / D1_LOCATION 来自环境变量且会进命令行，先做严格白名单。
+ * 原来的实现把所有参数拼成一个字符串交给 shell，`D1_NAME=x"; ...` 就能注入。
  */
-function wranglerBin() {
-  const bin = process.platform === "win32" ? "wrangler.cmd" : "wrangler";
-  const local = join(ROOT, "node_modules", ".bin", bin);
-  return existsSync(local) ? `"${local}"` : "npx --yes wrangler@latest";
+function assertSafeToken(value, label) {
+  if (!/^[A-Za-z0-9_-]{1,64}$/.test(value)) {
+    fail(`${label} 含非法字符：${String(value)}（只允许字母、数字、下划线、连字符，最长 64）`);
+  }
+}
+assertSafeToken(process.env.D1_NAME || "uptime-db", "D1_NAME");
+assertSafeToken(process.env.D1_LOCATION || "apac", "D1_LOCATION");
+
+/** 本地装了 wrangler 就直接跑它的 JS 入口：数组传参，完全不经过 shell。 */
+function localWranglerJs() {
+  const p = join(ROOT, "node_modules", "wrangler", "bin", "wrangler.js");
+  return existsSync(p) ? p : null;
 }
 
-/** Windows 上 npx 是 .cmd，必须走 shell 才能解析成可执行文件。 */
+/** 仅 Windows 的 npx 回退路径需要 shell；含空格的路径参数在这里加双引号。 */
+const quoteArg = (a) => (/[\s]/.test(a) ? `"${a}"` : a);
+
 function wrangler(args) {
-  // 走 shell 就必须自己处理分词：含空格的参数（如 --command=SELECT ...）加双引号。
-  // 本项目这类参数里不含双引号，足以安全包裹。
-  const cmd = args.map((a) => (/\s/.test(a) && !/^"[\s\S]*"$/.test(a) ? `"${a}"` : a)).join(" ");
+  // 单引号是 SQL 参数必需的（cmd.exe 不解释单引号）；双引号及其它元字符一律拒绝。
+  for (const a of args) {
+    if (/[;&|`$<>"\n\r]/.test(a)) {
+      throw new Error(`拒绝执行含 shell 元字符的参数：${a}`);
+    }
+  }
+  const local = localWranglerJs();
+  const opts = {
+    cwd: ROOT,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+    maxBuffer: 32 * 1024 * 1024,
+  };
   try {
-    return execFileSync(`${wranglerBin()} ${cmd}`, {
-      cwd: ROOT,
-      encoding: "utf8",
-      shell: true,
-      stdio: ["ignore", "pipe", "pipe"],
-      maxBuffer: 32 * 1024 * 1024,
-    });
+    if (local) return execFileSync(process.execPath, [local, ...args], opts);
+    if (process.platform === "win32") {
+      // npx 是 .cmd，CreateProcess 执行不了，只能经 cmd.exe（此时参数已全部校验/包裹）。
+      const cmdLine = ["npx", "--yes", "wrangler@latest", ...args].map(quoteArg).join(" ");
+      return execFileSync(cmdLine, [], { ...opts, shell: true });
+    }
+    return execFileSync("npx", ["--yes", "wrangler@latest", ...args], opts);
   } catch (e) {
     throw new Error(`wrangler ${args.join(" ")} 失败：\n${String(e.stderr || e.message || e).trim()}`);
   }

@@ -18,7 +18,20 @@ binding = "DB"
 database_name = "uptime-db"
 database_id = ""
 
-# 静态文件优先匹配，未命中才进 Worker
+# 静态文件优先匹配，未命中才进 Worker。
+# public/ 是源，dist/ 是 scripts/build.mjs 的产物（JS/CSS 带内容哈希、HTML 引用已改写）。
+# 因此部署必须走 npm run dev / npm run deploy（会自动先 build），直接 npx wrangler deploy 不行。
 [assets]
-directory = "./public"
+directory = "./dist"
 binding = "ASSETS"
+
+# 结构化日志：cron 每轮的 console.log 与未捕获异常都要能在控制台查到。
+# 免费层每天 20 万条，本项目每分钟一轮 + 少量页面请求，远用不完。
+[observability]
+enabled = true
+head_sampling_rate = 1
+
+# 让 Worker 尽量调度到靠近 D1 主区域的机房，缩短 /api/* 的跨洋往返。
+# 静态资源仍由边缘直接返回，不受影响；scheduled() 不参与 Smart Placement。
+[placement]
+mode = "smart"

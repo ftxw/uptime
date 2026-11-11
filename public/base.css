@@ -1,0 +1,191 @@
+/* ============================================================
+   uptime-v2 前端样式
+   设计语言复刻自 ftxw/uptime-monitor（shadcn/ui + Tailwind 令牌）
+   —— 但**不用 Tailwind 构建**，手写 CSS 还原同一套令牌与组件形态。
+
+   与原项目的有意偏离：
+   1. 字体不用 Inter/JetBrains Mono 外链（国内访问 Google Fonts 会被墙），改系统字体栈
+   2. 图标全部内联 SVG，不引 lucide 库
+   3. 不引任何 JS 框架（前台 + 后台都是原生）
+   4. 卡片改为**玻璃质感**（backdrop-filter 磨砂 + 顶部高光 + 柔阴影）
+   ============================================================ */
+
+:root {
+  --background: 220 20% 97%;
+  --foreground: 220 20% 10%;
+  --card: 0 0% 100%;
+  --popover: 0 0% 100%;
+  --secondary: 220 14% 92%;
+  --muted: 220 14% 95%;
+  --muted-foreground: 220 10% 46%;
+  --accent: 220 14% 92%;
+  --primary: 160 84% 39%;
+  --primary-foreground: 0 0% 100%;
+  --destructive: 0 72% 51%;
+  --success: 160 84% 39%;
+  --warning: 38 92% 50%;
+  /* `--warning` 亮琥珀只适合当**背景/描边**；拿来当浅色底上的文字对比度只有 ~1.8:1，
+     基本读不清。所以文字色单独一个更暗的值（深色主题再换回亮色）。 */
+  --warning-text: 30 90% 34%;
+  --border: 220 13% 89%;
+  --input: 220 13% 89%;
+  --ring: 160 84% 39%;
+  --radius: 0.625rem;
+
+  /* 玻璃质感参数 */
+  --glass-bg: 0 0% 100%;
+  --glass-alpha: 0.72;
+  --glass-border: 0 0% 100%;
+  --glass-border-alpha: 0.55;
+  --glass-blur: 14px;
+
+  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+    "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans SC", sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Consolas,
+    "Liberation Mono", Menlo, monospace;
+}
+
+.dark {
+  /* meta 的 "light dark" 只跟随系统；手动/后台指定深色时必须覆盖，
+     否则原生 select、滚动条、输入框仍按浅色渲染。theme.js 也会同步设置。 */
+  color-scheme: dark;
+  --background: 224 20% 7%;
+  --foreground: 210 20% 95%;
+  --card: 224 18% 10%;
+  --popover: 224 18% 10%;
+  --secondary: 220 14% 16%;
+  --muted: 220 14% 14%;
+  --muted-foreground: 220 10% 55%;
+  --accent: 220 14% 16%;
+  /* 深底上亮琥珀是够用的，只有浅色主题需要那个更暗的文字色 */
+  --warning-text: 38 92% 58%;
+  --border: 220 14% 18%;
+  --input: 220 14% 18%;
+  /* ⚠️ 这里只列**真正与 :root 不同**的令牌。相同值的重复声明（曾经的
+     --destructive / --success / --warning / --ring / --*-foreground）
+     看着像"深色主题专门调过这些颜色"，实际没有任何效果，只会误导维护者。 */
+
+  --glass-bg: 224 20% 14%;
+  --glass-alpha: 0.55;
+  --glass-border: 220 30% 70%;
+  --glass-border-alpha: 0.14;
+}
+
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  font-family: var(--font-sans);
+  font-size: 14px;
+  line-height: 1.6;
+  background: hsl(var(--background));
+  color: hsl(var(--foreground));
+  -webkit-font-smoothing: antialiased;
+}
+
+/* 玻璃质感需要有东西可"磨"。这层固定背景装饰由合成器缓存，几乎不产生重绘开销 */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background:
+    radial-gradient(56rem 38rem at 10% -10%, hsl(var(--primary) / 0.18), transparent 62%),
+    radial-gradient(48rem 32rem at 92% 2%, hsl(220 70% 50% / 0.13), transparent 62%),
+    radial-gradient(42rem 30rem at 52% 108%, hsl(var(--warning) / 0.10), transparent 64%);
+}
+/* 只匹配 html.dark 下的 body 伪元素；`.dark::before` 没有 content，不生成盒子，是无效规则。 */
+.dark body::before {
+  background:
+    radial-gradient(56rem 38rem at 10% -10%, hsl(var(--primary) / 0.22), transparent 62%),
+    radial-gradient(48rem 32rem at 92% 2%, hsl(220 80% 55% / 0.18), transparent 62%),
+    radial-gradient(42rem 30rem at 52% 108%, hsl(280 70% 55% / 0.12), transparent 64%);
+}
+
+a { color: inherit; text-decoration: none; }
+
+/* ── 玻璃卡片 ───────────────────────────────────────────── */
+
+.glass {
+  position: relative;
+  background: hsl(var(--glass-bg) / var(--glass-alpha));
+  border: 1px solid hsl(var(--glass-border) / var(--glass-border-alpha));
+  border-radius: var(--radius);
+  backdrop-filter: blur(var(--glass-blur)) saturate(150%);
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(150%);
+  box-shadow:
+    0 1px 2px hsl(220 40% 20% / 0.04),
+    0 10px 30px -14px hsl(220 40% 20% / 0.16);
+  overflow: hidden;
+}
+/* 顶部高光：让玻璃有"厚度" */
+.glass::before {
+  content: "";
+  position: absolute;
+  inset: 0 0 auto 0;
+  height: 1px;
+  background: linear-gradient(
+    90deg,
+    transparent,
+    hsl(0 0% 100% / 0.7),
+    transparent
+  );
+  pointer-events: none;
+}
+.dark .glass::before {
+  background: linear-gradient(90deg, transparent, hsl(210 40% 90% / 0.18), transparent);
+}
+/* 不支持 backdrop-filter 时退化为实心卡，保证可读性 */
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  .glass { background: hsl(var(--card)); }
+}
+
+/* 系统要求减少透明效果时（含部分低端设备）关掉多层磨砂：
+   .glass / .topbar / .btn / dialog / .tip 叠起来会产生大量合成层，
+   这里统一退化成不透明底色，普通用户不受影响。 */
+@media (prefers-reduced-transparency: reduce) {
+  .glass, .topbar, .btn, dialog, .tip {
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+  }
+  .glass, .btn, dialog { background: hsl(var(--card)); }
+  .topbar { background: hsl(var(--background)); }
+  .tip { background: hsl(var(--popover)); }
+}
+
+/* ── 布局 ───────────────────────────────────────────────── */
+
+.wrap { max-width: 1100px; margin: 0 auto; padding: 0 16px 56px; }
+.stack { display: flex; flex-direction: column; gap: 24px; }
+.row { display: flex; align-items: center; gap: 8px; }
+.between { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+
+.page-head h1 { margin: 0; font-size: 20px; font-weight: 600; letter-spacing: -0.01em; }
+.page-head p { margin: 2px 0 0; font-size: 13px; color: hsl(var(--muted-foreground)); }
+/* 副标题（分组 · URL · 最近检查…）数据到达前是空的。空 <p> 高 0，
+   文字一出现就把下方整块推下去 —— 先按一行字号把高度占住（13 × 1.6 ≈ 21px）。 */
+#subtitle:empty { min-height: 21px; }
+
+.topbar {
+  position: sticky; top: 0; z-index: 20;
+  background: hsl(var(--background) / 0.7);
+  backdrop-filter: blur(16px) saturate(160%);
+  -webkit-backdrop-filter: blur(16px) saturate(160%);
+  border-bottom: 1px solid hsl(var(--border) / 0.7);
+}
+.topbar-inner {
+  max-width: 1100px; margin: 0 auto; padding: 11px 16px;
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+}
+.brand { display: flex; align-items: center; gap: 8px; font-weight: 600; font-size: 15px; }
+.brand svg { color: hsl(var(--primary)); }
+.nav { display: flex; align-items: center; gap: 4px; }
+.nav a {
+  padding: 6px 10px; border-radius: calc(var(--radius) - 4px);
+  font-size: 13px; color: hsl(var(--muted-foreground));
+  transition: background .12s, color .12s;
+}
+.nav a:hover { background: hsl(var(--accent) / 0.8); color: hsl(var(--foreground)); }

@@ -2,15 +2,21 @@
   "name": "uptime",
   "version": "1.0.0",
   "private": true,
+  "type": "module",
   "description": "站点可用性监控：Cloudflare Workers + D1 + Globalping",
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "schema": "node scripts/gen-schema.mjs",
     "check:schema": "node scripts/gen-schema.mjs --check",
+    "check": "node scripts/check.mjs",
+    "build": "node scripts/build.mjs",
     "presetup": "node scripts/gen-schema.mjs",
     "setup": "node scripts/setup-d1.mjs production",
-    "predev": "node scripts/gen-schema.mjs",
+    "predev": "node scripts/gen-schema.mjs && node scripts/build.mjs",
     "dev": "node scripts/setup-d1.mjs local && wrangler dev",
-    "predeploy": "node scripts/gen-schema.mjs",
+    "predeploy": "node scripts/gen-schema.mjs && node scripts/build.mjs",
     "deploy": "node scripts/setup-d1.mjs production && wrangler deploy"
   },
   "devDependencies": {

@@ -1,28 +1,10 @@
 /* 单站点详情。数据来自 /api/site，图表用原生 SVG。
    与首页一致：先渲染 localStorage 缓存，再拉新覆盖。 */
 
-const ICONS = {
-  activity: '<path d="M22 12h-4l-3 9L9 3l-3 9H2"/>',
-  shield: '<path d="M20 13c0 5-3.5 7.5-7.7 8.9a1 1 0 0 1-.6 0C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.2-2.7a1 1 0 0 1 1.6 0C14.5 3.8 17 5 19 5a1 1 0 0 1 1 1z"/>',
-  clock: '<circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/>',
-  lock: '<rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>',
-};
-
-const svg = (n, cls = "") =>
-  `<svg class="${cls}" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-    stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${ICONS[n] || ""}</svg>`;
-
+const { svg, escapeHtml, STATE_LABEL, fmtInterval } = window.U;
 const qs = (s) => document.querySelector(s);
 const { fmtFull, fmtAxis } = window.T;
 const relTime = (iso) => window.T.relTime(iso, "从未检查");
-
-const STATE_LABEL = { up: "正常", down: "故障", degraded: "降级", unknown: "未知" };
-
-function escapeHtml(s) {
-  return String(s ?? "").replace(/[&<>"']/g, (c) =>
-    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])
-  );
-}
 
 function fmtDur(sec) {
   if (sec < 60) return `${sec} 秒`;
@@ -32,7 +14,6 @@ function fmtDur(sec) {
   return `${h} 小时 ${m} 分`;
 }
 
-const fmtInterval = (min) => (min >= 60 ? `${min / 60} 小时` : `${min} 分钟`);
 const ms = (v) => (v === null || v === undefined ? "--" : `${Math.round(v)} ms`);
 
 /** 小时数 → 人话（168 → "7 天"，24 → "24 小时"）。故障记录窗口用得上 */
@@ -342,7 +323,11 @@ function renderBars(bars) {
           ? "当天有故障（连续失败达到该站点阈值）"
           : "当天有抖动（失败未达故障阈值）";
       const detail = b.n ? `（${b.ok}/${b.n} 次成功）` : "";
-      return `<span class="s-${b.st}" data-d="${b.d}" data-s="${label}" data-n="${detail}"></span>`;
+      // 与首页色条一致：title + aria-label + tabindex，触屏 / 键盘 / 读屏才够得到每一格。
+      const full = `${b.d} · ${label}${detail}`;
+      return `<span class="s-${escapeHtml(b.st)}" tabindex="0" title="${escapeHtml(full)}"
+        aria-label="${escapeHtml(full)}" data-d="${escapeHtml(b.d)}"
+        data-s="${escapeHtml(label)}" data-n="${escapeHtml(detail)}"></span>`;
     })
     .join("");
 
@@ -371,9 +356,9 @@ function renderRecent(recent) {
       const src = r.origin || r.source || "";
       return `<div class="lst-row">
         <span class="badge ${cls}">${label}</span>
-        <span class="mono" style="min-width:34px">${r.status ?? "--"}</span>
+        <span class="mono" style="min-width:34px">${escapeHtml(r.status ?? "--")}</span>
         <span class="mono" style="min-width:72px">${
-          r.ttfb != null ? r.ttfb + " ms" : "--"
+          r.ttfb != null ? escapeHtml(r.ttfb) + " ms" : "--"
         }</span>
         <span class="grow muted" style="font-size:12px" title="${escapeHtml(
           // 失败行优先显示错误原因（比"在哪跑的"更要紧），但来源仍放进 title ——
@@ -414,7 +399,7 @@ function renderIncidents(incidents, winHours) {
         <div class="muted" style="font-size:12px;margin-top:3px">
           ${fmtFull(i.start)} → ${i.end ? fmtFull(i.end) : "持续中"} · 历时 ${fmtDur(
         i.duration_s
-      )} · ${i.checks ?? i.checks_est} 次失败
+      )} · ${escapeHtml(i.checks ?? i.checks_est)} 次失败
         </div>
       </div>
     </div>`
@@ -443,10 +428,14 @@ const SITE_ID = params.get("id") || "";
 const TREND_HOURS = 24;
 
 // 带版本号：缓存含站点 URL，hide_url 改动后旧副本必须作废；v7 = 边界点格式
-const cacheKey = () => `uptime:site:v7:${SITE_ID}`;
+const cacheKey = () => `uptime:site:v8:${SITE_ID}`;
 
 function render(d) {
   if (!d || !d.ok) return;
+  // 主题与展示时区先落地：下面 fmtFull / fmtAxis 都要按配置偏移算，
+  // 否则图表时间轴与服务端色条的「一天」不在同一个时区。
+  window.U.applyThemeDefault(d.settings?.default_theme);
+  window.U.setTimezoneOffset(d.settings?.utc_offset_min);
   // 页头品牌名跟随后台设置（详情页的 document.title 仍用站点名，更有用）
   if (d.settings && d.settings.site_title) {
     const b = document.getElementById("brand-name");
@@ -505,13 +494,19 @@ async function load(manual = false) {
       try {
         localStorage.setItem(cacheKey(), JSON.stringify(data));
       } catch (e) {}
-    } else if (!cached) {
+    } else if (cached) {
+      // 首屏用的是 localStorage 副本：接口失败时必须标明「当前为缓存数据」。
+      qs("#subtitle").textContent =
+        ((data && data.error) || "加载失败") + " · 当前为缓存数据";
+    } else {
       qs("#title").textContent = "加载失败";
       qs("#subtitle").textContent = (data && data.error) || "接口返回异常";
       renderFailed("加载失败");
     }
   } catch (e) {
-    if (!cached) {
+    if (cached) {
+      qs("#subtitle").textContent = "加载失败 · 当前为缓存数据";
+    } else {
       qs("#subtitle").textContent = "加载失败，稍后重试";
       renderFailed("加载失败，稍后重试");
     }
@@ -534,7 +529,10 @@ const tip = qs("#tip");
 document.addEventListener("mouseover", (e) => {
   const seg = e.target.closest(".bar span");
   if (!seg) return;
-  tip.innerHTML = `<b>${seg.dataset.d}</b><br>${seg.dataset.s}${seg.dataset.n || ""}`;
+  // dataset 读出来是解码后的原文，拼进 innerHTML 前必须再转义一次。
+  tip.innerHTML = `<b>${escapeHtml(seg.dataset.d)}</b><br>${escapeHtml(
+    (seg.dataset.s || "") + (seg.dataset.n || "")
+  )}`;
   tip.classList.add("show");
 });
 document.addEventListener("mousemove", (e) => {

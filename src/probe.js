@@ -5,6 +5,30 @@ import { defOf, validMagic, gpLimitNum } from "./settings.js";
 /** Globalping 要求非浏览器客户端自报标识，缺 UA 会被边缘风控优先拦。 */
 const UA = "Uptime-Monitor/1.0 (+https://github.com/ftxw/uptime)";
 
+/**
+ * 出网请求统一超时：Globalping 不响应时不该把整轮 cron 挂死到 55 秒租约耗尽。
+ * 老运行时没有 AbortSignal.timeout 时优雅退回「不设超时」，不能因此让探测全挂。
+ */
+function timeoutSignal(ms) {
+  try {
+    return typeof AbortSignal?.timeout === "function" ? AbortSignal.timeout(ms) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * 同一 measurement id 的 ETag。官方 client guidelines 明确要求收取状态用
+ * ETag / If-None-Match：/api/test 的轮询和跨轮重试会反复 GET 同一个 id，
+ * 命中 304 就不必再下载整份（含 rawOutput）的结果体。
+ */
+const etags = new Map();
+function rememberEtag(id, tag) {
+  if (!tag) return;
+  if (etags.size > 200) etags.clear();
+  etags.set(id, tag);
+}
+
 export function normalizeUrl(u) {
   return /^https?:\/\//i.test(u) ? u : `https://${u}`;
 }
@@ -53,7 +77,7 @@ function retryAfterMs(raw) {
 }
 
 /** 发起一次测量，返回 measurement id（不等待结果）。额度按探测点数计费。 */
-export async function gpCreate(env, site) {
+export async function gpCreate(env, site, opts = {}) {
   const token = env && env.GLOBALPING_TOKEN;
   const u = new URL(normalizeUrl(site.url));
   // 位置筛选是全局设置，这里再校验一次（环境变量可绕过后台规范化）
@@ -71,6 +95,7 @@ export async function gpCreate(env, site) {
 
   const res = await fetch("https://api.globalping.io/v1/measurements", {
     method: "POST",
+    signal: timeoutSignal(12_000),
     headers: {
       "Content-Type": "application/json",
       "User-Agent": UA,
@@ -81,6 +106,9 @@ export async function gpCreate(env, site) {
       target: u.hostname, // 不能带 scheme
       locations: [{ magic }],
       limit,
+      // 交互式即时测试用：让平台边跑边回部分结果，减少轮询次数。
+      // 顶层字段（与 measurementOptions 平级），默认 false，cron 不开启。
+      ...(opts.inProgressUpdates ? { inProgressUpdates: true } : {}),
       // 顶层字段，放进 measurementOptions 会 422
       timeout: timeoutSec,
       measurementOptions: {
@@ -181,7 +209,9 @@ function tlsOf(rr) {
     protocol: t.protocol || null,
     issuer: [issuer.O, issuer.CN].filter(Boolean).join(" ") || null,
     subject: subject.CN || subject.alt || null,
-    key_type: t.cipherName || null,
+    // 列名叫 key_type，就只存密钥算法（RSA / ECDSA…）。cipherName 是加密套件
+    // （TLS_AES_256_GCM_SHA384 之类），以前塞进来会把两者混为一谈。
+    key_type: t.keyType || t.key_type || t.publicKeyAlgorithm || null,
     expires_at: new Date(exp).toISOString(),
   };
 }
@@ -189,10 +219,20 @@ function tlsOf(rr) {
 /** 收取结果：{done:false} 仍在跑 / {done:true,broken:true} 丢弃 / 正常结果。429 回传 retryAfterMs。 */
 export async function gpCollect(env, pending) {
   const token = env && env.GLOBALPING_TOKEN;
-  const res = await fetch(
-    `https://api.globalping.io/v1/measurements/${pending.measurement_id}`,
-    { headers: { "User-Agent": UA, ...(token ? { Authorization: `Bearer ${token}` } : {}) } }
-  );
+  const mid = encodeURIComponent(String(pending.measurement_id));
+  const etag = etags.get(mid);
+  const res = await fetch(`https://api.globalping.io/v1/measurements/${mid}`, {
+    signal: timeoutSignal(12_000),
+    headers: {
+      "User-Agent": UA,
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...(etag ? { "If-None-Match": etag } : {}),
+    },
+  });
+  rememberEtag(mid, res.headers.get("etag"));
+
+  // 内容没变（测量还在跑）：等价于 done:false，继续等下一拍，别重复解析同一份结果。
+  if (res.status === 304) return { done: false, results: [], notModified: true };
 
   // 429 先处理：它带 Retry-After，要留给调度层做退避，而不是当成"这条结果坏了"丢掉。
   if (res.status === 429) {

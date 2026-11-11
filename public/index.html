@@ -6,19 +6,10 @@
 <meta name="color-scheme" content="light dark">
 <title>站点状态</title>
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-<link rel="stylesheet" href="/app.css">
-<script>
-// 主题在 CSS 之前定好，避免闪白（FOUC）
-// 优先级：用户手动选择 > 服务端设置的默认主题 > 跟随系统
-// （theme-default 由 app.js 在拿到 /api/overview 后写入，因此改完设置下次访问即生效）
-(function () {
-  try {
-    var t = localStorage.getItem("theme") || localStorage.getItem("theme-default");
-    if (!t || t === "auto") t = matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
-    if (t === "dark") document.documentElement.classList.add("dark");
-  } catch (e) {}
-})();
-</script>
+<script src="/theme.js"></script>
+<link rel="stylesheet" href="/base.css">
+<link rel="stylesheet" href="/components.css">
+<link rel="stylesheet" href="/pages.css">
 </head>
 <body>
 
@@ -62,6 +53,7 @@
 </main>
 
 <div class="tip" id="tip" role="tooltip"></div>
+<script src="/common.js" defer></script>
 <script src="/time.js" defer></script>
 <script src="/app.js" defer></script>
 </body>

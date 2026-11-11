@@ -1,0 +1,287 @@
+/* 页面层：详情页图表 / 分类筛选条 / 后台两栏 / 登录遮罩。
+   由 app.css 按原顺序拆出，必须最后加载。 */
+
+/* ══════════════════════════════════════════════════════════════
+   二级页面：单站点详情
+   ══════════════════════════════════════════════════════════════ */
+
+.back {
+  display: inline-flex; align-items: center; gap: 6px; align-self: flex-start;
+  font-size: 13px; color: hsl(var(--muted-foreground));
+}
+.back:hover { color: hsl(var(--foreground)); }
+.back svg { width: 14px; height: 14px; }
+
+/* 区块头（卡片内的标题行） */
+.sec-head {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 12px; flex-wrap: wrap;
+  padding: 14px 20px 12px;
+  border-bottom: 1px solid hsl(var(--border) / 0.8);
+}
+.sec-head h2 { margin: 0; font-size: 14px; font-weight: 600; }
+/* 标题右侧的说明文字：卡片标题、站点表头、分类计数共用 */
+.sec-sub { font-size: 12px; font-weight: 400; color: hsl(var(--muted-foreground)); }
+.sec-body { padding: 16px 20px; }
+
+/* 时间范围分段控件 */
+.seg {
+  display: inline-flex; gap: 2px; padding: 2px;
+  border-radius: calc(var(--radius) - 2px);
+  background: hsl(var(--muted) / 0.8);
+}
+.seg button {
+  height: 26px; padding: 0 10px; border: 0; border-radius: calc(var(--radius) - 4px);
+  background: transparent; color: hsl(var(--muted-foreground));
+  font: inherit; font-size: 12px; cursor: pointer;
+  transition: background .12s, color .12s;
+}
+.seg button:hover { color: hsl(var(--foreground)); }
+.seg button.on {
+  background: hsl(var(--card)); color: hsl(var(--foreground)); font-weight: 500;
+  box-shadow: 0 1px 3px hsl(220 40% 15% / 0.12);
+}
+
+/* 图表 */
+/* min-height：加载中 / 切时间范围时这里是空的，SVG 出现后会占满 260px。
+   不预留的话卡身高会在 126px ↔ 386px 之间跳 —— 那是整页位移里第二大的来源。 */
+.chart-wrap { position: relative; width: 100%; min-height: 260px; }
+.chart-wrap svg { display: block; width: 100%; height: auto; overflow: visible; }
+.chart-empty {
+  display: flex; align-items: center; justify-content: center;
+  height: 200px; font-size: 13px; color: hsl(var(--muted-foreground));
+}
+.grid-line { stroke: hsl(var(--border)); stroke-width: 1; }
+.grid-line.dash { stroke-dasharray: 3 3; }
+.axis-text { fill: hsl(var(--muted-foreground)); font-size: 11px; font-family: var(--font-mono); }
+.chart-area { fill: url(#areaGrad); }
+.chart-line {
+  fill: none; stroke: hsl(var(--primary)); stroke-width: 2;
+  stroke-linejoin: round; stroke-linecap: round;
+}
+.chart-dot { fill: hsl(var(--primary)); }
+.chart-dot-bad { fill: hsl(var(--destructive)); stroke: hsl(var(--card)); stroke-width: 1.5; }
+/* 整槽全失败：在基线画一道红杠，与"空槽（没测）"的断线区分开 */
+.chart-tick-bad { stroke: hsl(var(--destructive)); stroke-width: 3; stroke-linecap: round; }
+.chart-guide { stroke: hsl(var(--primary) / 0.55); stroke-width: 1; stroke-dasharray: 3 3; }
+.chart-hi { fill: hsl(var(--primary)); stroke: hsl(var(--card)); stroke-width: 2; }
+.chart-hit { fill: transparent; cursor: crosshair; }
+
+/* 图表图例 */
+.legend {
+  display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+  padding: 0 20px 16px;
+  font-size: 12px; color: hsl(var(--muted-foreground));
+}
+.legend i {
+  display: inline-block; width: 10px; height: 10px; border-radius: 3px;
+  margin-right: 5px; vertical-align: -1px;
+}
+
+/* 详情页的大号色条 */
+.bar-lg { gap: 3px; }
+.bar-lg span { height: 34px; border-radius: 3px; }
+.bar-axis {
+  display: flex; justify-content: space-between;
+  margin-top: 8px; font-size: 11px; color: hsl(var(--muted-foreground));
+  font-family: var(--font-mono);
+}
+
+/* 列表（最近检查 / 故障记录） */
+.lst { display: flex; flex-direction: column; }
+.lst-row, .inc-row {
+  display: flex; align-items: center; gap: 12px;
+  padding: 11px 20px; font-size: 13px;
+  border-top: 1px solid hsl(var(--border) / 0.7);
+}
+.inc-row { align-items: flex-start; }
+.lst-row:first-child, .inc-row:first-child { border-top: none; }
+.lst-row:hover { background: hsl(var(--accent) / 0.4); }
+.lst-row .grow, .inc-row .grow { flex: 1; min-width: 0; }
+.lst-row .grow { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ══════════════════════════════════════════════════════════════
+   后台：分类管理 + 排序
+   ══════════════════════════════════════════════════════════════ */
+
+/* 分类筛选条 */
+.chips { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  height: 28px; padding: 0 11px;
+  border-radius: 999px; border: 1px solid hsl(var(--border));
+  background: hsl(var(--card) / 0.6); color: hsl(var(--muted-foreground));
+  font: inherit; font-size: 12px; cursor: pointer;
+  transition: background .12s, color .12s, border-color .12s;
+}
+.chip:hover { color: hsl(var(--foreground)); background: hsl(var(--accent) / 0.8); }
+.chip.on {
+  background: hsl(var(--primary) / 0.12); color: hsl(var(--primary));
+  border-color: hsl(var(--primary) / 0.35); font-weight: 500;
+}
+.chip .n {
+  font-size: 11px; padding: 0 5px; border-radius: 999px;
+  background: hsl(var(--muted)); color: hsl(var(--muted-foreground));
+}
+.chip.on .n { background: hsl(var(--primary) / 0.16); color: hsl(var(--primary)); }
+
+@media (max-width: 760px) {
+  .lst-row { flex-wrap: wrap; gap: 8px; }
+}
+
+/* ══════════════════════════════════════════════════════════════
+   后台：左右两栏（左 = 分类目录，右 = 站点列表）
+   结构参考 HaoNav 的「链接管理」：左卡固定宽度、右卡自适应，
+   宽屏下两卡等高、各自独立滚动。
+   ══════════════════════════════════════════════════════════════ */
+
+/* 登录前整块隐藏：用 [hidden] 而不是 inline visibility，避免留出空白高度 */
+.adm-main { padding-top: 24px; }
+
+.adm-grid { display: grid; gap: 16px; align-items: start; }
+@media (min-width: 1000px) {
+  /* 右列（站点表）拿剩余空间，左列给一个够放 4 个汉字+计数的宽度 */
+  .adm-grid { grid-template-columns: 13rem minmax(0, 1fr); }
+}
+.adm-col { display: flex; flex-direction: column; min-height: 0; }
+
+/* ── 左侧分类目录 ─────────────────────────────────────── */
+
+.cat-list {
+  display: flex; flex-direction: column; gap: 2px;
+  /* 与右侧 .tbl-wrap 的首行留白对齐（4px + 行内 10px ≈ 14px） */
+  padding: 4px 8px 8px;
+  /* 分类多时同样内部滚动，别被卡片裁掉 */
+  overflow-y: auto;
+  max-height: calc(100vh - 22rem);
+}
+
+.cat-item {
+  display: flex; align-items: center; gap: 6px;
+  padding: 9px 10px; border-radius: calc(var(--radius) - 2px);
+  font-size: 13px; cursor: pointer;
+  transition: background .12s, color .12s, box-shadow .1s;
+}
+.cat-item[draggable="true"] { cursor: grab; }
+.cat-item[draggable="true"]:active { cursor: grabbing; }
+.cat-item.dragging { opacity: .4; }
+/* 插入位置指示：用对比色而非主色 —— 选中的项本身就是主色实心块，主色线在上面看不见 */
+.cat-item.drag-over { box-shadow: inset 0 2px 0 hsl(var(--foreground) / 0.5); }
+/* 站点表格拖拽：与左侧分类同一套反馈（抓手光标 / 拖起时变淡 / 目标行高亮）。
+   高亮刷在 td 上 —— 直接在 tr 上设 background 会被 td 自己的背景盖住。
+   用 ID 选择器压过 .table tr:hover td 的悬浮底色（/0.9 也比 /0.45 明显）。 */
+#rows tr[draggable="true"] { cursor: grab; }
+#rows tr[draggable="true"]:active { cursor: grabbing; }
+#rows tr.row-dragging { opacity: .4; }
+#rows tr.row-drag-over > td { background: hsl(var(--accent) / 0.9); }
+.cat-item:hover { background: hsl(var(--accent) / 0.8); }
+.cat-item.on {
+  background: hsl(var(--primary)); color: hsl(var(--primary-foreground)); font-weight: 500;
+}
+.cat-item .nm {
+  flex: 1; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.cat-item .n {
+  flex-shrink: 0; font-size: 11px; opacity: .65; font-variant-numeric: tabular-nums;
+}
+
+/* 操作按钮：平时隐藏，hover 才出现（移动端无 hover → 常显） */
+.cat-item .ops { display: none; flex-shrink: 0; align-items: center; gap: 1px; }
+.cat-item:hover .ops { display: inline-flex; }
+.cat-item .ops button {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 20px; height: 20px; padding: 0; border: 0; border-radius: 4px;
+  background: transparent; color: inherit; opacity: .7; cursor: pointer;
+}
+.cat-item .ops button:hover:not(:disabled) { background: hsl(var(--foreground) / 0.12); opacity: 1; }
+.cat-item .ops button:disabled { opacity: .25; cursor: not-allowed; }
+.cat-item .ops svg { width: 13px; height: 13px; }
+@media (hover: none) { .cat-item .ops { display: inline-flex; } }
+
+
+
+/* ── 右侧表格容器 ─────────────────────────────────────── */
+
+/* 站点多时表格本身要能滚：只写 overflow-x 会让超出部分被卡片裁掉，
+   滚轮落在表格上等于没反应。限一个视口内的最大高度，超出部分内部滚动，
+   表头用 sticky 固定 —— 否则滚到中间就看不到列名了。 */
+.tbl-wrap {
+  overflow: auto;
+  max-height: calc(100vh - 22rem);
+  padding: 4px 8px 8px;
+}
+.tbl-wrap .table thead th {
+  position: sticky; top: 0; z-index: 1;
+  background: hsl(var(--card));
+  box-shadow: inset 0 -1px 0 hsl(var(--border));
+}
+/* URL 过长时截断，避免把操作列挤出视野 */
+.tbl-wrap td .mono {
+  display: inline-block; max-width: 260px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: middle;
+}
+
+/* 后台页面底部的说明文字（顺序提示 / 额度估算）：统一字号与颜色 */
+.adm-note {
+  margin: 0; font-size: 12px; line-height: 1.6;
+  color: hsl(var(--muted-foreground));
+}
+
+/* ── 设置对话框的分组标题 ─────────────────────────────── */
+
+.set-group {
+  margin: 6px 0 -2px; padding-top: 12px;
+  font-size: 12px; font-weight: 600; letter-spacing: .04em;
+  color: hsl(var(--muted-foreground));
+  border-top: 1px solid hsl(var(--border) / 0.8);
+}
+.set-group:first-of-type { border-top: none; padding-top: 0; }
+.set-probe { margin: -2px 0 10px; }
+
+/* ── 登录遮罩 ─────────────────────────────────────────── */
+
+.login-mask {
+  position: fixed; inset: 0; z-index: 100;
+  display: flex; align-items: center; justify-content: center;
+  padding: 20px;
+  background: hsl(var(--background) / 0.65);
+  backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px);
+}
+/* 不需要 [hidden] 特例了 —— 顶部有全局 [hidden] 兜底 */
+
+.login-card {
+  width: min(360px, 100%); padding: 24px;
+  display: flex; flex-direction: column; gap: 14px;
+}
+.login-card h2 { margin: 0; font-size: 17px; }
+.login-card p { margin: 0; font-size: 13px; }
+.login-card .btn { width: 100%; }
+
+/* 未配密码的说明卡：比登录卡宽一点 —— 里面是操作步骤，窄了会折得很碎 */
+.setup-card { width: min(460px, 100%); }
+.setup-steps {
+  margin: 0; padding-left: 1.15em;
+  display: flex; flex-direction: column; gap: 7px;
+  font-size: 12.5px; line-height: 1.55;
+}
+/* 行内代码：用来在提示里引用环境变量名 / 命令。
+   同一条规则同时服务「后台未配置密码说明页」与「提示气泡」两处，
+   写成 `code` 的通用样式会让文档正文里的行内代码也被套上底色。 */
+.alert code,
+.setup-card code {
+  font-family: var(--font-mono); font-size: 12px;
+  padding: 1px 5px; border-radius: 5px;
+  background: hsl(var(--secondary));
+  color: hsl(var(--foreground));
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * { animation-duration: .001ms !important; transition-duration: .001ms !important; }
+}
+
+/* 窄屏两栏堆叠：再按 100vh 限高每块只剩半屏，此时交给页面整体滚动。
+   这条必须写在 .tbl-wrap / .cat-list 之后才生效（否则被基础规则覆盖）。 */
+@media (max-width: 760px) {
+  .tbl-wrap, .cat-list { max-height: none; overflow: visible; }
+}

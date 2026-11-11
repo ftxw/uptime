@@ -23,6 +23,8 @@ import {
   UNGROUPED,
   ensureSchema,
   minuteIso,
+  acquireRoundLock,
+  releaseRoundLock,
 } from "./db.js";
 import { SCHEMA_STMTS } from "./schema.js";
 import {
@@ -44,19 +46,48 @@ import {
   sha256Hex,
   sleep,
 } from "./auth.js";
-import { SETTING_META, SETTING_KEYS, defOf, validMagic, gpLimitNum } from "./settings.js";
+import {
+  SETTING_META,
+  SETTING_KEYS,
+  defOf,
+  validMagic,
+  gpLimitNum,
+  clampInt,
+  dayOffsetMs,
+} from "./settings.js";
 // 「谁在哪跑的」统一口径 —— 三个前端共用这一个格式化函数（原因见模块注释）
 import { formatOrigin } from "./origin.js";
 
 
-const JSON_HEADERS = { "content-type": "application/json; charset=utf-8" };
+/** _headers 只作用于静态资源；Worker 返回的 /api/* 必须自己带这些头。 */
+const JSON_HEADERS = {
+  "content-type": "application/json; charset=utf-8",
+  "x-content-type-options": "nosniff",
+  "x-frame-options": "DENY",
+  "referrer-policy": "strict-origin-when-cross-origin",
+};
 
 /** 只读接口的边缘缓存 TTL（秒）。刷新按钮带 no-cache，会绕过它。 */
 const READ_TTL_SEC = 300;
 const READ_CACHE = `public, max-age=0, s-maxage=${READ_TTL_SEC}, stale-while-revalidate=120`;
 
-/** 会改配置的写接口才递增 config_version；test / run 只产生探测记录，不算。 */
-const WRITE_APIS = new Set(["settings", "sites", "categories"]);
+/** 会产生可见数据变化的写接口都递增 config_version，让公开缓存立即换 key。 */
+const WRITE_APIS = new Set(["settings", "sites", "categories", "test", "run"]);
+
+/** 每个接口允许的方法。写接口一律不落到 GET 分支，未知接口留给末尾的 404。 */
+const ALLOWED_METHODS = {
+  health: ["GET", "HEAD"],
+  overview: ["GET", "HEAD"],
+  site: ["GET", "HEAD"],
+  admin: ["GET", "HEAD"],
+  settings: ["GET", "HEAD", "POST"],
+  categories: ["GET", "HEAD", "POST"],
+  sites: ["GET", "HEAD", "POST", "DELETE"], // GET 仍由业务分支返回「请用 /api/admin」
+  login: ["POST"],
+  logout: ["POST"],
+  run: ["POST"],
+  test: ["POST"],
+};
 
 /** 默认输出紧凑 JSON（省流量）；调试时加 &pretty=1 才缩进 */
 const json = (o, status = 200, cache = "no-store", pretty = false) =>
@@ -107,6 +138,8 @@ async function buildHealth(env, pwdConfigured, pretty, schema, opts = {}) {
   };
 
   if (schema && !schema.ok) {
+    // 自检接口不能自己说谎：建表失败时其它接口全会被拦成 500，这里必须报不健康。
+    out.ok = false;
     out.schema.error = schema.error;
     const h = dbErrorHint(schema.error);
     if (h) out.schema.hint = h;
@@ -180,8 +213,9 @@ async function deliveryOf(env) {
         "SUM(collected_n) AS delivered, " +
         "SUM(CASE WHEN err LIKE '%access_forbidden%' THEN 1 ELSE 0 END) AS e403, " +
         "SUM(CASE WHEN err IS NOT NULL AND err<>'' THEN 1 ELSE 0 END) AS err_rounds " +
-        "FROM rounds WHERE ts >= strftime('%Y-%m-%dT%H:%M','now','-24 hours')"
+        "FROM rounds WHERE ts >= ?"
     )
+    .bind(minuteIso(Date.now() - 86_400_000))
     .first();
   const attempts = Number(r?.attempts || 0);
   const delivered = Number(r?.delivered || 0);
@@ -223,7 +257,8 @@ function sameOriginOk(request, url) {
   const origin = request.headers.get("origin");
   if (origin) {
     try {
-      return new URL(origin).host === url.host;
+      // 必须连 scheme 一起比：只比 host 的话，http:// 页面也能向 https:// 端点发写请求。
+      return new URL(origin).origin === url.origin;
     } catch {
       return false;
     }
@@ -240,10 +275,23 @@ function requirePost(request, pretty) {
   return json({ ok: false, error: "仅支持 POST" }, 405, "no-store", pretty);
 }
 
-/** 用 Cache API 做边缘缓存：只加 Cache-Control 不会让 CF 缓存 Worker 响应。 */
-async function withEdgeCache(request, ctx, ttl, producer, keyUrl) {
+/**
+ * 用 Cache API 做边缘缓存：只加 Cache-Control 不会让 CF 缓存 Worker 响应。
+ * pretty 只影响返回体的缩进，不进缓存 key（否则每个页面凭空多出一倍缓存条目），
+ * 因此 producer 一律产出紧凑 JSON，格式化留到返回时做。
+ */
+async function withEdgeCache(request, ctx, ttl, producer, keyUrl, pretty = false) {
   const key = new Request(keyUrl || request.url, { method: "GET" });
   const cache = caches.default;
+  const cacheControl = `public, max-age=0, s-maxage=${ttl}, stale-while-revalidate=120`;
+  const render = (text, status) => {
+    if (!pretty || status !== 200) return text;
+    try {
+      return JSON.stringify(JSON.parse(text), null, 2);
+    } catch {
+      return text;
+    }
+  };
 
   // 客户端要求绕过缓存（刷新按钮）时直接回源
   const cc = String(request.headers.get("cache-control") || "").toLowerCase();
@@ -251,7 +299,7 @@ async function withEdgeCache(request, ctx, ttl, producer, keyUrl) {
   const bypass = cc.includes("no-store") || cc.includes("no-cache") || pragma === "no-cache";
   if (bypass) {
     const fresh = await producer();
-    return new Response(await fresh.text(), {
+    return new Response(render(await fresh.text(), fresh.status), {
       status: fresh.status,
       headers: { ...JSON_HEADERS, "Cache-Control": "no-store", "x-edge-cache": "BYPASS" },
     });
@@ -260,13 +308,9 @@ async function withEdgeCache(request, ctx, ttl, producer, keyUrl) {
     const hit = await cache.match(key);
     if (hit) {
       const text = await hit.text();
-      return new Response(text, {
+      return new Response(render(text, 200), {
         status: 200,
-        headers: {
-          ...JSON_HEADERS,
-          "Cache-Control": `public, max-age=0, s-maxage=${ttl}`,
-          "x-edge-cache": "HIT",
-        },
+        headers: { ...JSON_HEADERS, "Cache-Control": cacheControl, "x-edge-cache": "HIT" },
       });
     }
   } catch {}
@@ -278,18 +322,15 @@ async function withEdgeCache(request, ctx, ttl, producer, keyUrl) {
   /** 只缓存 200，并原样返回原始状态码。 */
   const cacheable = status === 200 && !res.headers.get("set-cookie");
   const headers = cacheable
-    ? { ...JSON_HEADERS, "Cache-Control": `public, max-age=0, s-maxage=${ttl}` }
-    : {
-        ...JSON_HEADERS,
-        "Cache-Control": res.headers.get("cache-control") || "no-store",
-      };
+    ? { ...JSON_HEADERS, "Cache-Control": cacheControl }
+    : { ...JSON_HEADERS, "Cache-Control": res.headers.get("cache-control") || "no-store" };
 
   if (cacheable) {
     try {
       await cache.put(key, new Response(text, { status: 200, headers }));
     } catch {}
   }
-  return new Response(text, {
+  return new Response(render(text, status), {
     status,
     headers: { ...headers, "x-edge-cache": cacheable ? "MISS" : "BYPASS" },
   });
@@ -508,7 +549,10 @@ function stateOf(s, env) {
     const warnDays = sslWarnDays(env);
     if (ssl && !ssl.error && ssl.valid === false) {
       state = "degraded";
-      degrade_reason = "证书无效";
+      degrade_reason =
+        ssl.days_remaining != null && ssl.days_remaining <= 0
+          ? "证书已过期"
+          : "证书无效（未受信任）";
     } else if (
       ssl &&
       ssl.days_remaining !== null &&
@@ -562,18 +606,9 @@ async function effectiveEnv(env, S) {
   return merged;
 }
 
-/** 「一天」从哪一刻起算：色条格子与按天汇总的唯一时区来源（写入侧见 db.js 的 dayKey）。 */
-function dayOffsetMs(env) {
-  const min = clampInt(
-    env?.UTC_OFFSET_MIN ?? SETTING_META.utc_offset_min.def,
-    -720,
-    840,
-    SETTING_META.utc_offset_min.def
-  );
-  return min * 60000;
-}
-
-/** 按 key 规范化取值，写入前拦截非法值。 */
+/** 按 key 规范化取值，写入前拦截非法值。
+ *  「一天」从哪一刻起算统一走 settings.js 的 dayOffsetMs —— 写入侧（db.js 的 dayKey）
+ *  与读取侧（色条日期轴）必须用完全相同的钳制与默认值。 */
 function normalizeSetting(k, v) {
   const def = SETTING_META[k]?.def ?? "";
   const num = (min, max) =>
@@ -670,13 +705,6 @@ const testLimiter = createRateLimiter(1, 10_000);
 /* ─────────────────────── 入参校验 ─────────────────────── */
 
 /** 服务端必须自己校验：绕过页面直接调接口时，前端的 Number/trim 完全不存在。 */
-
-/** 钳到整数区间；非数字返回默认值（而不是 NaN 落库） */
-function clampInt(v, min, max, dflt) {
-  const n = Number(v);
-  if (!Number.isFinite(n)) return dflt;
-  return Math.min(max, Math.max(min, Math.trunc(n)));
-}
 
 /** 0/1 开关列：接受布尔、数字 1、字符串 "1"，其余一律 0。 */
 function boolInt(v) {
@@ -792,7 +820,11 @@ function effectiveSettingValue(env, raw, k) {
 /** 设置的对外表示：token 永不回传明文，只给掩码与是否存在。 */
 function publicSettings(env, raw) {
   const s = {};
-  for (const k of SETTING_KEYS) s[k] = effectiveSettingValue(env, raw, k);
+  // 白名单回显：不要先把明文 token 算出来再覆写为空，中间任何一步都可能漏出去。
+  for (const k of SETTING_KEYS) {
+    if (k === "globalping_token") continue;
+    s[k] = effectiveSettingValue(env, raw, k);
+  }
   s.globalping_token = "";
   s.globalping_token_masked = maskToken(env.GLOBALPING_TOKEN);
   s.has_globalping_token = Boolean(env.GLOBALPING_TOKEN);
@@ -800,15 +832,16 @@ function publicSettings(env, raw) {
 }
 
 /**
- * 会话校验。抽出来是因为 /api/health 也要用（它跑在 loadSettings 之前）。
- * rawSettings 为 null 时自己读一次设置 —— 只有 health 走那条路。
+ * 会话校验。/api/health 的 deep 检查也要用，所以它不依赖外层的 loadSettings。
+ * 密钥与纪元必须直读 D1（fresh）：否则「登出所有设备」在其它 isolate 里
+ * 最长还能用旧密钥验签 30 秒，吊销就不是立即生效。
  */
-async function isAuthed(request, env, rawSettings, pwdConfigured) {
+async function isAuthed(request, env, pwdConfigured) {
   if (!(pwdConfigured ?? Boolean(env.ADMIN_PASSWORD))) return false;
   const token = getSessionToken(request.headers.get("cookie"));
   if (!token) return false;
   try {
-    const S = rawSettings || (await loadSettings(env));
+    const S = await loadSettings(env, true);
     return Boolean(await verifySession(token, await sessionSecret(env, S), sessionEpoch(S)));
   } catch {
     return false;
@@ -824,7 +857,7 @@ const PENDING_TTL_MS = 300_000;
  * 阶段一：收取上一轮发起的测量。
  * @param sitesIn 调用方已有的站点清单，不传则自己查
  */
-async function collectGlobalping(env, sitesIn) {
+async function collectGlobalping(env, sitesIn, opts = {}) {
   const d = await db(env);
   const { results: pending } = await d.prepare("SELECT * FROM pending").all();
   // 空数组分支的返回结构必须与下方完整分支一致，否则调用方取字段会 TypeError
@@ -833,6 +866,7 @@ async function collectGlobalping(env, sitesIn) {
       collected: 0,
       fetched: 0,
       dropped: [],
+      deferred: [],
       voided: 0,
       voidSites: [],
       sslWritten: 0,
@@ -854,11 +888,21 @@ async function collectGlobalping(env, sitesIn) {
   const voidSet = new Set(); // 拿不到结论的站点
   let fetched = 0; // 本次收取的子请求数
   let blockedUntil = null; // 收取侧 429 的退避截止
-  const remaining = []; // 仍在跑的 pending，交给 dispatch 复用
+  const remaining = []; // 仍在跑 / 被延后的 pending，交给 dispatch 复用
+  const deferred = []; // 本轮没丢、只是延后收取的 pending（供日志归因）
+  // 已有 429 退避窗口时连收取都别发：省下子请求，pending 原样留到窗口结束。
+  const deferCollect = Number(opts.blockedUntil || 0) > Date.now();
   const collectAt = Date.now();
   let collectLagMs = 0; // 发起 → 回收的最大滞后
 
   for (const p of pending) {
+    if (deferCollect) {
+      remaining.push(p.site);
+      deferred.push({ site: p.site, id: p.measurement_id, why: "blocked" });
+      if (byId[p.site]) voidSet.add(p.site);
+      continue;
+    }
+
     // 超时或时间无法解析的 pending 直接丢弃
     const born = Date.parse(p.created_ts);
     if (!Number.isFinite(born) || Date.now() - born > PENDING_TTL_MS) {
@@ -878,36 +922,44 @@ async function collectGlobalping(env, sitesIn) {
       fetched++;
       out = await gpCollect(env, p);
     } catch (e) {
-      // 收取失败就丢弃，避免 pending 永久占位。同样不记检查记录（不知道站点当时的状态）
-      dropped.push({
+      // 网络层异常（含超时）是暂时的：保留 pending 下一轮重试，
+      // PENDING_TTL_MS 会兜底，不会永久占位。同样不记检查记录（不知道站点当时状态）。
+      remaining.push(p.site);
+      deferred.push({
         site: p.site,
         id: p.measurement_id,
         why: "throw",
         error: String((e && e.message) || e),
       });
-      doneIds.push(p.site);
       if (byId[p.site]) voidSet.add(p.site);
       continue;
     }
     if (!out.done) {
-      remaining.push(p.site); // 还没跑完，留到下一轮
+      remaining.push(p.site); // 还没跑完（或 304 内容未变），留到下一轮
       continue;
     }
-    doneIds.push(p.site);
 
-    // 结果不可用：丢弃 pending 但不写检查记录，否则把「没拿到数据」谎报成故障。
-    if (out.broken) {
-      dropped.push({
+    // 429 是「我们被限流」，不是「这条测量坏了」：测量还在 GP 那边，
+    // 保留 pending 等退避结束再收。直接删掉会让这个已跑完的数据点永久丢失。
+    if (out.rateLimited) {
+      remaining.push(p.site);
+      deferred.push({
         site: p.site,
         id: p.measurement_id,
-        why: out.rateLimited ? "rate-limit" : "broken",
+        why: "rate-limit",
         error: out.error,
       });
       if (byId[p.site]) voidSet.add(p.site);
-      // 记录退避截止时间
-      if (out.rateLimited) {
-        blockedUntil = Math.max(blockedUntil || 0, Date.now() + Number(out.retryAfterMs || 60_000));
-      }
+      blockedUntil = Math.max(blockedUntil || 0, Date.now() + Number(out.retryAfterMs || 60_000));
+      continue;
+    }
+
+    doneIds.push(p.site);
+
+    // 其它不可用结果：丢弃 pending 但不写检查记录，否则把「没拿到数据」谎报成故障。
+    if (out.broken) {
+      dropped.push({ site: p.site, id: p.measurement_id, why: "broken", error: out.error });
+      if (byId[p.site]) voidSet.add(p.site);
       continue;
     }
 
@@ -967,16 +1019,18 @@ async function collectGlobalping(env, sitesIn) {
     if (r0.tls) sslWrites.push([p.site, r0.tls]);
   }
 
-  if (rows.length) await insertChecks(env, rows);
+  const inserted = rows.length ? await insertChecks(env, rows) : { stored: 0 };
   // 分片 IN 一次删完（deleteBySites 内部按 90 个参数分片）
   if (doneIds.length) await deleteBySites(env, "pending", doneIds);
   await bumpState(env, perSite, [...voidSet]);
   // 只在握手成功时写证书；失败时保持原值（连不上不代表证书变了）
   if (sslWrites.length) await saveSslBatch(env, sslWrites).catch(() => {});
   return {
-    collected: rows.length,
+    // 用真实落库条数：同分钟被去重掉的行不该算进「投递」。
+    collected: inserted.stored,
     fetched,
     dropped,
+    deferred,
     voided: voidSet.size,
     voidSites: [...voidSet],
     sslWritten: sslWrites.length,
@@ -1050,7 +1104,9 @@ const RETRY_WAIT_MS = 20_000;
 const RETRY_DEADLINE_MS = 30_000;
 
 async function dispatch(env, sites, opts = {}) {
-  const budget = Number((env && env.SUBREQ_BUDGET) || 30);
+  // 环境变量同样要钳：后台表单的 1–35 只对 meta 生效，裸 Number() 会让人
+  // 把预算设到 999，直接撞 Workers 免费层 50 子请求的硬上限。
+  const budget = clampInt(env?.SUBREQ_BUDGET, 1, 35, 30);
   const d = await db(env);
   let used = Math.max(0, Number(opts.alreadyUsed) || 0);
   const raw = opts.raw || {};
@@ -1125,8 +1181,10 @@ async function dispatch(env, sites, opts = {}) {
       continue;
     }
     if (used + 1 > budget) {
-      // 子请求预算不足
+      // 预算不足也是「这轮没测到」：必须计 void_streak，否则长期被跳过的站点
+      // 会一直停在上一次的「正常」，监控静默失效而页面毫无提示。
       skipped.push(s.id);
+      noteVoid(s.id);
       continue;
     }
     try {
@@ -1300,7 +1358,35 @@ export default {
     const api = m ? m[1] : "";
     const pretty = url.searchParams.get("pretty") === "1";
 
-    /** 库结构自举：放在所有分支之前，包括 /api/health。 */
+    // Workers Static Assets 的默认路由是「命中静态文件直接返回，未命中才进 Worker」，
+    // 所以任何非 /api 路径到这里都已经是 404。必须立刻挡掉：否则每个爬虫扫到的
+    // 坏路径都会跑一遍 ensureSchema + loadSettings 白烧 D1 读额度，还会把 404
+    // 伪装成 401/403 的 JSON。
+    if (!api) {
+      return new Response("Not Found", {
+        status: 404,
+        headers: {
+          "content-type": "text/plain; charset=utf-8",
+          "cache-control": "no-store",
+          "x-content-type-options": "nosniff",
+        },
+      });
+    }
+
+    // 方法白名单放在最前面：/api/health 在库自举之前就要返回，放在认证闸门之后
+    // 会完全绕过它（PUT /api/health 曾因此被当成 GET 处理）。
+    // 同时未知接口留给末尾的 404，不在这里拦。
+    const allowed = ALLOWED_METHODS[api];
+    if (allowed && !allowed.includes(request.method)) {
+      return json(
+        { ok: false, error: `不支持 ${request.method}，允许：${allowed.join(" / ")}` },
+        405,
+        "no-store",
+        pretty
+      );
+    }
+
+    /** 库结构自举：放在所有接口分支之前，包括 /api/health。 */
     let schemaState;
     try {
       schemaState = { ok: true, ...(await ensureSchema(env)) };
@@ -1308,12 +1394,22 @@ export default {
       schemaState = { ok: false, error: String((e && e.message) || e) };
     }
 
+    // 会话校验按需做（且只做一次）：公开接口不必为了「可能用得上」白算一次
+    // HMAC + 直读 D1。真正需要它的只有后台接口、health?deep 与详情页的参数微调。
+    let authedCache;
+    const getAuthed = async () => {
+      if (authedCache === undefined) {
+        authedCache = await isAuthed(request, env, Boolean(env.ADMIN_PASSWORD));
+      }
+      return authedCache;
+    };
+
     // 部署自检必须先于设置加载与认证闸门：库没建表时 loadSettings 会先抛异常，
     // 那时任何分支都到不了，自检也就失去意义。它只读 sqlite_master，不碰业务表。
     if (api === "health") {
       return await buildHealth(env, env.ADMIN_PASSWORD, pretty, schemaState, {
         deep: url.searchParams.get("deep") === "1",
-        authed: await isAuthed(request, env, null, null),
+        authed: await getAuthed(),
       });
     }
 
@@ -1343,8 +1439,6 @@ export default {
     // 密码只认环境变量 ADMIN_PASSWORD，不支持后台改
     const pwdConfigured = Boolean(env.ADMIN_PASSWORD);
 
-    const authed = await isAuthed(request, env, rawSettings, pwdConfigured);
-
     env = await effectiveEnv(env, rawSettings);
 
     // 公开接口：前台只读展示 + 登录/登出。其余（含所有写接口）都要求已登录。
@@ -1360,7 +1454,7 @@ export default {
           pretty
         );
       }
-      if (!authed) {
+      if (!(await getAuthed())) {
         return json(
           { ok: false, error: "未登录或会话已过期", need_login: true },
           401,
@@ -1465,7 +1559,7 @@ export default {
         const body = await bodyP;
         /** 登出；body.all=true 时作废所有会话（需已登录）。 */
         let revoked = false;
-        if (body.all === true && authed) {
+        if (body.all === true && (await getAuthed())) {
           const ep = await bumpSessionEpoch(env);
           revoked = ep !== null;
           // 配了 ADMIN_SECRET 时不轮换（写了也没人读）
@@ -1495,8 +1589,12 @@ export default {
           for (const k of SETTING_KEYS) {
             if (!(k in body)) continue;
             const v = body[k];
-            // __KEEP__ 或空 = 不修改
-            if (k === "globalping_token" && (v === "__KEEP__" || v === null || v === undefined)) {
+            // __KEEP__ / 空串 / 缺省 = 不修改；删除只能走 clear_globalping_token。
+            // 否则前端哪天忘了发哨兵值，一次保存就把已配好的 Token 悄悄清掉。
+            if (
+              k === "globalping_token" &&
+              (v === "__KEEP__" || v === "" || v === null || v === undefined)
+            ) {
               continue;
             }
             entries.push([k, normalizeSetting(k, String(v ?? "").trim())]);
@@ -1525,7 +1623,7 @@ export default {
         const days = queryInt(url.searchParams.get("days"), Math.min(30, maxD), 1, maxD);
         // 缓存 key 带配置版本，改配置即失效
         const ver = configVersionOf(rawSettings);
-        const keyUrl = `${url.origin}/api/overview?days=${days}&pretty=${pretty ? 1 : 0}&v=${ver}`;
+        const keyUrl = `${url.origin}/api/overview?days=${days}&v=${ver}`;
         return await withEdgeCache(request, ctx, READ_TTL_SEC, async () => {
           const d = await db(env);
 
@@ -1536,7 +1634,8 @@ export default {
             axis.push(t.toISOString().slice(0, 10));
           }
           // 可用率口径：最近 24 小时（滚动），与详情页趋势图同一个窗口。
-          const since24 = new Date(Date.now() - 86400000).toISOString();
+          // checks.ts 是分钟精度且不带秒；比较串必须同形，否则同分钟会多算最多 1 分钟。
+          const since24 = minuteIso(Date.now() - 86_400_000);
 
           // 站点/状态/证书/分类一次 JOIN；24h 聚合走覆盖索引
           const siteRows = await d
@@ -1641,13 +1740,11 @@ export default {
           let up = 0;
           let down = 0;
           let degraded = 0;
-          let incidents = 0;
           for (const g of Object.values(groups)) {
             for (const m of g) {
               if (m.state === "up") up++;
               else if (m.state === "down") down++;
               else if (m.state === "degraded") degraded++;
-              if (Number(m.consecutive_fail) > 0) incidents++;
             }
           }
           const total = seen.size;
@@ -1664,22 +1761,23 @@ export default {
                 site_title: rawSettings.site_title || defOf("site_title"),
                 // 页脚文案要按实际配置写
                 ssl_warn_days: sslWarnDays(env),
+                // 下发后台配置时区：前端的时间展示与色条「今天」必须用同一口径。
+                utc_offset_min: Math.round(dayOffsetMs(env) / 60_000),
               },
               stats: {
                 total,
                 up,
                 down,
                 degraded,
-                incidents,
                 uptime_24h: uptime,
               },
               groups: Object.entries(groups).map(([name, monitors]) => ({ name, monitors })),
             },
             200,
             READ_CACHE,
-            pretty
+            false // 缓存里只存紧凑 JSON，pretty 在返回时再格式化
           );
-        }, keyUrl);
+        }, keyUrl, pretty);
       }
 
       // ── 单站点详情 ──
@@ -1692,7 +1790,7 @@ export default {
 
         const maxD = maxDays(env);
         // 这几个参数进缓存 key，只允许登录后覆盖
-        const canTune = authed;
+        const canTune = await getAuthed();
         const daysFor = canTune
           ? queryInt(url.searchParams.get("days"), Math.min(30, maxD), 1, maxD)
           : Math.min(30, maxD);
@@ -1715,9 +1813,7 @@ export default {
         const verS = configVersionOf(rawSettings);
         const keyUrl = `${url.origin}/api/site?id=${encodeURIComponent(
           id
-        )}&days=${daysFor}&recent=${recentN}&incident=${incidentN}&pretty=${
-          pretty ? 1 : 0
-        }&v=${verS}`;
+        )}&days=${daysFor}&recent=${recentN}&incident=${incidentN}&v=${verS}`;
 
         return await withEdgeCache(request, ctx, READ_TTL_SEC, async () => {
           const d = await db(env);
@@ -1774,7 +1870,7 @@ export default {
           const ivSec = Math.max(60, Math.round(Number(meta.interval_min || 5) * 60));
           const bucketSec = Math.max(ivSec, Math.ceil(spanSec / TREND_HOURS));
           const nBuckets = Math.max(1, Math.min(TREND_HOURS, Math.ceil(spanSec / bucketSec)));
-          const since = new Date(startSec * 1000).toISOString();
+          const since = minuteIso(startSec * 1000);
 
           // 三段 UNION ALL：序列分桶 / 最近 N 条 / 状态翻转点。列类型按首段定，聚合列显式 CAST。
           const [trend, dayRows] = await Promise.all([
@@ -1824,7 +1920,13 @@ export default {
                         CAST(ts AS TEXT), ok, NULL, NULL, NULL,
                         NULL, NULL, CAST(error AS TEXT), prev
                  FROM flips
-                 WHERE prev IS NULL OR ok <> prev`
+                 WHERE prev IS NULL OR ok <> prev
+                 UNION ALL
+                 -- 故障段计数所需的全部失败行，随主查询一次带回（少一次 D1 往返 + 一次全窗口扫描）
+                 SELECT 'fail', 0, 0, 0, NULL, NULL, 0,
+                        CAST(ts AS TEXT), NULL, NULL, NULL, NULL,
+                        NULL, NULL, NULL, NULL
+                 FROM win WHERE ok = 0`
               )
               .bind(id, since, bucketSec, nBuckets - 1, endSec, recentN)
               .all(),
@@ -1889,10 +1991,12 @@ export default {
               // 只有一条记录：只画一个点，不虚构跨度
               series.push(mkPoint(endMs, byB.get(0)));
             } else {
-              for (let i = 0; i <= nBuckets; i++) {
-                // 最后一个边界右边没有槽，沿用 b=0
-                const b = i === nBuckets ? 0 : nBuckets - 1 - i;
-                series.push(mkPoint(Math.round(startMs + i * stepMs), byB.get(b)));
+              // 每个槽一个点，落在该槽的右边界：最后一个点的时间恰好是最后一次检查
+              // （与 window.last_check_ts 一致），值就是最近一小时的槽均值（b=0）。
+              // 旧实现多画了一个同样取 b=0 的末点，折线末尾会出现一段没有信息量的水平线。
+              for (let i = 0; i < nBuckets; i++) {
+                const b = nBuckets - 1 - i;
+                series.push(mkPoint(Math.round(startMs + (i + 1) * stepMs), byB.get(b)));
               }
             }
           }
@@ -1929,18 +2033,11 @@ export default {
             if (run) push();
           }
 
-          // 一次取回窗口内所有失败行时间戳，段升序且互不相交，双指针计数
-          const failTs = (
-            (
-              await d
-                .prepare(
-                  `SELECT ts FROM checks INDEXED BY idx_checks_site_ts_ok
-                   WHERE site = ?1 AND ts >= ?2 AND ok = 0 ORDER BY ts`
-                )
-                .bind(id, since)
-                .all()
-            ).results || []
-          ).map((r) => r.ts);
+          // 段升序且互不相交，双指针计数。时间戳来自主查询的 'fail' 段，不再单独往返 D1。
+          const failTs = trendRows
+            .filter((r) => r.kind === "fail")
+            .map((r) => String(r.ts))
+            .sort();
 
           const endNow = minuteIso();
           let fi = 0;
@@ -2002,6 +2099,7 @@ export default {
               settings: {
                 site_title: rawSettings.site_title || defOf("site_title"),
                 default_theme: rawSettings.default_theme || defOf("default_theme"),
+                utc_offset_min: Math.round(dayOffsetMs(env) / 60_000),
               },
               site: {
                 id: meta.id,
@@ -2062,9 +2160,9 @@ export default {
             },
             200,
             READ_CACHE,
-            pretty
+            false // 缓存里只存紧凑 JSON，pretty 在返回时再格式化
           );
-        }, keyUrl);
+        }, keyUrl, pretty);
       }
 
       // ── 分类管理 ──
@@ -2141,14 +2239,18 @@ export default {
             if (names.some((n) => n.length > 64)) {
               return json({ ok: false, error: "分类名最多 64 个字符" }, 400, "no-store", pretty);
             }
-            await d.batch(
-              names.map((n, i) =>
-                d
-                  .prepare("INSERT INTO categories (name, sort) VALUES (?,?) " +
-                    "ON CONFLICT(name) DO UPDATE SET sort = excluded.sort")
-                  .bind(n, i + 1)
-              )
+            if (names.length > 500) {
+              return json({ ok: false, error: "一次最多重排 500 个分类" }, 400, "no-store", pretty);
+            }
+            const stmts = names.map((n, i) =>
+              d
+                .prepare(
+                  "INSERT INTO categories (name, sort) VALUES (?,?) " +
+                    "ON CONFLICT(name) DO UPDATE SET sort = excluded.sort"
+                )
+                .bind(n, i + 1)
             );
+            for (const part of chunk(stmts, BATCH_CHUNK)) await d.batch(part);
             return json({ ok: true, action, order: names }, 200, "no-store", pretty);
           }
 
@@ -2192,11 +2294,10 @@ export default {
                 pretty
               );
             }
-            await d.batch(
-              ids.map((id, i) =>
-                d.prepare("UPDATE sites SET sort = ? WHERE id = ?").bind(i + 1, id)
-              )
+            const stmts = ids.map((id, i) =>
+              d.prepare("UPDATE sites SET sort = ? WHERE id = ?").bind(i + 1, id)
             );
+            for (const part of chunk(stmts, BATCH_CHUNK)) await d.batch(part);
             return json({ ok: true, action: "reorder", order: ids }, 200, "no-store", pretty);
           }
 
@@ -2307,25 +2408,47 @@ export default {
       if (api === "run") {
         const m2 = requirePost(request, pretty);
         if (m2) return m2;
-        const body = await request.json().catch(() => ({}));
-        const sites = await loadSites(env);
-        const raw = Number(body.limit ?? sites.length);
-        const limit = Number.isFinite(raw) && raw > 0 ? Math.min(raw, sites.length) : sites.length;
-        const picked = sites.slice(0, limit);
-        const collect = await collectGlobalping(env, sites);
-        const disp = await dispatch(env, picked, {
-          alreadyUsed: collect.fetched,
-          raw: rawSettings,
-          voided: collect.voidSites,
-          pendingSites: collect.remaining,
-          blockedUntil: collect.blockedUntil,
-        });
-        // rows / perSite 只在服务端内部用，不下发
-        return json({
-          ok: true,
-          collect: { collected: collect.collected, fetched: collect.fetched, dropped: collect.dropped },
-          dispatch: disp,
-        });
+
+        // 与 cron 共用同一把原子租约，避免手动跑一轮和定时轮重复发起测量。
+        const leaseUntil = Date.now() + 55_000;
+        if (!(await acquireRoundLock(env, leaseUntil))) {
+          return json(
+            { ok: false, error: "有一轮探测正在执行，请稍后再试" },
+            409,
+            "no-store",
+            pretty
+          );
+        }
+        try {
+          const body = await request.json().catch(() => ({}));
+          const sites = await loadSites(env);
+          const raw = Number(body.limit ?? sites.length);
+          const limit = Number.isFinite(raw) && raw > 0 ? Math.min(raw, sites.length) : sites.length;
+          const picked = sites.slice(0, limit);
+          const collect = await collectGlobalping(env, sites, {
+            blockedUntil: Number(rawSettings.gp_blocked_until || 0),
+          });
+          const disp = await dispatch(env, picked, {
+            alreadyUsed: collect.fetched,
+            raw: rawSettings,
+            voided: collect.voidSites,
+            pendingSites: collect.remaining,
+            blockedUntil: collect.blockedUntil,
+          });
+          // rows / perSite 只在服务端内部用，不下发
+          return json({
+            ok: true,
+            collect: {
+              collected: collect.collected,
+              fetched: collect.fetched,
+              dropped: collect.dropped,
+              deferred: collect.deferred,
+            },
+            dispatch: disp,
+          });
+        } finally {
+          await releaseRoundLock(env, leaseUntil);
+        }
       }
 
       // 即时测试：必须带 site=<id>，结果写入 checks
@@ -2363,7 +2486,12 @@ export default {
         const target = site.url;
 
         // 位置筛选统一取全局设置，不支持按请求覆盖
-        const { id, source, quota } = await gpCreate(env, { url: target });
+        // 交互式测试开启 inProgressUpdates：平台边跑边给部分结果，减少轮询次数。
+        const { id, source, quota } = await gpCreate(
+          env,
+          { url: target },
+          { inProgressUpdates: true }
+        );
 
         // 等结果：自适应间隔 + 总时长上限
         const startedAt = Date.now();
@@ -2496,42 +2624,46 @@ export default {
     const settings = await stage("loadSettings", () => loadSettings(env), {});
     env = await effectiveEnv(env, settings);
 
-    // ── 轮次互斥锁：55 秒租约，防止两轮重叠重复发起 ──
-    const lockUntil = Number(settings.gp_round_lock_until || 0) || 0;
-    if (lockUntil > Date.now()) {
-      // 被租约挡住 = 上一轮跑了超过 55 秒，必须落库留证
+    // ── 轮次互斥锁：55 秒原子租约，防止两轮重叠重复发起 ──
+    // 旧实现是「读 meta → 判断 → 写 meta」三步，两个 cron / 多 PoP 同时触发时
+    // 两边都会通过；现在用一条 UPSERT 的 CAS，只有租约已过期才抢得到。
+    const leaseUntil = wokeAt + 55_000;
+    const gotLock = await stage("roundLock", () => acquireRoundLock(env, leaseUntil), false);
+    if (!gotLock) {
+      // 被租约挡住 = 有一轮还在跑，必须落库留证，否则日志里看不出这轮为什么空转
       await logRound(env, {
-        ts: new Date(wokeAt).toISOString(),
-        sched_ts: Number.isFinite(nominal) && nominal > 0 ? new Date(nominal).toISOString() : null,
+        ts: minuteIso(wokeAt),
+        sched_ts: Number.isFinite(nominal) && nominal > 0 ? minuteIso(nominal) : null,
         delay_ms: cronDelayMs,
         dur_ms: Date.now() - wokeAt,
-        err: `locked(${lockUntil - Date.now()}ms)`,
+        err: "locked(atomic lease held)",
       });
-      console.log(
-        JSON.stringify({ cron: controller.cron, skipped: "locked", locked_for_ms: lockUntil - Date.now() })
-      );
+      console.log(JSON.stringify({ cron: controller.cron, skipped: "locked" }));
       return;
     }
-    await stage(
-      "roundLock",
-      () => saveSetting(env, "gp_round_lock_until", String(Date.now() + 55_000)),
-      null
-    );
 
     const sites = await stage("loadSites", () => loadSites(env), []);
 
     // 先全量收取上一轮结果，不受间隔影响
-    const collected = await stage("collectGlobalping", () => collectGlobalping(env, sites), {
-      collected: 0,
-      fetched: 0,
-      dropped: [],
-      voided: 0,
-      voidSites: [],
-      sslWritten: 0,
-      blockedUntil: null,
-      remaining: [],
-      collectLagMs: 0,
-    });
+    const collected = await stage(
+      "collectGlobalping",
+      () =>
+        collectGlobalping(env, sites, {
+          blockedUntil: Number(settings.gp_blocked_until || 0),
+        }),
+      {
+        collected: 0,
+        fetched: 0,
+        dropped: [],
+        deferred: [],
+        voided: 0,
+        voidSites: [],
+        sslWritten: 0,
+        blockedUntil: null,
+        remaining: [],
+        collectLagMs: 0,
+      }
+    );
 
     // 再按监测间隔对「已到期」的发起新一轮；预算要减掉本轮收取已花掉的次数
     const due = await stage("dueSites", () => dueSites(env, sites), []);
@@ -2552,7 +2684,7 @@ export default {
         }),
       { used: 0, gpStarted: [], skipped: [], voided: 0, blocked_until: null, quota: null }
     );
-    const subreqBudget = Number((env && env.SUBREQ_BUDGET) || 30);
+    const subreqBudget = clampInt(env?.SUBREQ_BUDGET, 1, 35, 30);
 
     // 每天一次的过期明细清理，按「距上次成功清理」判断，避免卡钟点
     let cleaned = 0;
@@ -2569,8 +2701,8 @@ export default {
       }
     }
 
-    // 释放轮次租约
-    await stage("roundUnlock", () => saveSetting(env, "gp_round_lock_until", "0"), null);
+    // 只释放自己持有的那把租约
+    await stage("roundUnlock", () => releaseRoundLock(env, leaseUntil), null);
 
     // 本轮调度事实落库。gpStarted 同时含成功项与失败项，按 error 拆分计数
     const startedOk = (disp.gpStarted || []).filter((x) => x && !x.error).length;
@@ -2590,8 +2722,9 @@ export default {
       "logRound",
       () =>
         logRound(env, {
-          ts: new Date(wokeAt).toISOString(),
-          sched_ts: Number.isFinite(nominal) && nominal > 0 ? new Date(nominal).toISOString() : null,
+          // rounds.ts 与 checks.ts 一样统一成分钟精度，deliveryOf / 清理的比较才不会错位。
+          ts: minuteIso(wokeAt),
+          sched_ts: Number.isFinite(nominal) && nominal > 0 ? minuteIso(nominal) : null,
           delay_ms: cronDelayMs,
           dur_ms: Date.now() - wokeAt,
           due_n: due.length,
@@ -2613,6 +2746,7 @@ export default {
         collected: collected.collected,
         collectLagMs: collected.collectLagMs || 0,
         gpDropped: collected.dropped,
+        gpDeferred: collected.deferred || [],
         gpStarted: disp.gpStarted,
         gpVoided: disp.voided,
         gpFailed: disp.failed,
